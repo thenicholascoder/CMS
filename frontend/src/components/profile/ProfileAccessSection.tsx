@@ -1,0 +1,274 @@
+import { User } from "@/src/lib/api";
+import {
+  formatGroupedResourceScope,
+  scopeLabelForAssignment,
+} from "@/src/lib/moduleCoordinatorDisplay";
+import { ModuleCoordinator } from "@/src/types/person";
+import { getPersonRoleColor } from "@/src/lib/personRole";
+
+function roleBadgeClass(role: string): string {
+  return getPersonRoleColor(role);
+}
+
+function sortAssignments(rows: ModuleCoordinator[]): ModuleCoordinator[] {
+  return [...rows].sort((a, b) => {
+    const ma = (a.module_display || a.module || "").localeCompare(
+      b.module_display || b.module || "",
+    );
+    if (ma !== 0) return ma;
+    const la = (a.level_display || a.level || "").localeCompare(
+      b.level_display || b.level || "",
+    );
+    if (la !== 0) return la;
+    return (a.id ?? 0) - (b.id ?? 0);
+  });
+}
+
+function formatScope(a: ModuleCoordinator): string {
+  return scopeLabelForAssignment(a) ?? "—";
+}
+
+function isClusterCoordinatorAssignment(a: ModuleCoordinator): boolean {
+  return a.module === "CLUSTER" && a.level === "COORDINATOR";
+}
+
+function isClusterReporterAssignment(a: ModuleCoordinator): boolean {
+  return a.module === "CLUSTER" && a.level === "REPORTER";
+}
+
+function isEvangelismReporterAssignment(a: ModuleCoordinator): boolean {
+  return a.module === "EVANGELISM" && a.level === "REPORTER";
+}
+
+function isEvangelismBibleSharerAssignment(a: ModuleCoordinator): boolean {
+  return a.module === "EVANGELISM" && a.level === "BIBLE_SHARER";
+}
+
+type AccessTableRow = {
+  key: string;
+  moduleLabel: string;
+  levelLabel: string;
+  scope: string;
+};
+
+function buildMergedClusterCoordinatorRow(
+  clusterCoordRows: ModuleCoordinator[],
+): AccessTableRow | null {
+  if (clusterCoordRows.length === 0) return null;
+  const scope = formatGroupedResourceScope(clusterCoordRows);
+  const first = clusterCoordRows[0];
+  return {
+    key: "merged-cluster-coordinator",
+    moduleLabel: first.module_display || first.module,
+    levelLabel: first.level_display || first.level,
+    scope,
+  };
+}
+
+function buildMergedClusterReporterRow(
+  clusterReporterRows: ModuleCoordinator[],
+): AccessTableRow | null {
+  if (clusterReporterRows.length === 0) return null;
+  const scope = formatGroupedResourceScope(clusterReporterRows);
+  const first = clusterReporterRows[0];
+  return {
+    key: "merged-cluster-reporter",
+    moduleLabel: first.module_display || first.module,
+    levelLabel: first.level_display || first.level,
+    scope,
+  };
+}
+
+function buildMergedLevelRow(
+  rows: ModuleCoordinator[],
+  key: string,
+): AccessTableRow | null {
+  if (rows.length === 0) return null;
+  const first = rows[0];
+  return {
+    key,
+    moduleLabel: first.module_display || first.module,
+    levelLabel: first.level_display || first.level,
+    scope: formatGroupedResourceScope(rows),
+  };
+}
+
+function buildAccessTableRows(sorted: ModuleCoordinator[]): AccessTableRow[] {
+  const merged = buildMergedClusterCoordinatorRow(
+    sorted.filter(isClusterCoordinatorAssignment),
+  );
+  const mergedReporter = buildMergedClusterReporterRow(
+    sorted.filter(isClusterReporterAssignment),
+  );
+  const mergedEvReporter = buildMergedLevelRow(
+    sorted.filter(isEvangelismReporterAssignment),
+    "merged-evangelism-reporter",
+  );
+  const mergedSharer = buildMergedLevelRow(
+    sorted.filter(isEvangelismBibleSharerAssignment),
+    "merged-evangelism-bible-sharer",
+  );
+  const firstClusterCoordIndex = sorted.findIndex(isClusterCoordinatorAssignment);
+  const firstClusterReporterIndex = sorted.findIndex(isClusterReporterAssignment);
+  const firstEvReporterIndex = sorted.findIndex(isEvangelismReporterAssignment);
+  const firstSharerIndex = sorted.findIndex(isEvangelismBibleSharerAssignment);
+  const rows: AccessTableRow[] = [];
+
+  for (let i = 0; i < sorted.length; i++) {
+    const a = sorted[i];
+    if (isClusterCoordinatorAssignment(a)) {
+      if (merged && i === firstClusterCoordIndex) {
+        rows.push(merged);
+      }
+      continue;
+    }
+    if (isClusterReporterAssignment(a)) {
+      if (mergedReporter && i === firstClusterReporterIndex) {
+        rows.push(mergedReporter);
+      }
+      continue;
+    }
+    if (isEvangelismReporterAssignment(a)) {
+      if (mergedEvReporter && i === firstEvReporterIndex) {
+        rows.push(mergedEvReporter);
+      }
+      continue;
+    }
+    if (isEvangelismBibleSharerAssignment(a)) {
+      if (mergedSharer && i === firstSharerIndex) {
+        rows.push(mergedSharer);
+      }
+      continue;
+    }
+    rows.push({
+      key: `mc-${a.id}`,
+      moduleLabel: a.module_display || a.module,
+      levelLabel: a.level_display || a.level,
+      scope: formatScope(a),
+    });
+  }
+  return rows;
+}
+
+function BroadAccessNote({ user }: { user: User }) {
+  if (user.role === "ADMIN") {
+    return (
+      <p className="text-sm text-gray-600">
+        You have full administrative access. Module-specific coordinator
+        assignments below add scoped roles when present.
+      </p>
+    );
+  }
+
+  if (user.role === "PASTOR") {
+    return (
+      <p className="text-sm text-gray-600">
+        Pastoral access follows your church and branch policies. The table below
+        lists any module-specific coordinator assignments.
+      </p>
+    );
+  }
+
+  if (user.role === "MEMBER") {
+    return (
+      <p className="text-sm text-gray-600">
+        You have standard member access to areas enabled for your church.
+      </p>
+    );
+  }
+
+  if (user.role === "VISITOR") {
+    return (
+      <p className="text-sm text-gray-600">
+        Visitor accounts have limited access to the system.
+      </p>
+    );
+  }
+
+  return null;
+}
+
+function EmptyAssignmentsLine({ user }: { user: User }) {
+  const n = (user.module_coordinator_assignments ?? []).length;
+  if (n > 0) return null;
+  if (user.role === "ADMIN") return null;
+
+  return (
+    <p className="text-sm text-gray-500">
+      No module-specific coordinator assignments.
+    </p>
+  );
+}
+
+export default function ProfileAccessSection({ user }: { user: User }) {
+  const assignments = sortAssignments(
+    user.module_coordinator_assignments ?? [],
+  );
+  const tableRows = buildAccessTableRows(assignments);
+
+  const branchLine =
+    user.branch_name?.trim() ||
+    (user.branch != null ? `Branch ID ${user.branch}` : null);
+
+  return (
+    <div className="bg-white rounded-lg shadow-md p-6">
+      <h2 className="text-xl font-semibold text-foreground mb-1">
+        Your access
+      </h2>
+      <p className="text-sm text-gray-500 mb-4">
+        Roles and module access are assigned by administrators. This summary is
+        for your information only.
+      </p>
+
+      <div className="space-y-4">
+        <div>
+          <p className="text-xs font-medium text-gray-500 uppercase tracking-wide mb-1">
+            Church role
+          </p>
+          <span
+            className={`inline-flex px-2.5 py-0.5 rounded-full text-sm font-medium ${roleBadgeClass(
+              user.role,
+            )}`}
+          >
+            {user.role}
+          </span>
+        </div>
+
+        {branchLine && (
+          <div>
+            <p className="text-xs font-medium text-gray-500 uppercase tracking-wide mb-1">
+              Branch
+            </p>
+            <p className="text-sm text-gray-800">{branchLine}</p>
+          </div>
+        )}
+
+        <BroadAccessNote user={user} />
+        <EmptyAssignmentsLine user={user} />
+
+        {assignments.length > 0 && (
+          <div className="overflow-x-auto border border-gray-200 rounded-lg">
+            <table className="min-w-full text-sm">
+              <thead className="bg-gray-50 text-left text-gray-600">
+                <tr>
+                  <th className="px-3 py-2 font-medium">Module</th>
+                  <th className="px-3 py-2 font-medium">Level</th>
+                  <th className="px-3 py-2 font-medium">Scope</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100">
+                {tableRows.map((row) => (
+                  <tr key={row.key} className="bg-white">
+                    <td className="px-3 py-2 text-gray-900">{row.moduleLabel}</td>
+                    <td className="px-3 py-2 text-gray-800">{row.levelLabel}</td>
+                    <td className="px-3 py-2 text-gray-600">{row.scope}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

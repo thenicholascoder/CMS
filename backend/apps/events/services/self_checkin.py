@@ -1,0 +1,959 @@
+"""Event self check-in: resolve today's opted-in session and household."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date, datetime, time
+from typing import Iterable, List, Optional, Sequence, Tuple
+
+from django.db.models import Q, QuerySet
+
+from apps.attendance.models import AttendanceRecord
+from apps.events.models import Event
+from apps.events.services.recurrence import Occurrence, generate_occurrences
+from apps.people.models import ModuleCoordinator, Person
+from apps.people.name_formatting import format_person_display_name
+from core.datetime_utils import church_calendar_date, church_today, get_church_timezone
+
+
+SUNDAY_SERVICE_TYPE = "SUNDAY_SERVICE"
+
+AGE_GROUP_LABELS = {
+    "ADULT": "Adult (18+)",
+    "YOUTH": "Youth (13–17)",
+    "CHILD": "Child (under 13)",
+}
+
+REASON_NO_SERVICE = "no_service_today"
+REASON_NOT_FOR_BRANCH = "no_service_for_branch"
+REASON_RESTRICTED = "restricted"
+
+
+def user_is_self_checkin_staff(user) -> bool:
+    """Admins and Events coordinators (including senior) may always use self-check-in."""
+    if not getattr(user, "is_authenticated", False):
+        return False
+    if getattr(user, "role", None) == "ADMIN":
+        return True
+    return user.module_coordinator_assignments.filter(
+        module=ModuleCoordinator.ModuleType.EVENTS,
+        level__in=(
+            ModuleCoordinator.CoordinatorLevel.COORDINATOR,
+            ModuleCoordinator.CoordinatorLevel.SENIOR_COORDINATOR,
+        ),
+    ).exists()
+
+
+def member_self_checkin_enabled() -> bool:
+    from apps.events.models import EventSetting
+
+    return EventSetting.get_solo().member_self_checkin_enabled
+
+
+def user_can_use_self_checkin(user) -> bool:
+    if user_is_self_checkin_staff(user):
+        return True
+    return member_self_checkin_enabled()
+
+
+def user_can_encode_self_checkin_visitors(user) -> bool:
+    """Online self-check-in hosts may find/encode a guest on this page only."""
+    return user_can_use_self_checkin(user)
+
+
+def _ensure_aware(dt: datetime) -> datetime:
+    from django.utils import timezone
+
+    if timezone.is_naive(dt):
+        return timezone.make_aware(dt, timezone.get_current_timezone())
+    return dt
+
+
+def occurrence_on_date(event: Event, today: date) -> Optional[Occurrence]:
+    """Return the occurrence of ``event`` that falls on church-local ``today``."""
+    if not event.is_recurring:
+        start = _ensure_aware(event.start_date)
+        end = _ensure_aware(event.end_date)
+        if church_calendar_date(start) == today:
+            return Occurrence(
+                event_id=event.id,
+                occurrence_id=f"{event.id}:{start.isoformat()}",
+                start=start,
+                end=end,
+                is_base_occurrence=True,
+            )
+        return None
+
+    tz = get_church_timezone()
+    window_start = datetime.combine(today, time.min, tzinfo=tz)
+    window_end = datetime.combine(today, time.max, tzinfo=tz)
+    pattern = event.recurrence_pattern or {}
+    for occ in generate_occurrences(event, pattern, start=window_start, end=window_end):
+        if church_calendar_date(occ.start) == today:
+            return occ
+    return None
+
+
+def find_todays_self_checkin_events(
+    today: Optional[date] = None,
+) -> List[Tuple[Event, Occurrence]]:
+    """Approved activity events with self-check-in enabled that occur today."""
+    today = today or church_today()
+    events = (
+        Event.objects.filter(
+            self_checkin_enabled=True,
+            booking_status=Event.BookingStatus.APPROVED,
+            event_type__counts_as_activity=True,
+        )
+        .exclude(attendance_format=Event.AttendanceFormat.ONSITE_ONLY)
+        .select_related("event_type", "branch", "room")
+        .order_by("start_date", "id")
+    )
+    matches: List[Tuple[Event, Occurrence]] = []
+    for event in events:
+        occ = occurrence_on_date(event, today)
+        if occ is not None:
+            matches.append((event, occ))
+    return matches
+
+
+# Backward-compatible alias used by older imports/tests.
+find_todays_sunday_services = find_todays_self_checkin_events
+
+
+def event_requires_online_venue(event: Event) -> bool:
+    return getattr(event, "requires_online_venue", True)
+
+
+def _event_allows_staff_onsite_guest(event: Event) -> bool:
+    """Staff guest encode from check-in: any approved activity event."""
+    if event.booking_status != Event.BookingStatus.APPROVED:
+        return False
+    event_type = getattr(event, "event_type", None)
+    if event_type is not None and not getattr(event_type, "counts_as_activity", True):
+        return False
+    return True
+
+
+def _is_visible_to_user(event: Event, user) -> bool:
+    if event.branch_id is None or event.allow_cross_branch_attendance:
+        return True
+    if user.can_see_all_branches():
+        return True
+    return event.branch_id == getattr(user, "branch_id", None)
+
+
+def member_id_lookup_values(raw: str) -> List[str]:
+    """Return distinct trimmed values to match against Person.member_id."""
+    trimmed = (raw or "").strip()
+    if not trimmed:
+        return []
+    values: List[str] = [trimmed]
+    upper = trimmed.upper()
+    if trimmed.isdigit():
+        values.append(f"LAMP{trimmed}")
+        values.append(f"GUEST{trimmed}")
+        values.append(f"TEMP{trimmed}")
+    elif upper.startswith("LAMP"):
+        rest = trimmed[4:]
+        if rest.isdigit():
+            values.append(rest)
+            values.append(f"LAMP{rest}")
+    elif upper.startswith("GUEST"):
+        rest = trimmed[5:]
+        if rest.isdigit():
+            values.append(rest)
+            values.append(f"GUEST{rest}")
+    elif upper.startswith("TEMP"):
+        rest = trimmed[4:]
+        if rest.isdigit():
+            values.append(rest)
+            values.append(f"TEMP{rest}")
+    seen = set()
+    unique: List[str] = []
+    for value in values:
+        key = value.lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(value)
+    return unique
+
+
+def find_people_by_member_id(raw: str) -> QuerySet[Person]:
+    values = member_id_lookup_values(raw)
+    if not values:
+        return Person.objects.none()
+    query = Q()
+    for value in values:
+        query |= Q(member_id__iexact=value)
+    return (
+        Person.objects.filter(query)
+        .exclude(member_id="")
+        .exclude(role="ADMIN")
+        .exclude(status="DECEASED")
+        .distinct()
+        .order_by("id")
+    )
+
+
+def _is_visible_to_person(event: Event, person: Person) -> bool:
+    if event.branch_id is None or event.allow_cross_branch_attendance:
+        return True
+    return event.branch_id == getattr(person, "branch_id", None)
+
+
+def select_matches_for_person(
+    matches: Sequence[Tuple[Event, Occurrence]],
+    person: Person,
+    event_id: Optional[int] = None,
+) -> Tuple[List[Tuple[Event, Occurrence]], Optional[str]]:
+    """Prefer the person's branch; include church-wide Sunday services."""
+    if not matches:
+        return [], REASON_NO_SERVICE
+
+    visible = [
+        (event, occ) for event, occ in matches if _is_visible_to_person(event, person)
+    ]
+    if not visible:
+        return [], REASON_NOT_FOR_BRANCH
+
+    if event_id is not None:
+        chosen = [(event, occ) for event, occ in visible if event.pk == event_id]
+        return chosen, None if chosen else "invalid_event"
+
+    branch_id = getattr(person, "branch_id", None)
+    if branch_id:
+        at_branch = [
+            (event, occ) for event, occ in visible if event.branch_id == branch_id
+        ]
+        if at_branch:
+            return at_branch, None
+    return list(visible), None
+
+
+def select_matches_for_user(
+    matches: Sequence[Tuple[Event, Occurrence]],
+    user,
+    event_id: Optional[int] = None,
+) -> Tuple[List[Tuple[Event, Occurrence]], Optional[str]]:
+    visible = [(event, occ) for event, occ in matches if _is_visible_to_user(event, user)]
+    if not visible:
+        return [], REASON_NO_SERVICE if not matches else REASON_NOT_FOR_BRANCH
+
+    if event_id is not None:
+        chosen = [(event, occ) for event, occ in visible if event.pk == event_id]
+        return chosen, None if chosen else "invalid_event"
+
+    if user.can_see_all_branches():
+        return list(visible), None
+
+    branch_id = getattr(user, "branch_id", None)
+    if branch_id:
+        at_branch = [
+            (event, occ) for event, occ in visible if event.branch_id == branch_id
+        ]
+        if at_branch:
+            return at_branch, None
+    return list(visible), None
+
+
+@dataclass
+class ResolvedSession:
+    available: bool
+    reason: Optional[str]
+    needs_selection: bool
+    event: Optional[Event]
+    occurrence: Optional[Occurrence]
+    occurrence_date: Optional[date]
+    options: List[Tuple[Event, Occurrence]]
+    can_encode_visitors: bool
+
+
+def resolve_session(
+    user,
+    event_id: Optional[int] = None,
+    today: Optional[date] = None,
+) -> ResolvedSession:
+    today = today or church_today()
+    can_encode = user_can_encode_self_checkin_visitors(user)
+    matches = find_todays_self_checkin_events(today)
+    selected, reason = select_matches_for_user(matches, user, event_id=event_id)
+
+    if reason == "invalid_event":
+        return ResolvedSession(
+            available=False,
+            reason="invalid_event",
+            needs_selection=False,
+            event=None,
+            occurrence=None,
+            occurrence_date=today,
+            options=[],
+            can_encode_visitors=can_encode,
+        )
+
+    if not selected:
+        return ResolvedSession(
+            available=False,
+            reason=reason or REASON_NO_SERVICE,
+            needs_selection=False,
+            event=None,
+            occurrence=None,
+            occurrence_date=today,
+            options=[],
+            can_encode_visitors=can_encode,
+        )
+
+    if event_id is None and len(selected) > 1:
+        return ResolvedSession(
+            available=True,
+            reason=None,
+            needs_selection=True,
+            event=None,
+            occurrence=None,
+            occurrence_date=today,
+            options=list(selected),
+            can_encode_visitors=can_encode,
+        )
+
+    event, occ = selected[0]
+    return ResolvedSession(
+        available=True,
+        reason=None,
+        needs_selection=False,
+        event=event,
+        occurrence=occ,
+        occurrence_date=today,
+        options=list(selected),
+        can_encode_visitors=can_encode,
+    )
+
+
+def resolve_public_session(
+    event_id: Optional[int] = None,
+    today: Optional[date] = None,
+) -> ResolvedSession:
+    """Today's approved self-check-in events with no user or branch filter."""
+    today = today or church_today()
+    matches = find_todays_self_checkin_events(today)
+
+    if event_id is not None:
+        chosen = [(event, occ) for event, occ in matches if event.pk == event_id]
+        if not chosen:
+            return ResolvedSession(
+                available=False,
+                reason="invalid_event" if matches else REASON_NO_SERVICE,
+                needs_selection=False,
+                event=None,
+                occurrence=None,
+                occurrence_date=today,
+                options=[],
+                can_encode_visitors=False,
+            )
+        event, occ = chosen[0]
+        return ResolvedSession(
+            available=True,
+            reason=None,
+            needs_selection=False,
+            event=event,
+            occurrence=occ,
+            occurrence_date=today,
+            options=list(chosen),
+            can_encode_visitors=False,
+        )
+
+    if not matches:
+        return ResolvedSession(
+            available=False,
+            reason=REASON_NO_SERVICE,
+            needs_selection=False,
+            event=None,
+            occurrence=None,
+            occurrence_date=today,
+            options=[],
+            can_encode_visitors=False,
+        )
+
+    if len(matches) == 1:
+        event, occ = matches[0]
+        return ResolvedSession(
+            available=True,
+            reason=None,
+            needs_selection=False,
+            event=event,
+            occurrence=occ,
+            occurrence_date=today,
+            options=list(matches),
+            can_encode_visitors=False,
+        )
+
+    return ResolvedSession(
+        available=True,
+        reason=None,
+        needs_selection=False,
+        event=None,
+        occurrence=None,
+        occurrence_date=today,
+        options=list(matches),
+        can_encode_visitors=False,
+    )
+
+
+def resolve_person_public_session(
+    person: Person,
+    event_id: Optional[int] = None,
+    today: Optional[date] = None,
+) -> ResolvedSession:
+    today = today or church_today()
+    matches = find_todays_self_checkin_events(today)
+    selected, reason = select_matches_for_person(
+        matches, person, event_id=event_id
+    )
+
+    if reason == "invalid_event":
+        return ResolvedSession(
+            available=False,
+            reason="invalid_event",
+            needs_selection=False,
+            event=None,
+            occurrence=None,
+            occurrence_date=today,
+            options=[],
+            can_encode_visitors=False,
+        )
+
+    if not selected:
+        return ResolvedSession(
+            available=False,
+            reason=reason or REASON_NO_SERVICE,
+            needs_selection=False,
+            event=None,
+            occurrence=None,
+            occurrence_date=today,
+            options=[],
+            can_encode_visitors=False,
+        )
+
+    if event_id is None and len(selected) > 1:
+        return ResolvedSession(
+            available=True,
+            reason=None,
+            needs_selection=True,
+            event=None,
+            occurrence=None,
+            occurrence_date=today,
+            options=list(selected),
+            can_encode_visitors=False,
+        )
+
+    event, occ = selected[0]
+    return ResolvedSession(
+        available=True,
+        reason=None,
+        needs_selection=False,
+        event=event,
+        occurrence=occ,
+        occurrence_date=today,
+        options=list(selected),
+        can_encode_visitors=False,
+    )
+
+
+def household_queryset(user) -> QuerySet[Person]:
+    family_ids = user.families.filter(is_active=True).values_list("id", flat=True)
+    others = (
+        Person.objects.filter(families__id__in=family_ids)
+        .exclude(pk=user.pk)
+        .exclude(role="ADMIN")
+        .exclude(status="DECEASED")
+    )
+    return (
+        Person.objects.filter(Q(pk=user.pk) | Q(pk__in=others))
+        .distinct()
+        .order_by("last_name", "first_name", "id")
+    )
+
+
+def household_person_ids(user) -> set[int]:
+    return set(household_queryset(user).values_list("id", flat=True))
+
+
+def undoable_person_ids(user, event: Event) -> set[int]:
+    allowed = household_person_ids(user)
+    visitors = visitor_scope_for_event(user, event)
+    if user_is_self_checkin_staff(user):
+        allowed.update(visitors.values_list("pk", flat=True))
+    else:
+        allowed.update(
+            visitors.filter(inviter_id=user.pk).values_list("pk", flat=True)
+        )
+    return allowed
+
+
+def checked_in_person_ids(event: Event, occurrence_date: date) -> set[int]:
+    return set(
+        AttendanceRecord.objects.filter(
+            event=event, occurrence_date=occurrence_date
+        ).values_list("person_id", flat=True)
+    )
+
+
+def assert_registration_for_self_checkin(
+    event: Event,
+    person: Person,
+    occurrence_date: date,
+) -> None:
+    """Self-check-in never uses admin override for registration gates."""
+    from apps.events.services.registration import require_registration_for_checkin
+
+    require_registration_for_checkin(
+        event,
+        person,
+        AttendanceRecord.AttendanceMode.ONLINE,
+        occurrence_date,
+        is_admin_override=False,
+    )
+
+
+def people_scope_for_event(user, event: Event) -> QuerySet[Person]:
+    qs = Person.objects.exclude(role="ADMIN").exclude(status="DECEASED")
+    if event.branch_id:
+        return qs.filter(branch_id=event.branch_id)
+    if user.can_see_all_branches():
+        return qs
+    if getattr(user, "branch_id", None):
+        return qs.filter(branch_id=user.branch_id)
+    return qs.none()
+
+
+def visitor_scope_for_event(user, event: Event) -> QuerySet[Person]:
+    return people_scope_for_event(user, event).filter(role="VISITOR")
+
+
+def invited_prospect_branch_q(branch_id: int) -> Q:
+    return (
+        Q(inviter_cluster__branch_id=branch_id)
+        | Q(endorsed_cluster__branch_id=branch_id)
+        | Q(person__branch_id=branch_id)
+        | Q(invited_by__branch_id=branch_id)
+        | Q(evangelism_group__branch_id=branch_id)
+    )
+
+
+def invited_prospect_scope_for_event(event: Event):
+    from apps.evangelism.models import Prospect
+
+    qs = Prospect.objects.filter(
+        is_dropped_off=False,
+        pipeline_stage=Prospect.PipelineStage.INVITED,
+        person__isnull=True,
+    )
+    if event.branch_id:
+        qs = qs.filter(invited_prospect_branch_q(event.branch_id))
+    return qs.select_related("invited_by").distinct()
+
+
+def search_prospects_by_name(qs, query: str, limit: int = 15):
+    trimmed = (query or "").strip()
+    if len(trimmed) < 2:
+        return qs.none()
+    name_filter = (
+        Q(first_name__icontains=trimmed)
+        | Q(last_name__icontains=trimmed)
+        | Q(middle_name__icontains=trimmed)
+        | Q(facebook_name__icontains=trimmed)
+    )
+    parts = trimmed.split()
+    if len(parts) >= 2:
+        name_filter |= Q(
+            first_name__icontains=parts[0], last_name__icontains=parts[-1]
+        )
+    return qs.filter(name_filter).order_by("last_name", "first_name", "id")[:limit]
+
+
+def exact_prospect_name_matches(first_name: str, last_name: str, event: Event):
+    return invited_prospect_scope_for_event(event).filter(
+        first_name__iexact=(first_name or "").strip(),
+        last_name__iexact=(last_name or "").strip(),
+    ).order_by("id")
+
+
+def search_people_by_name(qs: QuerySet[Person], query: str, limit: int = 15):
+    trimmed = (query or "").strip()
+    if len(trimmed) < 2:
+        return qs.none()
+    name_filter = (
+        Q(first_name__icontains=trimmed)
+        | Q(last_name__icontains=trimmed)
+        | Q(nickname__icontains=trimmed)
+        | Q(middle_name__icontains=trimmed)
+    )
+    parts = trimmed.split()
+    if len(parts) >= 2:
+        given, family = parts[0], parts[-1]
+        name_filter |= Q(
+            first_name__icontains=given, last_name__icontains=family
+        ) | Q(nickname__icontains=given, last_name__icontains=family)
+    return qs.filter(name_filter).order_by("last_name", "first_name", "id")[:limit]
+
+
+def exact_name_matches(
+    first_name: str, last_name: str, branch_id: Optional[int]
+) -> QuerySet[Person]:
+    qs = Person.objects.exclude(role="ADMIN").filter(
+        first_name__iexact=(first_name or "").strip(),
+        last_name__iexact=(last_name or "").strip(),
+    )
+    if branch_id is not None:
+        qs = qs.filter(branch_id=branch_id)
+    return qs.order_by("id")
+
+
+def serialize_event_option(event: Event, occ: Occurrence) -> dict:
+    attendance_format = (
+        event.attendance_format or Event.AttendanceFormat.HYBRID
+    )
+    return {
+        "event_id": event.pk,
+        "title": event.title,
+        "branch": event.branch_id,
+        "branch_name": event.branch.name if event.branch_id else None,
+        "location": event.location or "",
+        "room_name": event.room.name if event.room_id else None,
+        "start": occ.start.isoformat(),
+        "end": occ.end.isoformat(),
+        "occurrence_date": church_calendar_date(occ.start).isoformat()
+        if church_calendar_date(occ.start)
+        else None,
+        "attendance_format": attendance_format,
+        "requires_online_venue": event_requires_online_venue(event),
+    }
+
+
+def serialize_session_event(event: Event, occ: Occurrence) -> dict:
+    payload = serialize_event_option(event, occ)
+    payload["id"] = event.pk
+    payload["type"] = event.event_type_id
+    payload["type_display"] = event.event_type.label if event.event_type_id else ""
+    return payload
+
+
+def person_full_name(person: Person) -> str:
+    return (
+        format_person_display_name(person)
+        or person.username
+        or f"Person #{person.pk}"
+    )
+
+
+def serialize_person_slim(
+    person: Person,
+    *,
+    already_checked_in: bool,
+    is_self: bool = False,
+    request=None,
+) -> dict:
+    photo = None
+    if person.photo:
+        url = person.photo.url
+        photo = request.build_absolute_uri(url) if request else url
+    return {
+        "id": person.pk,
+        "first_name": person.first_name or "",
+        "last_name": person.last_name or "",
+        "nickname": person.nickname or "",
+        "full_name": person_full_name(person),
+        "role": person.role,
+        "status": person.status or "",
+        "member_id": person.member_id or "",
+        "photo": photo,
+        "is_self": is_self,
+        "already_checked_in": already_checked_in,
+        "kind": "visitor",
+    }
+
+
+def serialize_public_person(
+    person: Person,
+    *,
+    already_checked_in: bool,
+    request=None,
+) -> dict:
+    photo = None
+    if person.photo:
+        url = person.photo.url
+        photo = request.build_absolute_uri(url) if request else url
+    return {
+        "id": person.pk,
+        "first_name": person.first_name or "",
+        "last_name": person.last_name or "",
+        "nickname": person.nickname or "",
+        "full_name": person_full_name(person),
+        "member_id": person.member_id or "",
+        "photo": photo,
+        "already_checked_in": already_checked_in,
+    }
+
+
+def serialize_prospect_match(prospect) -> dict:
+    invited_by = getattr(prospect, "invited_by", None)
+    return {
+        "id": prospect.pk,
+        "prospect_id": prospect.pk,
+        "first_name": prospect.first_name or "",
+        "last_name": prospect.last_name or "",
+        "nickname": "",
+        "full_name": prospect.display_name,
+        "role": "INVITED",
+        "status": "INVITED",
+        "member_id": "",
+        "photo": None,
+        "is_self": False,
+        "already_checked_in": False,
+        "kind": "prospect",
+        "invited_by_name": (
+            format_person_display_name(invited_by) if invited_by else ""
+        ),
+    }
+
+
+def parse_event_id(raw) -> Optional[int]:
+    if raw in (None, "", False):
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_occurrence_date(raw) -> Optional[date]:
+    if raw in (None, "", False):
+        return None
+    if isinstance(raw, date) and not isinstance(raw, datetime):
+        return raw
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        return None
+
+
+def resolve_onsite_guest_session(
+    user,
+    event_id: Optional[int] = None,
+    occurrence_date: Optional[date] = None,
+) -> ResolvedSession:
+    """Staff onsite guest session for an approved activity occurrence.
+
+    When ``event_id`` and ``occurrence_date`` are both set (e.g. from check-in),
+    validate that approved activity occurrence. Otherwise resolve today's
+    self-check-in-enabled events like online self-check-in.
+    """
+    if event_id is not None and occurrence_date is not None:
+        try:
+            event = (
+                Event.objects.select_related("event_type", "branch", "room")
+                .get(pk=event_id)
+            )
+        except Event.DoesNotExist:
+            return ResolvedSession(
+                available=False,
+                reason="invalid_event",
+                needs_selection=False,
+                event=None,
+                occurrence=None,
+                occurrence_date=occurrence_date,
+                options=[],
+                can_encode_visitors=True,
+            )
+        if not _event_allows_staff_onsite_guest(event):
+            return ResolvedSession(
+                available=False,
+                reason="invalid_event",
+                needs_selection=False,
+                event=None,
+                occurrence=None,
+                occurrence_date=occurrence_date,
+                options=[],
+                can_encode_visitors=True,
+            )
+        if not _is_visible_to_user(event, user):
+            return ResolvedSession(
+                available=False,
+                reason="invalid_event",
+                needs_selection=False,
+                event=None,
+                occurrence=None,
+                occurrence_date=occurrence_date,
+                options=[],
+                can_encode_visitors=True,
+            )
+        occ = occurrence_on_date(event, occurrence_date)
+        if occ is None:
+            return ResolvedSession(
+                available=False,
+                reason="invalid_event",
+                needs_selection=False,
+                event=None,
+                occurrence=None,
+                occurrence_date=occurrence_date,
+                options=[],
+                can_encode_visitors=True,
+            )
+        return ResolvedSession(
+            available=True,
+            reason=None,
+            needs_selection=False,
+            event=event,
+            occurrence=occ,
+            occurrence_date=occurrence_date,
+            options=[(event, occ)],
+            can_encode_visitors=True,
+        )
+
+    target_day = occurrence_date or church_today()
+    resolved = resolve_session(user, event_id=event_id, today=target_day)
+    return ResolvedSession(
+        available=resolved.available,
+        reason=resolved.reason,
+        needs_selection=resolved.needs_selection,
+        event=resolved.event,
+        occurrence=resolved.occurrence,
+        occurrence_date=resolved.occurrence_date,
+        options=list(resolved.options),
+        can_encode_visitors=True,
+    )
+
+
+def validate_guest_encode_fields(data) -> Tuple[dict, dict]:
+    """Return (cleaned_fields, errors) for guest create payloads."""
+    from apps.people.name_formatting import title_case_name
+
+    first_name = title_case_name(str(data.get("first_name") or "").strip())
+    last_name = title_case_name(str(data.get("last_name") or "").strip())
+    gender = str(data.get("gender") or "").strip().upper()
+    age_group = str(data.get("age_group") or "").strip().upper()
+    phone = str(data.get("phone") or "").strip()
+    email = str(data.get("email") or "").strip()
+    errors: dict = {}
+    if not first_name:
+        errors["first_name"] = ["First name is required."]
+    if not last_name:
+        errors["last_name"] = ["Last name is required."]
+    if gender not in ("MALE", "FEMALE"):
+        errors["gender"] = ["Select Male or Female."]
+    if age_group not in AGE_GROUP_LABELS:
+        errors["age_group"] = ["Select Adult, Youth, or Child."]
+    if phone and len(phone) > 20:
+        errors["phone"] = ["Phone must be 20 characters or fewer."]
+    if errors:
+        return {}, errors
+    return {
+        "first_name": first_name,
+        "last_name": last_name,
+        "gender": gender,
+        "age_group": age_group,
+        "phone": phone,
+        "email": email,
+    }, {}
+
+
+def parse_first_time_attending(raw) -> bool:
+    """True when omitted; accept common truthy/falsey payload values."""
+    if raw in (None, ""):
+        return True
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    text = str(raw).strip().lower()
+    if text in ("1", "true", "yes", "y", "on"):
+        return True
+    if text in ("0", "false", "no", "n", "off"):
+        return False
+    return True
+
+
+def create_visitor_guest_person(
+    *,
+    first_name: str,
+    last_name: str,
+    gender: str,
+    age_group: str,
+    phone: str = "",
+    email: str = "",
+    branch=None,
+    inviter=None,
+    date_first_attended: Optional[date] = None,
+    date_first_invited: Optional[date] = None,
+    first_activity_attended=None,
+) -> Person:
+    """Create a VISITOR person + age-group Journey note (no attendance)."""
+    from apps.events.models import EventType
+    from apps.people.models import Journey, Person
+    from apps.people.usernames import generate_unique_username
+
+    attended = date_first_attended or church_today()
+    event_type = first_activity_attended
+    if event_type is None:
+        event_type = EventType.objects.filter(code=SUNDAY_SERVICE_TYPE).first()
+    person = Person(
+        username=generate_unique_username(first_name, last_name),
+        first_name=first_name,
+        last_name=last_name,
+        gender=gender,
+        phone=phone,
+        email=email,
+        role="VISITOR",
+        status="ONGOING",
+        date_first_attended=attended,
+        date_first_invited=date_first_invited,
+        first_activity_attended=event_type,
+        branch=branch,
+        inviter=inviter,
+    )
+    person.set_unusable_password()
+    person.save()
+
+    Journey.objects.create(
+        user=person,
+        type="NOTE",
+        title="Visitor note",
+        description=f"Age group: {AGE_GROUP_LABELS[age_group]}",
+        date=person.date_first_attended or church_today(),
+        verified_by=None,
+    )
+    return person
+
+
+def resolve_optional_inviter(user, event: Event, inviter_id) -> Tuple[Optional[Person], Optional[dict]]:
+    """Staff may set an optional inviter; omit/blank means walk-in (null)."""
+    if inviter_id in (None, "", False):
+        return None, None
+    parsed = parse_event_id(inviter_id)
+    if parsed is None:
+        return None, {"inviter_id": ["Invalid inviter."]}
+    qs = (
+        people_scope_for_event(user, event)
+        .exclude(role="VISITOR")
+        .exclude(status="DECEASED")
+    )
+    try:
+        return qs.get(pk=parsed), None
+    except Person.DoesNotExist:
+        return None, {"inviter_id": ["Inviter not found for this service."]}
+
+
+def parse_person_ids(raw: Iterable) -> List[int]:
+    ids: List[int] = []
+    seen = set()
+    for value in raw or []:
+        try:
+            pk = int(value)
+        except (TypeError, ValueError):
+            continue
+        if pk not in seen:
+            seen.add(pk)
+            ids.append(pk)
+    return ids

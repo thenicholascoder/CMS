@@ -1,0 +1,1792 @@
+import React, { useState, useMemo, useRef, useEffect } from "react";
+import ReactDOM from "react-dom";
+import { Person } from "@/src/types/person";
+import * as XLSX from "xlsx";
+import { jsPDF } from "jspdf";
+import autoTable from "jspdf-autotable";
+import ExportPreviewModal from "./ExportPreviewModal";
+import ImportModal from "./ImportModal";
+import BulkActionsMenu from "./BulkActionsMenu";
+import SelectedPeoplePreview from "./SelectedPeoplePreview";
+import { formatPersonStatusLabel } from "@/src/lib/personStatus";
+import {
+  PEOPLE_EXPORT_FIELDS,
+  formatExportDate,
+  formatPersonClusterExportValue,
+  type PeopleExportFormat,
+} from "@/src/lib/peopleImport";
+import { Branch } from "@/src/types/branch";
+import {
+  ChevronUpIcon,
+  ChevronDownIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
+  DocumentArrowDownIcon,
+} from "@heroicons/react/24/outline";
+import { TABLE_ENTITY_LINK_CLASS } from "@/src/lib/tableEntityLink";
+import { getPersonRoleColor } from "@/src/lib/personRole";
+import { useEventTypeOptions } from "@/src/hooks/useEventTypeOptions";
+import PersonAvatar from "@/src/components/people/PersonAvatar";
+import { formatPersonName } from "@/src/lib/name";
+import { LockedControlTooltip } from "@/src/components/ui/LockedControlTooltip";
+import ViewModeToggle from "@/src/components/ui/ViewModeToggle";
+
+interface DataTableProps {
+  people: Person[];
+  highlightedPersonId?: string | null;
+  onView?: (person: Person) => void;
+  onEdit?: (person: Person) => void;
+  /** When set, Edit is shown only for people this returns true for. Defaults to all when onEdit is set. */
+  canEditPerson?: (person: Person) => boolean;
+  onDelete?: (person: Person) => void;
+  onBulkDelete?: (people: Person[]) => void;
+  onBulkExport?: (people: Person[], format: PeopleExportFormat) => void;
+  /** Export all matching (server-filtered) people; when set, Export All uses this instead of the current page. */
+  onExportAll?: (opts?: {
+    branch?: number | string | null;
+  }) => Promise<Person[]> | Person[];
+  onImport?: (rows: Record<string, string>[]) => Promise<void> | void;
+  /** When false, hide Export All and bulk export. Defaults to true. */
+  canExport?: boolean;
+  defaultBranchId?: number | null;
+  defaultBranchCode?: string | null;
+  branches?: Branch[];
+  canChangeBranchFilter?: boolean;
+  /** Shrinks the double-click hint when the people side panel is open. */
+  sidePanelOpen?: boolean;
+  /** Server-driven pagination (when totalCount is provided). */
+  page?: number;
+  pageSize?: number;
+  totalCount?: number;
+  onPageChange?: (page: number) => void;
+  onPageSizeChange?: (pageSize: number) => void;
+  sortBy?: string;
+  sortDir?: "asc" | "desc";
+  onSortChange?: (sortBy: string, sortDir: "asc" | "desc") => void;
+}
+
+export default function DataTable({
+  people,
+  highlightedPersonId = null,
+  onView,
+  onEdit,
+  canEditPerson,
+  onDelete,
+  onBulkDelete,
+  onBulkExport,
+  onExportAll,
+  onImport,
+  canExport = true,
+  defaultBranchId = null,
+  defaultBranchCode = null,
+  branches = [],
+  canChangeBranchFilter = true,
+  page: controlledPage,
+  pageSize: controlledPageSize,
+  totalCount,
+  onPageChange,
+  onPageSizeChange,
+  sortBy: controlledSortBy,
+  sortDir: controlledSortDir,
+  onSortChange,
+  sidePanelOpen = false,
+}: DataTableProps) {
+  const { getLabel: getEventTypeLabel } = useEventTypeOptions();
+  type DisplayPerson = Person & {
+    name: string;
+    dateFirstAttended?: string;
+    waterBaptismDate?: string;
+    spiritBaptismDate?: string;
+    dateOfBirth?: string;
+  };
+
+  const toDisplayPerson = (p: Person): DisplayPerson => ({
+    ...p,
+    name: formatPersonName(p),
+    dateFirstAttended: p.date_first_attended,
+    waterBaptismDate: (p as Person & { water_baptism_date?: string })
+      .water_baptism_date,
+    spiritBaptismDate: (p as Person & { spirit_baptism_date?: string })
+      .spirit_baptism_date,
+    dateOfBirth: p.date_of_birth,
+  });
+
+  const fetchExportAllPeople = async (branch: string): Promise<DisplayPerson[]> => {
+    if (!onExportAll) return [];
+    const all = await onExportAll({
+      branch: branch === "" ? null : branch,
+    });
+    return all.map(toDisplayPerson);
+  };
+
+  // Normalize backend fields and hide admin/blank-name entries from the table
+  const displayPeople: DisplayPerson[] = people
+    .filter(
+      (p) =>
+        p.role !== "ADMIN" && // Exclude ADMIN users
+        p.username !== "admin" && // Keep the username check as backup
+        ((p.first_name ?? "") !== "" || (p.last_name ?? "") !== "")
+    )
+    .map(toDisplayPerson);
+
+  const isServerPaged = typeof totalCount === "number";
+  const [internalSortField, setInternalSortField] =
+    useState<keyof DisplayPerson>("last_name");
+  const [internalSortDirection, setInternalSortDirection] = useState<
+    "asc" | "desc"
+  >("asc");
+  const [internalPage, setInternalPage] = useState(1);
+  const [internalPageSize, setInternalPageSize] = useState(10);
+
+  const sortField = (controlledSortBy ??
+    internalSortField) as keyof DisplayPerson;
+  const sortDirection = controlledSortDir ?? internalSortDirection;
+  const currentPage = controlledPage ?? internalPage;
+  const itemsPerPage = controlledPageSize ?? internalPageSize;
+
+  const setCurrentPage = (page: number) => {
+    if (onPageChange) {
+      onPageChange(page);
+    } else {
+      setInternalPage(page);
+    }
+  };
+
+  const setItemsPerPage = (size: number) => {
+    if (onPageSizeChange) {
+      onPageSizeChange(size);
+    } else {
+      setInternalPageSize(size);
+    }
+    setCurrentPage(1);
+  };
+  const [showExportModal, setShowExportModal] = useState(false);
+  const [exportLockedFormat, setExportLockedFormat] =
+    useState<PeopleExportFormat | null>(null);
+  const [exportModalPeople, setExportModalPeople] = useState<DisplayPerson[]>(
+    []
+  );
+  const [showImportModal, setShowImportModal] = useState(false);
+  const [showColumnsModal, setShowColumnsModal] = useState(false);
+  const [selectedPeople, setSelectedPeople] = useState<Set<string>>(new Set());
+  const [openActionMenuId, setOpenActionMenuId] = useState<string | null>(null);
+  const [openActionMenuView, setOpenActionMenuView] = useState<
+    "mobile-card" | "mobile-table" | "desktop" | null
+  >(null);
+  const [mobileViewMode, setMobileViewMode] = useState<"cards" | "table">(
+    "cards"
+  );
+
+  // Available columns with their config
+  const availableColumns = [
+    { key: "first_name", label: "First Name", default: true },
+    { key: "middle_name", label: "Middle Name", default: false },
+    { key: "last_name", label: "Last Name", default: true },
+    { key: "suffix", label: "Suffix", default: false },
+    { key: "maiden_name", label: "Maiden Name", default: false },
+    { key: "username", label: "Username", default: false },
+    { key: "email", label: "Email", default: false },
+    { key: "phone", label: "Phone", default: false },
+    { key: "gender", label: "Gender", default: false },
+    { key: "address", label: "Address", default: false },
+    { key: "country", label: "Country", default: false },
+    { key: "role", label: "Role", default: true },
+    { key: "status", label: "Status", default: true },
+    { key: "branch", label: "Branch", default: false },
+    { key: "cluster_codes", label: "Cluster Code", default: false },
+    { key: "dateOfBirth", label: "Date of Birth", default: false },
+    { key: "dateFirstAttended", label: "First Attended", default: true },
+    { key: "waterBaptismDate", label: "Water Baptism", default: false },
+    { key: "spiritBaptismDate", label: "Spirit Baptism", default: false },
+    { key: "first_activity_attended", label: "First Activity", default: false },
+    { key: "member_id", label: "LAMP ID", default: false },
+    { key: "facebook_name", label: "Facebook Name", default: false },
+  ];
+
+  const [visibleColumns, setVisibleColumns] = useState<Set<string>>(
+    new Set(availableColumns.map((col) => col.key))
+  );
+
+  const handleSort = (field: keyof DisplayPerson) => {
+    const nextDir =
+      field === sortField && sortDirection === "asc" ? "desc" : "asc";
+    if (onSortChange) {
+      onSortChange(String(field), field === sortField ? nextDir : "asc");
+      return;
+    }
+    if (field === sortField) {
+      setInternalSortDirection(sortDirection === "asc" ? "desc" : "asc");
+    } else {
+      setInternalSortField(field);
+      setInternalSortDirection("asc");
+    }
+  };
+
+  const handleSelectAll = () => {
+    if (selectedPeople.size === paginatedPeople.length) {
+      setSelectedPeople(new Set());
+    } else {
+      setSelectedPeople(new Set(paginatedPeople.map((p) => p.id)));
+    }
+  };
+
+  const handleSelectPerson = (personId: string) => {
+    const newSelected = new Set(selectedPeople);
+    if (newSelected.has(personId)) {
+      newSelected.delete(personId);
+    } else {
+      newSelected.add(personId);
+    }
+    setSelectedPeople(newSelected);
+  };
+
+  const getSelectedPeopleObjects = (): Person[] => {
+    return displayPeople.filter((p) => selectedPeople.has(p.id));
+  };
+
+  const getStatusColor = (status: string) => {
+    switch (status) {
+      case "ACTIVE":
+        return "bg-green-100 text-green-800";
+      case "SEMIACTIVE":
+        return "bg-yellow-100 text-yellow-800";
+      case "ONGOING":
+        return "bg-green-100 text-green-800";
+      case "NO_RESPONSE":
+        return "bg-yellow-100 text-yellow-800";
+      case "INACTIVE":
+        return "bg-red-100 text-red-800";
+      case "DORMANT":
+        return "bg-orange-100 text-orange-800";
+      case "FALLAWAY":
+        return "bg-violet-100 text-violet-800";
+      case "DECEASED":
+        return "bg-gray-100 text-gray-800";
+      default:
+        return "bg-gray-100 text-gray-800";
+    }
+  };
+
+
+  const handleBulkDelete = () => {
+    const selectedPeopleObjects = getSelectedPeopleObjects();
+    if (onBulkDelete) {
+      onBulkDelete(selectedPeopleObjects);
+    }
+    setSelectedPeople(new Set());
+  };
+
+  const openExportModal = (
+    people: DisplayPerson[],
+    lockedFormat: PeopleExportFormat | null = null
+  ) => {
+    setExportModalPeople(people);
+    setExportLockedFormat(lockedFormat);
+    setShowExportModal(true);
+  };
+
+  const closeExportModal = () => {
+    setShowExportModal(false);
+    setExportLockedFormat(null);
+    setExportModalPeople([]);
+  };
+
+  const handleBulkExport = (format: PeopleExportFormat) => {
+    openExportModal(getSelectedPeopleObjects() as DisplayPerson[], format);
+  };
+
+  const EXPORT_DATE_KEYS = new Set([
+    "date_of_birth",
+    "date_first_attended",
+    "water_baptism_date",
+    "spirit_baptism_date",
+  ]);
+
+  const resolveExportColumns = (fields?: string[]) => {
+    const wanted =
+      fields && fields.length > 0
+        ? fields
+        : PEOPLE_EXPORT_FIELDS.map((f) => f.key).filter((k) => k !== "address");
+    const byKey = new Map(PEOPLE_EXPORT_FIELDS.map((f) => [f.key, f]));
+    return wanted
+      .map((key) => byKey.get(key))
+      .filter((f): f is (typeof PEOPLE_EXPORT_FIELDS)[number] => Boolean(f));
+  };
+
+  const getExportCellValue = (person: any, key: string) => {
+    if (key === "cluster") {
+      return formatPersonClusterExportValue(person);
+    }
+    const raw =
+      person[key] ??
+      (key === "date_first_attended"
+        ? person.dateFirstAttended
+        : key === "water_baptism_date"
+          ? person.waterBaptismDate
+          : key === "spirit_baptism_date"
+            ? person.spiritBaptismDate
+            : key === "date_of_birth"
+              ? person.dateOfBirth
+              : undefined);
+
+    if (raw == null || raw === "") return "";
+    if (EXPORT_DATE_KEYS.has(key)) {
+      return formatExportDate(String(raw));
+    }
+    return String(raw);
+  };
+
+  const escapeCsvValue = (value: string) => {
+    if (/[",\n\r]/.test(value)) {
+      return `"${value.replace(/"/g, '""')}"`;
+    }
+    return value;
+  };
+
+  const exportToExcel = (
+    peopleToExport: any[] = displayPeople,
+    fields?: string[]
+  ) => {
+    const columns = resolveExportColumns(fields);
+    const worksheet = XLSX.utils.json_to_sheet(
+      peopleToExport.map((person) => {
+        const row: Record<string, string> = {};
+        for (const col of columns) {
+          row[col.label] = getExportCellValue(person, col.key);
+        }
+        return row;
+      })
+    );
+
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, "People");
+    XLSX.writeFile(workbook, "people_data.xlsx");
+  };
+
+  const exportToPDF = (
+    peopleToExport: any[] = displayPeople,
+    fields?: string[]
+  ) => {
+    const doc = new jsPDF({
+      orientation: "landscape",
+    });
+    const columns = resolveExportColumns(fields);
+    const tableColumn = columns.map((c) => c.label);
+    const tableRows = peopleToExport.map((person) =>
+      columns.map((c) => getExportCellValue(person, c.key))
+    );
+
+    autoTable(doc, {
+      head: [tableColumn],
+      body: tableRows,
+      startY: 20,
+      theme: "grid",
+      styles: { fontSize: 7 },
+    });
+
+    doc.save("people_data.pdf");
+  };
+
+  const exportToCSV = (
+    peopleToExport: any[] = displayPeople,
+    fields?: string[]
+  ) => {
+    const columns = resolveExportColumns(fields);
+    const header = columns.map((c) => escapeCsvValue(c.label)).join(",");
+    const csvContent = peopleToExport
+      .map((person) =>
+        columns
+          .map((c) => escapeCsvValue(getExportCellValue(person, c.key)))
+          .join(",")
+      )
+      .join("\n");
+
+    const blob = new Blob([`${header}\n${csvContent}`], {
+      type: "text/csv;charset=utf-8;",
+    });
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = "people_data.csv";
+    link.click();
+  };
+
+  const handleExport = (
+    format: PeopleExportFormat,
+    fields?: string[],
+    peopleToExport?: Person[]
+  ) => {
+    const wasBulkExport = exportLockedFormat != null;
+    closeExportModal();
+
+    // Build a projection of current people using selected fields
+    const selected = fields && fields.length > 0 ? fields : undefined;
+    const wanted = selected || [
+      "first_name",
+      "middle_name",
+      "last_name",
+      "maiden_name",
+      "username",
+      "email",
+      "phone",
+      "role",
+      "status",
+      "country",
+      "address",
+      "date_of_birth",
+      "date_first_attended",
+      "first_activity_attended",
+      "water_baptism_date",
+      "spirit_baptism_date",
+      "member_id",
+      "cluster",
+    ];
+    const sourcePeople =
+      peopleToExport ??
+      (exportModalPeople.length > 0 ? exportModalPeople : displayPeople);
+    const project = (list: DisplayPerson[]) =>
+      list.map((p) => {
+        const row: Record<string, any> = {};
+        const source: any = p as any;
+        const add = (k: string, v: any) => {
+          row[k] = v ?? "";
+        };
+        for (const key of wanted) {
+          switch (key) {
+            case "date_first_attended":
+              add(key, source.dateFirstAttended);
+              break;
+            case "first_activity_attended":
+              add(
+                key,
+                getEventTypeLabel(source.first_activity_attended) ||
+                  source.first_activity_attended
+              );
+              break;
+            case "water_baptism_date":
+              add(key, source.waterBaptismDate);
+              break;
+            case "spirit_baptism_date":
+              add(key, source.spiritBaptismDate);
+              break;
+            case "cluster":
+              add(key, formatPersonClusterExportValue(source));
+              break;
+            default:
+              add(key, source[key]);
+          }
+        }
+        return row;
+      });
+
+    const exportFormat = exportLockedFormat ?? format;
+    const rows = project(sourcePeople as DisplayPerson[]);
+    switch (exportFormat) {
+      case "excel":
+        exportToExcel(rows, wanted);
+        break;
+      case "pdf":
+        exportToPDF(rows, wanted);
+        break;
+      case "csv":
+        exportToCSV(rows, wanted);
+        break;
+    }
+
+    if (wasBulkExport) {
+      onBulkExport?.(sourcePeople, exportFormat);
+      setSelectedPeople(new Set());
+    }
+  };
+
+  const SortIcon = ({ field }: { field: keyof DisplayPerson }) => {
+    if (field !== sortField) return null;
+    return sortDirection === "asc" ? (
+      <ChevronUpIcon className="w-4 h-4 inline-block" />
+    ) : (
+      <ChevronDownIcon className="w-4 h-4 inline-block" />
+    );
+  };
+
+  // Action Menu Component for each row
+  const ActionMenu = ({
+    person,
+    isOpen,
+    onOpen,
+    onClose,
+    currentOpenMenuId,
+    viewType,
+  }: {
+    person: DisplayPerson;
+    isOpen: boolean;
+    onOpen: () => void;
+    onClose: () => void;
+    currentOpenMenuId: string | null;
+    viewType: "mobile-card" | "mobile-table" | "desktop";
+  }) => {
+    const menuRef = useRef<HTMLDivElement>(null);
+    const buttonRef = useRef<HTMLButtonElement>(null);
+    const portalMenuRef = useRef<HTMLDivElement>(null);
+    const [mounted, setMounted] = useState(false);
+    const [coords, setCoords] = useState<{ top: number; left: number } | null>(
+      null
+    );
+
+    useEffect(() => {
+      setMounted(true);
+    }, []);
+
+    // Calculate position when menu opens
+    useEffect(() => {
+      // Only calculate if this menu is actually open, matches the global state, and matches the view type
+      const isActiveView =
+        (viewType === "mobile-card" && mobileViewMode === "cards") ||
+        (viewType === "mobile-table" && mobileViewMode === "table") ||
+        viewType === "desktop";
+
+      if (
+        isOpen &&
+        currentOpenMenuId === person.id &&
+        openActionMenuView === viewType &&
+        isActiveView &&
+        buttonRef.current
+      ) {
+        const buttonRect = buttonRef.current.getBoundingClientRect();
+        const viewportHeight = window.innerHeight;
+        const viewportWidth = window.innerWidth;
+        const dropdownHeight = 200;
+        const dropdownWidth = 192;
+        const isMobile = viewportWidth < 768;
+
+        // Calculate top position
+        const minTop = 8;
+        const maxTop = Math.max(minTop, viewportHeight - dropdownHeight - 8);
+        const proposedTop = buttonRect.bottom + 4;
+        const top = Math.max(minTop, Math.min(maxTop, proposedTop));
+
+        // Calculate left position - on mobile, center it or align to button
+        let left: number;
+        if (isMobile) {
+          // On mobile, try to align with button, but ensure it fits
+          const proposedLeft = buttonRect.right - dropdownWidth;
+          const minLeft = 8;
+          const maxLeft = viewportWidth - dropdownWidth - 8;
+          left = Math.max(minLeft, Math.min(maxLeft, proposedLeft));
+        } else {
+          // On desktop, align to right edge of button
+          const proposedLeft = buttonRect.right - dropdownWidth;
+          const minLeft = 8;
+          const maxLeft = viewportWidth - dropdownWidth - 8;
+          left = Math.max(minLeft, Math.min(maxLeft, proposedLeft));
+        }
+
+        setCoords({ top, left });
+      } else if (
+        !isOpen ||
+        currentOpenMenuId !== person.id ||
+        openActionMenuView !== viewType
+      ) {
+        setCoords(null);
+      }
+    }, [
+      isOpen,
+      currentOpenMenuId,
+      person.id,
+      openActionMenuView,
+      viewType,
+      mobileViewMode,
+    ]);
+
+    useEffect(() => {
+      if (!isOpen) return;
+
+      const handleClickOutside = (event: MouseEvent | TouchEvent) => {
+        const target = event.target as Node;
+        const clickedInsideButton = menuRef.current?.contains(target);
+        const clickedInsidePortal = portalMenuRef.current?.contains(target);
+        if (!clickedInsideButton && !clickedInsidePortal) {
+          onClose();
+        }
+      };
+
+      // Use mousedown for desktop and touchend for mobile
+      // touchend fires after the user lifts their finger, allowing button actions to complete first
+      document.addEventListener("mousedown", handleClickOutside);
+      document.addEventListener("touchend", handleClickOutside);
+
+      return () => {
+        document.removeEventListener("mousedown", handleClickOutside);
+        document.removeEventListener("touchend", handleClickOutside);
+      };
+    }, [isOpen, onClose]);
+
+    const handleToggle = (
+      e:
+        | React.MouseEvent<HTMLButtonElement>
+        | React.TouchEvent<HTMLButtonElement>
+    ) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if ("stopImmediatePropagation" in e.nativeEvent) {
+        e.nativeEvent.stopImmediatePropagation();
+      }
+
+      if (!isOpen) {
+        // Close any other open menu first
+        if (currentOpenMenuId && currentOpenMenuId !== person.id) {
+          onClose();
+        }
+        // Small delay to ensure state is cleared
+        requestAnimationFrame(() => {
+          onOpen();
+        });
+      } else {
+        onClose();
+      }
+    };
+
+    return (
+      <div className="relative" ref={menuRef}>
+        <button
+          ref={buttonRef}
+          onClick={handleToggle}
+          onTouchEnd={handleToggle}
+          type="button"
+          className="p-2 min-h-[44px] min-w-[44px] text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-lg transition-colors flex items-center justify-center"
+          title="Actions"
+        >
+          <svg
+            className="w-5 h-5"
+            fill="none"
+            stroke="currentColor"
+            viewBox="0 0 24 24"
+          >
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              strokeWidth={2}
+              d="M5 12h.01M12 12h.01M19 12h.01M6 12a1 1 0 11-2 0 1 1 0 012 0zm7 0a1 1 0 11-2 0 1 1 0 012 0zm7 0a1 1 0 11-2 0 1 1 0 012 0z"
+            />
+          </svg>
+        </button>
+
+        {isOpen &&
+          mounted &&
+          coords &&
+          currentOpenMenuId === person.id &&
+          openActionMenuView === viewType &&
+          ReactDOM.createPortal(
+            <div
+              ref={portalMenuRef}
+              className="fixed w-48 bg-white rounded-md shadow-lg ring-1 ring-black ring-opacity-5 focus:outline-none z-[9999]"
+              style={{ top: `${coords.top}px`, left: `${coords.left}px` }}
+              onClick={(e) => {
+                // Only stop propagation to prevent outside click handler from firing
+                // Don't prevent default so buttons inside can be clicked
+                e.stopPropagation();
+              }}
+              onMouseDown={(e) => {
+                // Prevent mousedown from bubbling to document (which would close menu)
+                e.stopPropagation();
+              }}
+              onTouchStart={(e) => {
+                // Prevent touchstart from bubbling to document (which would close menu on mobile)
+                e.stopPropagation();
+              }}
+              onTouchEnd={(e) => {
+                // Prevent touchend from bubbling to document (which would close menu on mobile)
+                e.stopPropagation();
+              }}
+            >
+              <div className="py-1">
+                {onView && (
+                  <button
+                    type="button"
+                    title={
+                      person.can_view_profile === false
+                        ? "Only people in your cluster can be viewed. Assign them to your cluster first."
+                        : undefined
+                    }
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      onView(person as Person);
+                      onClose();
+                    }}
+                    onTouchEnd={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      onView(person as Person);
+                      onClose();
+                    }}
+                    className="flex items-center w-full px-4 py-2 min-h-[44px] text-sm text-gray-700 hover:bg-gray-100 hover:text-gray-900 active:bg-gray-100 cursor-pointer"
+                  >
+                    <svg
+                      className="w-4 h-4 mr-2 text-primary"
+                      fill="none"
+                      stroke="currentColor"
+                      viewBox="0 0 24 24"
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth={2}
+                        d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"
+                      />
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth={2}
+                        d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"
+                      />
+                    </svg>
+                    View
+                  </button>
+                )}
+                {onEdit &&
+                  (canEditPerson
+                    ? canEditPerson(person as Person)
+                    : true) && (
+                  <button
+                    type="button"
+                    title={
+                      person.can_view_profile === false
+                        ? "Only people in your cluster can be edited. Assign them to your cluster first."
+                        : undefined
+                    }
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      onEdit(person as Person);
+                      onClose();
+                    }}
+                    onTouchEnd={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      onEdit(person as Person);
+                      onClose();
+                    }}
+                    className="flex items-center w-full px-4 py-2 min-h-[44px] text-sm text-gray-700 hover:bg-gray-100 hover:text-gray-900 active:bg-gray-100 cursor-pointer"
+                  >
+                    <svg
+                      className="w-4 h-4 mr-2 text-green-500"
+                      fill="none"
+                      stroke="currentColor"
+                      viewBox="0 0 24 24"
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth={2}
+                        d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"
+                      />
+                    </svg>
+                    Edit
+                  </button>
+                )}
+                {onDelete && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      onDelete(person as Person);
+                      onClose();
+                    }}
+                    onTouchEnd={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      onDelete(person as Person);
+                      onClose();
+                    }}
+                    className="flex items-center w-full px-4 py-2 min-h-[44px] text-sm text-red-600 hover:bg-red-50 hover:text-red-700 active:bg-red-50 cursor-pointer"
+                  >
+                    <svg
+                      className="w-4 h-4 mr-2"
+                      fill="none"
+                      stroke="currentColor"
+                      viewBox="0 0 24 24"
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth={2}
+                        d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"
+                      />
+                    </svg>
+                    Delete
+                  </button>
+                )}
+              </div>
+            </div>,
+            document.body
+          )}
+      </div>
+    );
+  };
+
+  const sortedPeople = isServerPaged
+    ? displayPeople
+    : [...displayPeople].sort((a, b) => {
+        const normalize = (person: DisplayPerson) => {
+          if (sortField === "cluster_codes") {
+            return person.cluster_codes?.filter(Boolean).join(", ") ?? "";
+          }
+          if (sortField === "branch") {
+            return person.branch_code?.trim() || "";
+          }
+          return person[sortField] as string | number | undefined;
+        };
+
+        const aNorm = normalize(a);
+        const bNorm = normalize(b);
+
+        if (aNorm == null && bNorm == null) return 0;
+        if (aNorm == null || aNorm === "")
+          return sortDirection === "asc" ? 1 : -1;
+        if (bNorm == null || bNorm === "")
+          return sortDirection === "asc" ? -1 : 1;
+
+        if (aNorm < bNorm) return sortDirection === "asc" ? -1 : 1;
+        if (aNorm > bNorm) return sortDirection === "asc" ? 1 : -1;
+        return 0;
+      });
+
+  const resultCount = isServerPaged ? totalCount! : sortedPeople.length;
+  const totalPages = Math.max(1, Math.ceil(resultCount / itemsPerPage));
+  const startIndex = isServerPaged
+    ? (currentPage - 1) * itemsPerPage
+    : (currentPage - 1) * itemsPerPage;
+  const endIndex = isServerPaged
+    ? Math.min(startIndex + displayPeople.length, resultCount)
+    : startIndex + itemsPerPage;
+  const paginatedPeople = isServerPaged
+    ? sortedPeople
+    : sortedPeople.slice(startIndex, startIndex + itemsPerPage);
+  const hasSelection = selectedPeople.size > 0;
+  const selectionActionTooltip =
+    "Use the Bulk Actions button instead for selected people.";
+
+  const wrapWhenSelected = (
+    button: React.ReactNode,
+    wrapperClassName = "inline-block cursor-default",
+  ) =>
+    hasSelection ? (
+      <LockedControlTooltip
+        label={selectionActionTooltip}
+        wrapperClassName={wrapperClassName}
+      >
+        <span className="pointer-events-none inline-flex w-full">{button}</span>
+      </LockedControlTooltip>
+    ) : (
+      button
+    );
+
+  return (
+    <div className="space-y-6">
+      <SelectedPeoplePreview
+        selectedPeople={getSelectedPeopleObjects()}
+        onClearSelection={() => setSelectedPeople(new Set())}
+      />
+
+      {/* Table Header with Actions */}
+      <div className="bg-white rounded-xl border border-gray-200 shadow-sm">
+        <div className="px-4 md:px-6 py-4 border-b border-gray-200">
+          <div className="flex flex-col tablet:flex-row tablet:items-center tablet:justify-between gap-2 tablet:gap-3">
+            <div className="min-w-0 flex-1 flex items-center justify-end tablet:justify-start">
+              {selectedPeople.size > 0 &&
+              (canExport || onBulkDelete) ? (
+                <div className="flex items-center space-x-2">
+                  <span className="text-sm text-gray-600">
+                    {selectedPeople.size} selected
+                  </span>
+                  <BulkActionsMenu
+                    onBulkDelete={onBulkDelete ? handleBulkDelete : undefined}
+                    onBulkExport={canExport ? handleBulkExport : undefined}
+                    selectedCount={selectedPeople.size}
+                  />
+                </div>
+              ) : selectedPeople.size > 0 ? (
+                <span className="text-sm text-gray-600">
+                  {selectedPeople.size} selected
+                </span>
+              ) : (
+                <p
+                  className={`hidden tablet:block leading-snug text-gray-500 truncate pr-2 ${
+                    sidePanelOpen ? "text-[10px]" : "text-xs"
+                  }`}
+                  title="Double-click a row to open a profile"
+                >
+                  Double-click a row to open a profile
+                </p>
+              )}
+            </div>
+            <div className="flex w-full flex-col gap-2 tablet:w-auto tablet:shrink-0 tablet:flex-row tablet:items-center tablet:justify-end">
+              {/* Mobile View Toggle - Only visible on mobile */}
+              <div className="tablet:hidden w-full">
+                <ViewModeToggle
+                  fullWidth
+                  viewMode={mobileViewMode}
+                  onViewModeChange={setMobileViewMode}
+                />
+              </div>
+
+              <div className="flex w-full items-stretch gap-1.5 tablet:w-auto tablet:items-center tablet:justify-end tablet:gap-2">
+                <button
+                  onClick={() => setShowColumnsModal(true)}
+                  className="inline-flex min-w-0 flex-1 items-center justify-center px-2 py-2 border border-gray-300 shadow-sm text-xs sm:text-sm font-medium rounded-lg text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-ring min-h-[44px] tablet:flex-none tablet:justify-start tablet:px-3 md:min-h-0 whitespace-nowrap"
+                >
+                  <svg
+                    className="w-4 h-4 mr-1.5 shrink-0"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4"
+                    />
+                  </svg>
+                  Columns
+                </button>
+                {canExport &&
+                  wrapWhenSelected(
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (onExportAll) {
+                        openExportModal([]);
+                        return;
+                      }
+                      openExportModal(sortedPeople);
+                    }}
+                    disabled={hasSelection}
+                    className="inline-flex min-w-0 w-full flex-1 items-center justify-center px-2 py-2 border border-gray-300 shadow-sm text-xs sm:text-sm font-medium rounded-lg text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-ring min-h-[44px] tablet:w-auto tablet:flex-none tablet:justify-start tablet:px-3 md:min-h-0 disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap"
+                  >
+                    <DocumentArrowDownIcon className="w-4 h-4 mr-1.5 shrink-0" />
+                    Export All
+                  </button>,
+                  "min-w-0 flex-1 cursor-default tablet:flex-none",
+                )}
+                {onImport &&
+                  wrapWhenSelected(
+                  <button
+                    type="button"
+                    onClick={() => setShowImportModal(true)}
+                    disabled={hasSelection}
+                    className="inline-flex min-w-0 w-full flex-1 items-center justify-center px-2 py-2 border border-gray-300 shadow-sm text-xs sm:text-sm font-medium rounded-lg text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-ring min-h-[44px] tablet:w-auto tablet:flex-none tablet:justify-start tablet:px-3 md:min-h-0 disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap"
+                  >
+                    <svg
+                      className="w-4 h-4 mr-1.5 shrink-0"
+                      fill="none"
+                      stroke="currentColor"
+                      viewBox="0 0 24 24"
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth={2}
+                        d="M4 4v16h16M12 4v12m0 0l-3-3m3 3l3-3"
+                      />
+                    </svg>
+                    Import
+                  </button>,
+                  "min-w-0 flex-1 cursor-default tablet:flex-none",
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Mobile Card View */}
+        {mobileViewMode === "cards" && (
+          <div className="tablet:hidden space-y-4 p-4">
+            {paginatedPeople.map((person) => (
+              <div
+                key={person.id}
+                className={`rounded-lg p-4 shadow-sm transition-colors ${
+                  highlightedPersonId === person.id
+                    ? "bg-primary/10 border border-primary/20 ring-1 ring-primary/20"
+                    : "bg-white border border-gray-200"
+                }`}
+              >
+                <div className="flex items-start justify-between mb-3">
+                  <div className="flex items-center space-x-3 flex-1 min-w-0">
+                    <input
+                      type="checkbox"
+                      checked={selectedPeople.has(person.id)}
+                      onChange={() => handleSelectPerson(person.id)}
+                      className="rounded border-gray-300 text-primary focus:ring-ring mt-1 flex-shrink-0"
+                    />
+                    <PersonAvatar person={person} size="md" />
+                    <div className="flex-1 min-w-0">
+                      <button
+                        type="button"
+                        onClick={() => onView && onView(person as Person)}
+                        className="text-left w-full"
+                        title={
+                          person.can_view_profile === false
+                            ? "Only people in your cluster can be viewed. Assign them to your cluster first."
+                            : undefined
+                        }
+                      >
+                        <div className="text-sm font-semibold text-primary hover:underline truncate">
+                          {formatPersonName(person)}
+                        </div>
+                      </button>
+                    </div>
+                  </div>
+                  <ActionMenu
+                    person={person}
+                    isOpen={openActionMenuId === person.id}
+                    onOpen={() => {
+                      setOpenActionMenuId(person.id);
+                      setOpenActionMenuView("mobile-card");
+                    }}
+                    onClose={() => {
+                      setOpenActionMenuId(null);
+                      setOpenActionMenuView(null);
+                    }}
+                    currentOpenMenuId={openActionMenuId}
+                    viewType="mobile-card"
+                  />
+                </div>
+                <div className="space-y-2 pl-14">
+                  {visibleColumns.has("email") && person.email && (
+                    <div className="text-sm">
+                      <span className="text-gray-500 font-medium">Email: </span>
+                      <span className="text-gray-900">{person.email}</span>
+                    </div>
+                  )}
+                  {visibleColumns.has("phone") && person.phone && (
+                    <div className="text-sm">
+                      <span className="text-gray-500 font-medium">Phone: </span>
+                      <span className="text-gray-900">{person.phone}</span>
+                    </div>
+                  )}
+                  {visibleColumns.has("role") && (
+                    <div className="text-sm flex items-center gap-2">
+                      <span className="text-gray-500 font-medium">Role: </span>
+                      <span
+                        className={`px-2 py-1 rounded-full text-xs font-medium ${getPersonRoleColor(
+                          person.role
+                        )}`}
+                      >
+                        {person.role}
+                      </span>
+                    </div>
+                  )}
+                  {visibleColumns.has("status") && (
+                    <div className="text-sm flex items-center gap-2">
+                      <span className="text-gray-500 font-medium">
+                        Status:{" "}
+                      </span>
+                      <span
+                        className={`px-2 py-1 rounded-full text-xs font-medium ${getStatusColor(
+                          person.status
+                        )}`}
+                      >
+                        {person.status}
+                      </span>
+                    </div>
+                  )}
+                  {visibleColumns.has("dateFirstAttended") &&
+                    person.dateFirstAttended && (
+                      <div className="text-sm">
+                        <span className="text-gray-500 font-medium">
+                          First Attended:{" "}
+                        </span>
+                        <span className="text-gray-900">
+                          {new Date(
+                            person.dateFirstAttended
+                          ).toLocaleDateString()}
+                        </span>
+                      </div>
+                    )}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Mobile Table View */}
+        {mobileViewMode === "table" && (
+          <div className="tablet:hidden overflow-x-auto p-4">
+            <table className="min-w-full divide-y divide-gray-200">
+              <thead className="bg-gray-50">
+                <tr>
+                  <th className="px-4 py-3 text-left">
+                    <input
+                      type="checkbox"
+                      checked={
+                        selectedPeople.size === paginatedPeople.length &&
+                        paginatedPeople.length > 0
+                      }
+                      onChange={handleSelectAll}
+                      className="rounded border-gray-300 text-primary focus:ring-ring"
+                    />
+                  </th>
+                  {availableColumns.map((col) => {
+                    if (!visibleColumns.has(col.key)) return null;
+                    const field = col.key;
+                    return (
+                      <th
+                        key={field}
+                        className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100 transition-colors"
+                        onClick={() => handleSort(field as keyof DisplayPerson)}
+                      >
+                        <div className="flex items-center space-x-1">
+                          <span>{col.label}</span>
+                          <SortIcon field={field as keyof DisplayPerson} />
+                        </div>
+                      </th>
+                    );
+                  })}
+                  <th className="px-2 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-12"></th>
+                </tr>
+              </thead>
+              <tbody className="bg-white divide-y divide-gray-200">
+                {paginatedPeople.map((person) => (
+                  <tr
+                    key={person.id}
+                    title="Double-click to open profile"
+                    onDoubleClick={(e) => {
+                      const target = e.target as HTMLElement;
+                      if (
+                        target.closest(
+                          'button, a, input, label, [role="menu"]',
+                        )
+                      ) {
+                        return;
+                      }
+                      onView?.(person as Person);
+                    }}
+                    className={`transition-colors ${
+                      highlightedPersonId === person.id
+                        ? "bg-primary/10 hover:bg-primary/15"
+                        : "hover:bg-gray-50"
+                    }`}
+                  >
+                    <td className="px-4 py-3 whitespace-nowrap">
+                      <input
+                        type="checkbox"
+                        checked={selectedPeople.has(person.id)}
+                        onChange={() => handleSelectPerson(person.id)}
+                        className="rounded border-gray-300 text-primary focus:ring-ring"
+                      />
+                    </td>
+                    {availableColumns.map((col) => {
+                      if (!visibleColumns.has(col.key)) return null;
+                      const field = col.key;
+                      return (
+                        <td key={field} className="px-4 py-3 whitespace-nowrap">
+                          {field === "first_name" && (
+                            <div className="flex items-center">
+                              <PersonAvatar person={person} size="sm" className="mr-2" />
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  onView && onView(person as Person)
+                                }
+                                className={TABLE_ENTITY_LINK_CLASS}
+                                title={
+                                  person.can_view_profile === false
+                                    ? "Only people in your cluster can be viewed. Assign them to your cluster first."
+                                    : "View profile"
+                                }
+                              >
+                                {person.first_name || "-"}
+                              </button>
+                            </div>
+                          )}
+                          {field === "last_name" && (
+                            <button
+                              type="button"
+                              onClick={() => onView && onView(person as Person)}
+                              className={TABLE_ENTITY_LINK_CLASS}
+                              title={
+                                person.can_view_profile === false
+                                  ? "Only people in your cluster can be viewed. Assign them to your cluster first."
+                                  : "View profile"
+                              }
+                            >
+                              {person.last_name || "-"}
+                            </button>
+                          )}
+                          {field === "middle_name" && (
+                            <div className="text-sm text-gray-900">
+                              {person.middle_name || "-"}
+                            </div>
+                          )}
+                          {field === "suffix" && (
+                            <div className="text-sm text-gray-900">
+                              {person.suffix || "-"}
+                            </div>
+                          )}
+                          {field === "maiden_name" && (
+                            <div className="text-sm text-gray-900">
+                              {person.maiden_name || "-"}
+                            </div>
+                          )}
+                          {field === "username" && (
+                            <div className="text-sm text-gray-900">
+                              {person.username || "-"}
+                            </div>
+                          )}
+                          {field === "email" && (
+                            <div className="text-sm text-gray-900">
+                              {person.email || "-"}
+                            </div>
+                          )}
+                          {field === "phone" && (
+                            <div className="text-sm text-gray-900">
+                              {person.phone || "-"}
+                            </div>
+                          )}
+                          {field === "gender" && (
+                            <div className="text-sm text-gray-900">
+                              {person.gender || "-"}
+                            </div>
+                          )}
+                          {field === "address" && (
+                            <div className="text-sm text-gray-900">
+                              {person.address || "-"}
+                            </div>
+                          )}
+                          {field === "country" && (
+                            <div className="text-sm text-gray-900">
+                              {person.country || "-"}
+                            </div>
+                          )}
+                          {field === "member_id" && (
+                            <div className="text-sm text-gray-900">
+                              {person.member_id || "-"}
+                            </div>
+                          )}
+                          {field === "facebook_name" && (
+                            <div className="text-sm text-gray-900">
+                              {person.facebook_name || "-"}
+                            </div>
+                          )}
+                          {field === "dateOfBirth" && (
+                            <div className="text-sm text-gray-900">
+                              {person.dateOfBirth
+                                ? new Date(
+                                    person.dateOfBirth
+                                  ).toLocaleDateString()
+                                : "-"}
+                            </div>
+                          )}
+                          {field === "first_activity_attended" && (
+                            <div className="text-sm text-gray-900">
+                              {getEventTypeLabel(
+                                (person as any).first_activity_attended
+                              ) || "-"}
+                            </div>
+                          )}
+                          {field === "role" && (
+                            <span
+                              className={`px-2 py-1 rounded-full text-xs font-medium ${getPersonRoleColor(
+                                person.role
+                              )}`}
+                            >
+                              {person.role}
+                            </span>
+                          )}
+                          {field === "status" && (
+                            <span
+                              className={`px-2 py-1 rounded-full text-xs font-medium ${
+                                person.status === "ACTIVE"
+                                  ? "bg-green-100 text-green-800"
+                                  : person.status === "INACTIVE"
+                                  ? "bg-gray-100 text-gray-800"
+                                  : "bg-red-100 text-red-800"
+                              }`}
+                            >
+                              {person.status}
+                            </span>
+                          )}
+                          {field === "branch" && (
+                            <div className="text-sm text-gray-900">
+                              {person.branch_code?.trim() || "-"}
+                            </div>
+                          )}
+                          {field === "cluster_codes" && (
+                            <div className="text-sm text-gray-900">
+                              {person.cluster_codes?.filter(Boolean).join(", ") ||
+                                "-"}
+                            </div>
+                          )}
+                          {field === "dateFirstAttended" && (
+                            <div className="text-sm text-gray-900">
+                              {person.dateFirstAttended
+                                ? new Date(
+                                    person.dateFirstAttended
+                                  ).toLocaleDateString()
+                                : "-"}
+                            </div>
+                          )}
+                          {field === "waterBaptismDate" && (
+                            <div className="text-sm text-gray-900">
+                              {person.waterBaptismDate
+                                ? new Date(
+                                    person.waterBaptismDate
+                                  ).toLocaleDateString()
+                                : "-"}
+                            </div>
+                          )}
+                          {field === "spiritBaptismDate" && (
+                            <div className="text-sm text-gray-900">
+                              {person.spiritBaptismDate
+                                ? new Date(
+                                    person.spiritBaptismDate
+                                  ).toLocaleDateString()
+                                : "-"}
+                            </div>
+                          )}
+                        </td>
+                      );
+                    })}
+                    <td className="px-2 py-3 whitespace-nowrap text-sm font-medium w-12">
+                      <ActionMenu
+                        person={person}
+                        isOpen={openActionMenuId === person.id}
+                        onOpen={() => {
+                          setOpenActionMenuId(person.id);
+                          setOpenActionMenuView("mobile-table");
+                        }}
+                        onClose={() => {
+                          setOpenActionMenuId(null);
+                          setOpenActionMenuView(null);
+                        }}
+                        currentOpenMenuId={openActionMenuId}
+                        viewType="mobile-table"
+                      />
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {/* Desktop Table */}
+        <div className="hidden tablet:block overflow-x-auto">
+          <table className="min-w-full divide-y divide-gray-200">
+            <thead className="bg-gray-50">
+              <tr>
+                <th className="px-6 py-3 text-left">
+                  <input
+                    type="checkbox"
+                    checked={
+                      selectedPeople.size === paginatedPeople.length &&
+                      paginatedPeople.length > 0
+                    }
+                    onChange={handleSelectAll}
+                    className="rounded border-gray-300 text-primary focus:ring-ring"
+                  />
+                </th>
+                {availableColumns.map((col) => {
+                  if (!visibleColumns.has(col.key)) return null;
+                  const field = col.key;
+                  return (
+                    <th
+                      key={field}
+                      className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100 transition-colors"
+                      onClick={() => handleSort(field as keyof DisplayPerson)}
+                    >
+                      <div className="flex items-center space-x-1">
+                        <span>{col.label.toUpperCase()}</span>
+                        <SortIcon field={field as keyof DisplayPerson} />
+                      </div>
+                    </th>
+                  );
+                })}
+                <th className="px-2 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-12"></th>
+              </tr>
+            </thead>
+            <tbody className="bg-white divide-y divide-gray-200">
+              {paginatedPeople.map((person) => (
+                <tr
+                  key={person.id}
+                  title="Double-click to open profile"
+                  onDoubleClick={(e) => {
+                    const target = e.target as HTMLElement;
+                    if (
+                      target.closest(
+                        'button, a, input, label, [role="menu"]',
+                      )
+                    ) {
+                      return;
+                    }
+                    onView?.(person as Person);
+                  }}
+                  className={`transition-colors ${
+                    highlightedPersonId === person.id
+                      ? "bg-primary/10 hover:bg-primary/15"
+                      : "hover:bg-gray-50"
+                  }`}
+                >
+                  <td className="px-6 py-4 whitespace-nowrap">
+                    <input
+                      type="checkbox"
+                      checked={selectedPeople.has(person.id)}
+                      onChange={() => handleSelectPerson(person.id)}
+                      className="rounded border-gray-300 text-primary focus:ring-ring"
+                    />
+                  </td>
+                  {availableColumns.map((col) => {
+                    if (!visibleColumns.has(col.key)) return null;
+                    const field = col.key;
+                    return (
+                      <td key={field} className="px-6 py-4 whitespace-nowrap">
+                        {field === "first_name" && (
+                          <div className="flex items-center">
+                            <PersonAvatar person={person} size="md" className="mr-3" />
+                            <button
+                              type="button"
+                              onClick={() => onView && onView(person as Person)}
+                              className={TABLE_ENTITY_LINK_CLASS}
+                              title={
+                                person.can_view_profile === false
+                                  ? "Only people in your cluster can be viewed. Assign them to your cluster first."
+                                  : "View profile"
+                              }
+                            >
+                              {person.first_name || "-"}
+                            </button>
+                          </div>
+                        )}
+                        {field === "last_name" && (
+                          <button
+                            type="button"
+                            onClick={() => onView && onView(person as Person)}
+                            className={TABLE_ENTITY_LINK_CLASS}
+                            title={
+                              person.can_view_profile === false
+                                ? "Only people in your cluster can be viewed. Assign them to your cluster first."
+                                : "View profile"
+                            }
+                          >
+                            {person.last_name || "-"}
+                          </button>
+                        )}
+                        {field === "middle_name" && (
+                          <div className="text-sm text-gray-900">
+                            {person.middle_name || "-"}
+                          </div>
+                        )}
+                        {field === "suffix" && (
+                          <div className="text-sm text-gray-900">
+                            {person.suffix || "-"}
+                          </div>
+                        )}
+                        {field === "maiden_name" && (
+                          <div className="text-sm text-gray-900">
+                            {person.maiden_name || "-"}
+                          </div>
+                        )}
+                        {field === "username" && (
+                          <div className="text-sm text-gray-900">
+                            {person.username || "-"}
+                          </div>
+                        )}
+                        {field === "email" && (
+                          <div className="text-sm text-gray-900">
+                            {person.email || "-"}
+                          </div>
+                        )}
+                        {field === "phone" && (
+                          <div className="text-sm text-gray-900">
+                            {person.phone || "-"}
+                          </div>
+                        )}
+                        {field === "gender" && (
+                          <div className="text-sm text-gray-900">
+                            {person.gender || "-"}
+                          </div>
+                        )}
+                        {field === "address" && (
+                          <div className="text-sm text-gray-900">
+                            {person.address || "-"}
+                          </div>
+                        )}
+                        {field === "country" && (
+                          <div className="text-sm text-gray-900">
+                            {person.country || "-"}
+                          </div>
+                        )}
+                        {field === "member_id" && (
+                          <div className="text-sm text-gray-900">
+                            {person.member_id || "-"}
+                          </div>
+                        )}
+                        {field === "facebook_name" && (
+                          <div className="text-sm text-gray-900">
+                            {person.facebook_name || "-"}
+                          </div>
+                        )}
+                        {field === "dateOfBirth" && (
+                          <div className="text-sm text-gray-900">
+                            {person.dateOfBirth
+                              ? new Date(
+                                  person.dateOfBirth
+                                ).toLocaleDateString()
+                              : "-"}
+                          </div>
+                        )}
+                        {field === "first_activity_attended" && (
+                          <div className="text-sm text-gray-900">
+                            {getEventTypeLabel(
+                              (person as any).first_activity_attended
+                            ) || "-"}
+                          </div>
+                        )}
+                        {field === "role" && (
+                          <span
+                            className={`px-2 py-1 rounded-full text-xs font-medium ${getPersonRoleColor(
+                              person.role
+                            )}`}
+                          >
+                            {person.role.toLowerCase()}
+                          </span>
+                        )}
+                        {field === "status" && (
+                          <span
+                            className={`px-2 py-1 rounded-full text-xs font-medium ${getStatusColor(
+                              person.status
+                            )}`}
+                          >
+                            {formatPersonStatusLabel(person.status)}
+                          </span>
+                        )}
+                        {field === "branch" && (
+                          <div className="text-sm text-gray-900">
+                            {person.branch_code?.trim() || "-"}
+                          </div>
+                        )}
+                        {field === "cluster_codes" && (
+                          <div className="text-sm text-gray-900">
+                            {person.cluster_codes?.filter(Boolean).join(", ") ||
+                              "-"}
+                          </div>
+                        )}
+                        {field === "dateFirstAttended" && (
+                          <div className="text-sm text-gray-900">
+                            {person.dateFirstAttended
+                              ? new Date(
+                                  person.dateFirstAttended
+                                ).toLocaleDateString()
+                              : "-"}
+                          </div>
+                        )}
+                        {field === "waterBaptismDate" && (
+                          <div className="text-sm text-gray-900">
+                            {person.waterBaptismDate
+                              ? new Date(
+                                  person.waterBaptismDate
+                                ).toLocaleDateString()
+                              : "-"}
+                          </div>
+                        )}
+                        {field === "spiritBaptismDate" && (
+                          <div className="text-sm text-gray-900">
+                            {person.spiritBaptismDate
+                              ? new Date(
+                                  person.spiritBaptismDate
+                                ).toLocaleDateString()
+                              : "-"}
+                          </div>
+                        )}
+                      </td>
+                    );
+                  })}
+                  <td className="px-2 py-4 whitespace-nowrap text-sm font-medium w-12">
+                    <ActionMenu
+                      person={person}
+                      isOpen={openActionMenuId === person.id}
+                      onOpen={() => {
+                        setOpenActionMenuId(person.id);
+                        setOpenActionMenuView("desktop");
+                      }}
+                      onClose={() => {
+                        setOpenActionMenuId(null);
+                        setOpenActionMenuView(null);
+                      }}
+                      currentOpenMenuId={openActionMenuId}
+                      viewType="desktop"
+                    />
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        {/* Pagination */}
+        <div className="bg-white px-4 md:px-6 py-3 border-t border-gray-200">
+          <div className="flex flex-col sm:flex-row items-center justify-between gap-3">
+            <div className="text-sm text-gray-700 text-center sm:text-left">
+              Showing {resultCount === 0 ? 0 : startIndex + 1} to{" "}
+              {isServerPaged
+                ? endIndex
+                : Math.min(endIndex, resultCount)}{" "}
+              of {resultCount} results
+            </div>
+            <div className="flex items-center space-x-2 sm:space-x-4 flex-wrap justify-center">
+              <div className="flex items-center space-x-2">
+                <label className="text-sm text-gray-700 hidden sm:inline">
+                  Show:
+                </label>
+                <select
+                  value={itemsPerPage}
+                  onChange={(e) => {
+                    setItemsPerPage(Number(e.target.value));
+                    setCurrentPage(1);
+                  }}
+                  className="px-3 py-2 text-sm rounded-lg border border-gray-300 text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-ring min-h-[44px] md:min-h-0"
+                >
+                  <option value={10}>10</option>
+                  <option value={20}>20</option>
+                  <option value={30}>30</option>
+                  <option value={50}>50</option>
+                  <option value={100}>100</option>
+                </select>
+              </div>
+              <div className="flex items-center space-x-2">
+                <button
+                  onClick={() => setCurrentPage(Math.max(1, currentPage - 1))}
+                  disabled={currentPage === 1}
+                  className="px-3 py-2 text-sm rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors min-h-[44px] md:min-h-0 min-w-[44px] md:min-w-0 flex items-center justify-center"
+                  aria-label="Previous page"
+                >
+                  <ChevronLeftIcon className="w-4 h-4" />
+                </button>
+                <span className="px-3 py-2 text-sm text-gray-700 min-h-[44px] md:min-h-0 flex items-center">
+                  Page {currentPage} of {totalPages}
+                </span>
+                <button
+                  onClick={() =>
+                    setCurrentPage(Math.min(totalPages, currentPage + 1))
+                  }
+                  disabled={currentPage === totalPages}
+                  className="px-3 py-2 text-sm rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors min-h-[44px] md:min-h-0 min-w-[44px] md:min-w-0 flex items-center justify-center"
+                  aria-label="Next page"
+                >
+                  <ChevronRightIcon className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <ExportPreviewModal
+        key={`export-${showExportModal}-${exportLockedFormat ?? "all"}`}
+        isOpen={showExportModal}
+        onClose={closeExportModal}
+        data={exportModalPeople}
+        lockedFormat={exportLockedFormat}
+        branches={branches}
+        canChangeBranchFilter={canChangeBranchFilter}
+        defaultBranchId={defaultBranchId}
+        isBulkExport={exportLockedFormat != null}
+        onExportBranchChange={async (branchId) => {
+          if (!onExportAll) return;
+          const all = await fetchExportAllPeople(branchId);
+          setExportModalPeople(all);
+        }}
+        onExport={handleExport}
+      />
+      <ImportModal
+        isOpen={showImportModal}
+        onClose={() => setShowImportModal(false)}
+        defaultBranchId={defaultBranchId}
+        defaultBranchCode={defaultBranchCode}
+        onImport={async (rows) => {
+          if (!onImport) {
+            throw new Error("Import is not configured.");
+          }
+          await onImport(rows);
+        }}
+      />
+
+      {/* Columns Configuration Modal */}
+      {showColumnsModal &&
+        ReactDOM.createPortal(
+          <div
+            className="fixed inset-0 z-[70] flex items-center justify-center bg-black/50 p-4 !mt-0"
+            onClick={(e) => {
+              if (e.target === e.currentTarget) {
+                setShowColumnsModal(false);
+              }
+            }}
+          >
+            <div className="w-full max-w-md rounded-lg bg-white shadow-xl">
+            <div className="px-6 py-4 border-b border-gray-200">
+              <h3 className="text-lg font-semibold text-gray-900">
+                Configure Columns
+              </h3>
+              <p className="text-sm text-gray-500 mt-1">
+                Select which columns to display in the table
+              </p>
+            </div>
+            <div className="px-6 py-4 max-h-96 overflow-y-auto">
+              <div className="space-y-2">
+                {availableColumns.map((col) => (
+                  <label
+                    key={col.key}
+                    className="flex items-center space-x-3 cursor-pointer hover:bg-gray-50 p-2 rounded"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={visibleColumns.has(col.key)}
+                      onChange={(e) => {
+                        const newVisible = new Set(visibleColumns);
+                        if (e.target.checked) {
+                          newVisible.add(col.key);
+                        } else {
+                          newVisible.delete(col.key);
+                        }
+                        setVisibleColumns(newVisible);
+                      }}
+                      className="rounded border-gray-300 text-primary focus:ring-ring"
+                    />
+                    <span className="text-sm text-gray-700">{col.label}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+            <div className="px-6 py-4 border-t border-gray-200 flex flex-wrap justify-end gap-3">
+              <button
+                onClick={() => setVisibleColumns(new Set())}
+                disabled={visibleColumns.size === 0}
+                className="px-4 py-2 text-sm font-medium text-gray-700 hover:text-gray-900 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                Clear All
+              </button>
+              <button
+                onClick={() => {
+                  setVisibleColumns(
+                    new Set(availableColumns.map((col) => col.key))
+                  );
+                }}
+                className="px-4 py-2 text-sm font-medium text-gray-700 hover:text-gray-900"
+              >
+                Reset to Default
+              </button>
+              <button
+                onClick={() => setShowColumnsModal(false)}
+                className="px-4 py-2 text-sm font-medium text-white bg-primary rounded-lg hover:bg-lighthouse-navy focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-ring"
+              >
+                Done
+              </button>
+            </div>
+            </div>
+          </div>,
+          document.body
+        )}
+    </div>
+  );
+}

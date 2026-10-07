@@ -1,0 +1,320 @@
+# The Lighthouse — Access Levels Guide
+
+**Audience:** Administrators, pastors, and coordinators who need to understand who can see and do what  
+**Last updated:** June 2026
+
+**PDF:** `Access-Levels-Guide.pdf`
+
+---
+
+## How access works
+
+The Lighthouse uses **two layers** of access control:
+
+1. **Base role** — set on each person's account (Admin, Pastor, Member, or Visitor).
+2. **Module assignments** — optional extras that grant coordinator, teacher, or bible-sharer capabilities **within a specific module**.
+
+A cluster coordinator is typically a **Member** (or Pastor) who also has a **Cluster → Coordinator** assignment.
+
+Your **branch** (church location) further limits what data you see unless you are an Admin, an HQ Pastor, or an HQ Senior Coordinator.
+
+---
+
+## Base roles
+
+These are set when an administrator creates or edits a person under **Account & Role**.
+
+| Role | Can log in? | Typical use |
+|------|-------------|-------------|
+| **Admin** | Yes | Full system access; manages users, branches, module settings, and coordinator assignments |
+| **Pastor** | Yes | Pastoral oversight; broad read/write across modules in their branch (all branches if HQ) |
+| **Member** | Yes | Regular church member; read-mostly access unless given module assignments |
+| **Visitor** | **No** | Guest record only — tracked by staff, cannot sign in |
+
+### What each base role can do (without module assignments)
+
+| Capability | Admin | Pastor | Member | Visitor |
+|------------|-------|--------|--------|---------|
+| Log in | Yes | Yes | Yes | No |
+| See disabled modules | Yes | No | No | — |
+| Manage branches / module toggles | Yes | No | No | — |
+| Assign module coordinators | Yes | No | No | — |
+| People — view | All (incl. admins) | All except admins | Self + family | — |
+| People — create/edit | Yes | Yes | Edit self; cannot add people | — |
+| People — delete | Yes | No | No | — |
+| Families — view | All | All (branch-scoped) | Own families | — |
+| Families — create/edit | Yes | Yes | No (view only) | — |
+| Clusters — view | All | All (branch-scoped) | Own cluster (read-only) | — |
+| Module read access | All modules | All enabled modules | All enabled modules (limited data) | — |
+| Module write access | All | All enabled | **Read only** | — |
+| Finance module | Yes | Yes | No | — |
+| Analytics / Reports hub | Yes | Yes | No | — |
+| Admin Settings | Yes | No | No | — |
+
+---
+
+## Module assignments overview
+
+Administrators assign module access under **Admin Settings → Module Coordinators**.
+
+Each assignment has:
+
+| Field | Meaning |
+|-------|---------|
+| **Person** | Who receives the access (Admin accounts cannot be assigned) |
+| **Module** | Which area of the app (Cluster, Evangelism, Lessons, etc.) |
+| **Level** | What kind of access within that module |
+| **Scope** | **Senior Coordinator:** module-wide. **Coordinator** on Cluster, Evangelism, or Sunday School: must pick resource(s) in the assignee's branch. **Bible Sharer:** group(s) for reports, or module-wide roster grant (read-only) |
+
+A person can hold **multiple assignments** across different modules. Access is combined (you see the **union** of everything your assignments allow).
+
+### Available modules
+
+| Module | What it covers |
+|--------|----------------|
+| **Cluster** | Small groups and weekly cluster reports |
+| **Evangelism** | Bible study groups, prospects, conversion tracking |
+| **Lessons** | New Converts Course (NCC) |
+| **Sunday School** | Classes, enrollment, attendance |
+| **Events** | Church calendar and occurrence attendance |
+| **Ministries** | Ministry teams and rosters |
+| **Finance** | Donations, offerings, pledges |
+
+---
+
+## Coordinator levels
+
+| Level | Summary |
+|-------|---------|
+| **Senior Coordinator** | Module-wide oversight; can delete records; sees branch-wide (or all branches at HQ); compliance and stats views |
+| **Coordinator** | Leadership within a module; create and edit; may be scoped to specific clusters, groups, or classes |
+| **Teacher** | Sunday School or Lessons instruction; edit own classes/students; generally cannot delete |
+| **Bible Sharer** | Evangelism group facilitation and reports for assigned groups; cannot manage group members. A **module-wide** Bible Sharer row (from the HQ Ministries roster grant) is read-only Evangelism access until they are assigned to a group. |
+| **Reporter** | Weekly reports only (Cluster and Evangelism) |
+
+### Per-module levels available
+
+| Module | Levels you can assign | Resource-specific scope? |
+|--------|----------------------|--------------------------|
+| **Cluster** | Coordinator, Senior Coordinator, **Reporter** | Coordinator/Reporter: pick cluster(s); Senior: module-wide |
+| **Evangelism** | Coordinator, Senior Coordinator, Bible Sharer, Reporter | Coordinator/Reporter: pick evangelism group(s). Bible Sharer: group(s) for reports, or module-wide roster grant (read-only). Senior: module-wide |
+| **Lessons** | Coordinator, Senior Coordinator, Teacher | Module-wide only |
+| **Sunday School** | Coordinator, Senior Coordinator, Teacher | Yes — pick class(es) |
+| **Events** | Coordinator, Senior Coordinator | Module-wide only |
+| **Ministries** | Coordinator, Senior Coordinator | Module-wide only |
+| **Finance** | Coordinator, Senior Coordinator | Module-wide only |
+
+### Scope: module-wide vs resource-specific
+
+| Scope | Meaning |
+|-------|---------|
+| **Module-wide** (`resource` not set) | **Senior Coordinators** for Cluster, Evangelism, and Sunday School — access across the entire module within your branch. **Bible Sharer** may also be module-wide as an HQ roster grant (read-only Evangelism; reports still need a group assignment). |
+| **Resource-specific** | **Required** for Coordinators on Cluster, Evangelism, and Sunday School — limit to selected clusters, groups, or classes in the assignee's branch |
+
+**Example:** A **Cluster Coordinator** scoped to "North Cluster" can manage and submit reports only for that cluster. A **Cluster Senior Coordinator** (module-wide) can oversee all clusters in their branch.
+
+**Cluster coordinator sync:** When you set someone as **coordinator** on a cluster record, the system also creates a matching **Cluster → Coordinator** module assignment for that cluster.
+
+---
+
+## What module assignments add
+
+Module assignments grant **extra** capabilities on top of your base role. They do **not** change your login role — the app checks both.
+
+### People and families visibility
+
+When you have module assignments, you may see more people and families than a plain Member:
+
+| Assignment | People you can view | Families you can view |
+|------------|--------------------|-----------------------|
+| **Senior Coordinator** (any module) | All people except admins (branch-scoped) | All families in scope |
+| **Cluster Coordinator** (senior or non-senior) | **Search/list:** same-branch people. **Profile:** members of assigned cluster(s) + their families only | Families linked to those clusters. **May create/edit families** (Add Family, edit, add members) |
+| **Sunday School Teacher** | Students in your class(es) | Families of those students (view only; cannot create/edit families) |
+| **Lessons Teacher** | Your lesson students | Families of those students (view only; cannot create/edit families) |
+| **Bible Sharer** | Members of assigned evangelism groups | Families of those members (view only; cannot create/edit families) |
+| **Evangelism Coordinator** (non-senior) | **Search/list:** same-branch people (to pick group members). **Profile:** self and family only (plus any other module scopes) | No extra families. Cannot create/edit families |
+| **Multiple assignments** | Union of all the above | Union of all the above |
+
+### People and families editing
+
+| Who | Add Person (Member) / Export / Import | Add Visitor | Families create/edit |
+|-----|----------------------------------------|-------------|----------------------|
+| Admin, Pastor | Yes (within branch scope) | Yes | Yes |
+| **Cluster Senior Coordinator** or **Cluster Coordinator** | Yes | Yes | Yes |
+| **Evangelism Senior Coordinator, Evangelism Coordinator, Bible Sharer** | No | Yes | No |
+| Lessons / Sunday School Teachers, other-module coordinators (unless they also have Cluster access above) | No | No | No |
+| Plain Member, Cluster Reporter, Evangelism Reporter | No | No | No |
+
+### Per-module actions
+
+| Action | Admin / Pastor | Senior Coordinator | Coordinator / Teacher / Bible Sharer | Plain Member |
+|--------|----------------|--------------------|----------------------------------------|--------------|
+| **Read** module data | Yes | Yes | Yes (scoped) | Yes (limited) |
+| **Create / edit** in module | Yes | Yes | Yes (scoped) | No |
+| **Deactivate** (status / `is_active` / cancel) | Yes | Yes | Yes (scoped) | No |
+| **Hard delete** (permanent `DELETE`) | **Admin only** | No | No | No |
+
+Coordinators and pastors should **mark records inactive** or update status instead of deleting. Historical reports and journeys are edited in place; permanent deletion is reserved for administrators.
+
+**Clusters**
+
+- **Cluster Reporter** (CLUSTER): see **assigned cluster card(s) only**; submit weekly reports for those clusters; cannot edit cluster members or settings; cannot add people.
+- **Evangelism Reporter**: submit reports for assigned evangelism groups; cannot manage group members; cannot add people.
+- Non-senior **Cluster Coordinators** can **browse all cluster cards in their branch** (read-only for clusters they do not manage).
+- **Weekly reports** (list, analytics, year filters, create/edit) are limited to **managed clusters** (FK coordinator and/or resource-specific Cluster → Coordinator assignment). **Deleting** reports is **admin-only**; coordinators correct via edit.
+- **Compliance** tab is for senior cluster coordinators only.
+- Members see their own cluster read-only.
+
+**Evangelism**
+
+- **Bible Sharers** can submit reports for assigned groups; they cannot manage group members. Coordinators manage assigned groups (and that Coordinator assignment replaces Bible Sharer or Reporter on the same group).
+- Non-senior **Evangelism Coordinators** can browse all **approved** groups in their branch (read-only for groups they do not manage) and can **create additional groups**. New groups they create start **pending** until an Evangelism Senior Coordinator, Pastor, or Admin approves. Assigned groups stay immediately editable. They can add and remove members on create, on Edit Group, and from the group view for groups they manage, whether pending or approved — without needing a Cluster assignment or a prior evangelism-group resource. They cannot submit reports, add visitors, or record conversions for groups they do not manage, and pending groups cannot receive reports, sessions, visitors, conversions, or due reminders until approved. **Reports** lists only groups they can file for. **Tally** is limited to those same groups. They can create and edit **Each 1 Reach 1** goals for clusters of groups they manage, not other clusters. The **Bible Sharers** tab is hidden unless they are on the HQ Bible Sharers roster.
+- A **module-wide** Bible Sharer grant (HQ Ministries roster checkbox, default on) lets them open Evangelism **read-only**. It does not unlock group edits or reports.
+- Evangelism reports can be submitted by Evangelism Coordinators, Bible Sharers, and Evangelism Reporters for their assigned groups. Plain group members cannot file reports. Groups have a meeting frequency (weekly, biweekly, monthly, or irregular) that controls due reminders; uniqueness is one report per meeting date.
+
+**Lessons**
+
+- **Lesson catalog** (create / edit / deactivate) and **commitment form upload** are limited to **Admin** (any branch), or **HQ Pastor** / **HQ Lessons Coordinator** / **HQ Senior Coordinator** / **HQ NCC primary or support coordinator**. Teachers cannot manage catalog content.
+- **Teachers** see and log sessions for their students; they can also assign lessons when they have Lessons write access.
+- **Coordinators** assign lessons and see broader student lists.
+- **NCC ministry support coordinators** receive a non-senior Lessons Coordinator assignment (same branch access). **NCC ministry primary coordinators** have Lessons Senior access: their branch, or all branches if they are primary of the HQ NCC ministry. People/Families directory lists are not expanded; Lessons Assign / session pickers can search same-branch people.
+- Branch filter on Lessons is editable for Admin, Pastor, and **HQ** Lessons seniors (including HQ NCC primary). The filter defaults to the user's own branch.
+
+**Sunday School**
+
+- **Teachers** manage attendance for their classes.
+- Summary stats hidden from plain members.
+
+**Events**
+
+- Admin, Pastor, Events Coordinator, and Events Senior Coordinator **publish** events immediately when there is no schedule conflict.
+- Coordinator or Senior Coordinator of **another** module can **request** a room/time. The booking stays pending (slot held) until Events leadership approves or rejects it. Dual Events + other-module assignment publishes immediately.
+- Reporters, Teachers, Bible Sharers, and plain members cannot create events. Events has no Teacher or Bible Sharer assignment in Admin Settings.
+- Pending bookings are visible to the requester and to approvers; members only see approved events. Self-check-in stays closed until approved.
+- Requesters may edit or cancel their own pending request. Changing room or time on their own already-approved event sends it back to pending. Approvers can edit approved events without re-approval.
+- Coordinators with Events write may remove or edit a single recurring occurrence, this-and-following weeks, or **delete the entire series**. Type/room hard delete stays admin-only.
+
+**Ministries**
+
+- Ministries are either **branch-scoped** (`scope=BRANCH` + branch required) or **national** (`scope=NATIONAL`, no branch).
+- **List visibility:** own-branch ministries plus all national ministries. Admins and HQ pastors see everything.
+- Ministry coordinators remain assignment-scoped (ModuleCoordinator / primary / support), then filtered so they never see another branch’s local ministries.
+- **Create/edit NATIONAL:** Admin, HQ Pastor (`can_see_all_branches`), or Senior Ministries coordinator only. Branch pastors and non-senior coordinators create branch ministries for their own branch.
+- Ministry coordinators see ministries they are assigned to or listed on as primary/support coordinator (within those branch/national rules).
+
+**Finance**
+
+- Page access is primarily **Admin** and **Pastor**; finance module coordinators support finance workflows where configured.
+
+---
+
+## Branch scoping
+
+| Who | Branch visibility |
+|-----|-------------------|
+| **Admin** | All branches |
+| **Pastor at Headquarters** | All branches |
+| **Pastor at regular branch** | Own branch only |
+| **Senior Coordinator at HQ** | All branches |
+| **Senior Coordinator at regular branch** | Own branch only |
+| **Scoped coordinators / teachers** | Own branch; data further limited by resource assignment |
+| **Member** | Own branch; self + family + own cluster |
+
+Branch filters appear as chips or dropdowns on many pages. If a filter is locked, your role cannot view other branches.
+
+---
+
+## Multiple assignments (common examples)
+
+| Person | Assignments | Effective access |
+|--------|-------------|------------------|
+| Small-group leader | Member + Cluster Coordinator (Cluster A) | Submit reports for Cluster A; edit cluster members; create/edit families in scope |
+| NCC teacher | Member + Lessons Teacher | Log lesson sessions; view assigned students |
+| NCC support coordinator | Listed as NCC ministry support coordinator | Same Lessons access as a Lessons Coordinator in their branch (assign, log sessions, manage that roster; Lessons pickers can search the branch). People directory stays self + family |
+| NCC primary (branch) | NCC ministry primary coordinator | Lessons senior access for that branch |
+| NCC primary (HQ) | Primary coordinator of the HQ NCC ministry | Lessons senior access; can switch the Lessons branch filter (defaults to their own branch) |
+| SS teacher + cluster lead | Member + Sunday School Teacher (Class 1) + Cluster Coordinator (Cluster B) | Students in Class 1 **plus** Cluster B members and families |
+| Department head | Pastor + Evangelism Senior Coordinator | Full evangelism module in branch + pastoral people access |
+| Finance volunteer | Member + Finance Coordinator | Finance module write access (page may still require Pastor/Admin for some views) |
+
+When assignments overlap, you always get the **broadest combined view** — never less than any single assignment would give alone.
+
+---
+
+## Frontend: what you see in the app
+
+The sidebar, dashboard cards, quick actions (+ menu), and stats panels adapt to your access:
+
+- **Disabled modules** disappear from the sidebar (except for Admins).
+- **Stats / summary cards** in Sunday School and Lessons are hidden from plain Members. On Lessons, Members without a Lessons assignment also do not see **Student Progress** or **Session Reports**. The **Teachers** tab is coordinator-only.
+- **Cluster page primary button** is **Add Cluster** for admins, pastors, and senior cluster coordinators; other cluster coordinators see **Submit Report** as the main action.
+- **Analytics** appears only for Admin and Pastor roles.
+- **Admin Settings** appears only for Admins.
+
+The app reads your assignments from your login profile — you do not pick a "coordinator mode."
+
+---
+
+## Assigning access (admin quick steps)
+
+1. **Create the person** with a login-capable base role (Member, Pastor, or Admin).
+2. Go to **Admin Settings → Module Coordinators**.
+3. **Create Assignment** (one at a time) or **Bulk assign** (several resources or modules at once).
+4. Choose person, module, level, and scope.
+5. Verify with filters on the Module Coordinators list or the person's profile.
+
+See the **User Management Guide** for step-by-step screenshots and password workflows.
+
+---
+
+## Access evaluation order
+
+When the system decides what you can see:
+
+1. **Admin / Pastor** — broad access (with branch rules).
+2. **Senior Coordinator** (any module) — broad people/families access in branch.
+3. **Multiple module assignments** — union of all assignment scopes.
+4. **Single module assignment** — limited to that module's scope.
+5. **Plain Member** — self, family, own cluster (read-only).
+6. **Visitor** — cannot log in.
+
+**Special rules:**
+
+- Admin accounts are hidden from non-admin user searches.
+- Disabled modules block access for everyone except Admins.
+- Resource-specific assignments always limit lists to those resources unless you also have a module-wide row for that module.
+
+---
+
+## Troubleshooting access issues
+
+| Problem | Likely cause | Fix |
+|---------|--------------|-----|
+| User cannot submit cluster reports | No Cluster assignment for that cluster | Add Cluster → Coordinator scoped to the cluster |
+| User sees no one in People | Plain Member with no assignments | Expected — they only see self/family; add assignment if they need more |
+| User needs coordinator access | No module assignments | Add assignments under Admin Settings → Module Coordinators |
+| Cannot see Finance page | Page restricted to Admin/Pastor | Change base role or use pastor account |
+| Module missing from sidebar | Module disabled | Admin → Module Controls → enable module |
+| Teacher cannot delete a record | Delete requires Senior Coordinator | Escalate to senior coordinator or pastor |
+
+---
+
+## Quick reference matrix
+
+| I am a… | People edit | Cluster reports | Lessons assign | SS attendance | Events create |
+|---------|-------------|-----------------|----------------|---------------|---------------|
+| Admin | All | All | All | All | All |
+| Pastor | All (branch) | All (branch) | All (branch) | All (branch) | All (branch) |
+| Member | Visitors only | No | No | No | No |
+| Cluster Coordinator | Scoped | Yes (scoped) | No | No | Request / pending |
+| Cluster Reporter | Visitors only | Yes (assigned) | No | No | No |
+| Cluster Senior Coord. | Branch-wide | All (branch) | No | No | Request / pending |
+| Lessons Teacher | Students | No | No | No | No |
+| Lessons Coordinator | Branch students | No | Yes | No | Request / pending |
+| SS Teacher | Class students | No | No | Yes (class) | No |
+| Evangelism Coord. | Group members | No | No | No | Request / pending |
+| Bible Sharer | Group members | No | No | No | No |
+| Events Coordinator | Visitors only | No | No | No | Publish |
+| Events Senior Coord. | Branch-wide | No | No | No | Publish |
+
+For full technical detail (API permissions, queryset rules), see `ACCESS_CONTROL.md` in the developer documentation.

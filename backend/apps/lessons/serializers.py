@@ -1,0 +1,670 @@
+from __future__ import annotations
+
+from typing import Any, Dict
+
+from django.utils import timezone
+from rest_framework import serializers
+
+from apps.people.models import Person
+
+from .models import (
+    Lesson,
+    LessonJourney,
+    LessonSessionReport,
+    LessonSettings,
+    LessonStudentEnrollment,
+    LessonTeacherTransfer,
+    PersonLessonProgress,
+)
+from .services import (
+    clear_enrollment_commitment_signed,
+    ensure_lesson_enrollment,
+    person_assignment_eligibility_error,
+    set_enrollment_commitment_signed,
+    mark_progress_completed,
+    revert_progress_completion,
+    student_cannot_be_own_teacher_error,
+    transfer_lesson_teacher,
+)
+
+
+def _reject_student_as_own_teacher(
+    student: Person | None,
+    teacher: Person | None,
+    *,
+    field: str = "teacher_id",
+) -> None:
+    if student is None:
+        return
+    reason = student_cannot_be_own_teacher_error(student, teacher)
+    if reason:
+        raise serializers.ValidationError({field: reason})
+
+
+def _validate_teacher_on_ncc_roster(teacher: Person, student: Person) -> None:
+    """Require teacher to be on the student's branch NCC roster (active or inactive)."""
+    from apps.ministries.ncc import ensure_ncc_ministry, person_on_ncc_roster
+
+    branch = getattr(student, "branch", None)
+    if branch is None:
+        raise serializers.ValidationError(
+            {
+                "teacher_id": (
+                    "Student must have a branch before assigning a lessons teacher."
+                )
+            }
+        )
+    ensure_ncc_ministry(branch)
+    if not person_on_ncc_roster(teacher, branch):
+        raise serializers.ValidationError(
+            {
+                "teacher_id": (
+                    "Select a teacher from this branch's NCC / Lessons roster "
+                    "(Ministries). Inactive teachers remain selectable."
+                )
+            }
+        )
+
+
+class LessonJourneySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = LessonJourney
+        fields = ["journey_type", "title_template", "note_template"]
+
+
+class LessonSerializer(serializers.ModelSerializer):
+    journey_config = LessonJourneySerializer(required=False)
+
+    class Meta:
+        model = Lesson
+        fields = [
+            "id",
+            "code",
+            "version_label",
+            "title",
+            "summary",
+            "outline",
+            "order",
+            "is_latest",
+            "is_active",
+            "created_at",
+            "updated_at",
+            "journey_config",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+
+    def create(self, validated_data: Dict[str, Any]) -> Lesson:
+        journey_data = validated_data.pop("journey_config", None)
+        lesson = super().create(validated_data)
+        if journey_data:
+            LessonJourney.objects.create(lesson=lesson, **journey_data)
+        else:
+            LessonJourney.objects.create(lesson=lesson)
+        return lesson
+
+    def update(self, instance: Lesson, validated_data: Dict[str, Any]) -> Lesson:
+        journey_data = validated_data.pop("journey_config", None)
+        lesson = super().update(instance, validated_data)
+        if journey_data:
+            LessonJourney.objects.update_or_create(lesson=lesson, defaults=journey_data)
+        return lesson
+
+
+class PersonNestedSerializer(serializers.ModelSerializer):
+    cluster_codes = serializers.SerializerMethodField()
+
+    def get_cluster_codes(self, obj):
+        return [code for code in obj.clusters.values_list("code", flat=True) if code]
+
+    class Meta:
+        model = Person
+        fields = [
+            "id",
+            "first_name",
+            "middle_name",
+            "last_name",
+            "suffix",
+            "username",
+            "member_id",
+            "status",
+            "cluster_codes",
+            "branch",
+        ]
+
+
+class PersonLessonProgressSerializer(serializers.ModelSerializer):
+    person = PersonNestedSerializer(read_only=True)
+    person_id = serializers.PrimaryKeyRelatedField(
+        queryset=Person.objects.all(), source="person", write_only=True, required=False
+    )
+    lesson = LessonSerializer(read_only=True)
+    lesson_id = serializers.PrimaryKeyRelatedField(
+        queryset=Lesson.objects.all(), source="lesson", write_only=True, required=False
+    )
+
+    class Meta:
+        model = PersonLessonProgress
+        fields = [
+            "id",
+            "person",
+            "person_id",
+            "lesson",
+            "lesson_id",
+            "status",
+            "assigned_at",
+            "assigned_by",
+            "started_at",
+            "completed_at",
+            "completed_by",
+            "journey",
+            "notes",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "assigned_at",
+            "journey",
+            "created_at",
+            "updated_at",
+        ]
+
+    def update(
+        self, instance: PersonLessonProgress, validated_data: Dict[str, Any]
+    ) -> PersonLessonProgress:
+        status_before = instance.status
+        instance = super().update(instance, validated_data)
+
+        status_after = instance.status
+        if status_after == PersonLessonProgress.Status.COMPLETED:
+            note = validated_data.get("notes")
+            completed_by = validated_data.get("completed_by", instance.completed_by)
+            completed_at = (
+                validated_data.get("completed_at")
+                or instance.completed_at
+                or timezone.now()
+            )
+            mark_progress_completed(
+                instance,
+                completed_by=completed_by,
+                note=note,
+                completed_at=completed_at,
+            )
+        elif status_after != PersonLessonProgress.Status.COMPLETED:
+            revert_progress_completion(instance, previous_status=status_before)
+
+        return instance
+
+
+class LessonSessionReportSerializer(serializers.ModelSerializer):
+    teacher = PersonNestedSerializer(read_only=True)
+    teacher_id = serializers.PrimaryKeyRelatedField(
+        queryset=Person.objects.exclude(role="VISITOR").exclude(role="ADMIN"),
+        source="teacher",
+        required=False,
+        write_only=True,
+    )
+    student = PersonNestedSerializer(read_only=True)
+    student_id = serializers.PrimaryKeyRelatedField(
+        queryset=Person.objects.all(), source="student", write_only=True
+    )
+    lesson = LessonSerializer(read_only=True)
+    lesson_id = serializers.PrimaryKeyRelatedField(
+        queryset=Lesson.objects.all(),
+        source="lesson",
+        write_only=True,
+        required=False,
+        allow_null=True,
+    )
+    progress = serializers.PrimaryKeyRelatedField(read_only=True)
+    progress_id = serializers.PrimaryKeyRelatedField(
+        queryset=PersonLessonProgress.objects.all(),
+        source="progress",
+        required=False,
+        allow_null=True,
+        write_only=True,
+    )
+
+    class Meta:
+        model = LessonSessionReport
+        fields = [
+            "id",
+            "teacher",
+            "teacher_id",
+            "student",
+            "student_id",
+            "session_type",
+            "pre_lesson_kind",
+            "lesson",
+            "lesson_id",
+            "progress",
+            "progress_id",
+            "session_date",
+            "session_start",
+            "score",
+            "next_session_date",
+            "remarks",
+            "submitted_by",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "teacher",
+            "student",
+            "lesson",
+            "progress",
+            "submitted_by",
+            "created_at",
+            "updated_at",
+        ]
+
+    def validate_teacher_id(self, value):
+        """Ensure teacher is not a VISITOR."""
+        if value and value.role == "VISITOR":
+            raise serializers.ValidationError("Teacher cannot be a visitor.")
+        return value
+
+    def validate(self, attrs):
+        """Validate session type vs lesson, and next_session_date."""
+        instance = getattr(self, "instance", None)
+        session_type = attrs.get(
+            "session_type",
+            instance.session_type if instance else LessonSessionReport.SessionType.LESSON,
+        )
+        pre_lesson_kind = attrs.get(
+            "pre_lesson_kind",
+            instance.pre_lesson_kind if instance else None,
+        )
+        lesson = attrs.get("lesson", instance.lesson if instance else None)
+        remarks = attrs.get("remarks", instance.remarks if instance else "")
+
+        if session_type == LessonSessionReport.SessionType.PRE_LESSON:
+            if not pre_lesson_kind:
+                raise serializers.ValidationError(
+                    {"pre_lesson_kind": "Select a pre-lesson type."}
+                )
+            if lesson is not None:
+                raise serializers.ValidationError(
+                    {"lesson_id": "Pre-lesson sessions cannot be linked to a lesson."}
+                )
+            if pre_lesson_kind == LessonSessionReport.PreLessonKind.OTHER and not (
+                remarks and remarks.strip()
+            ):
+                raise serializers.ValidationError(
+                    {
+                        "remarks": "Add remarks describing this pre-lesson session."
+                    }
+                )
+            attrs["lesson"] = None
+            attrs["progress"] = None
+        else:
+            if pre_lesson_kind:
+                raise serializers.ValidationError(
+                    {
+                        "pre_lesson_kind": "Only pre-lesson sessions may set a pre-lesson type."
+                    }
+                )
+            if lesson is None:
+                raise serializers.ValidationError(
+                    {"lesson_id": "Select the lesson covered in this session."}
+                )
+            attrs["pre_lesson_kind"] = None
+
+        session_date = attrs.get("session_date")
+        next_session_date = attrs.get("next_session_date")
+
+        if session_date and next_session_date:
+            if next_session_date <= session_date:
+                raise serializers.ValidationError(
+                    {
+                        "next_session_date": "Next session date must be after the scheduled session date."
+                    }
+                )
+
+        student = attrs.get("student", instance.student if instance else None)
+        teacher = attrs.get("teacher", instance.teacher if instance else None)
+        _reject_student_as_own_teacher(student, teacher)
+
+        return attrs
+
+
+class LessonSettingsSerializer(serializers.ModelSerializer):
+    commitment_form_url = serializers.SerializerMethodField()
+    ncc_lessons_pdf_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = LessonSettings
+        fields = [
+            "id",
+            "commitment_form",
+            "commitment_form_url",
+            "uploaded_by",
+            "updated_at",
+            "ncc_lessons_pdf",
+            "ncc_lessons_pdf_url",
+            "ncc_lessons_pdf_uploaded_by",
+            "ncc_lessons_pdf_updated_at",
+        ]
+        read_only_fields = [
+            "id",
+            "commitment_form_url",
+            "uploaded_by",
+            "updated_at",
+            "ncc_lessons_pdf_url",
+            "ncc_lessons_pdf_uploaded_by",
+            "ncc_lessons_pdf_updated_at",
+        ]
+
+    def _absolute_file_url(self, file_field) -> str | None:
+        if not file_field:
+            return None
+        request = self.context.get("request")
+        if request:
+            return request.build_absolute_uri(file_field.url)
+        return file_field.url
+
+    def get_commitment_form_url(self, obj: LessonSettings) -> str | None:
+        return self._absolute_file_url(obj.commitment_form)
+
+    def get_ncc_lessons_pdf_url(self, obj: LessonSettings) -> str | None:
+        return self._absolute_file_url(obj.ncc_lessons_pdf)
+
+    def update(self, instance: LessonSettings, validated_data: Dict[str, Any]):
+        request = self.context.get("request")
+        uploaded_by = (
+            request.user if request and isinstance(request.user, Person) else None
+        )
+        if "ncc_lessons_pdf" in validated_data:
+            instance.ncc_lessons_pdf = validated_data["ncc_lessons_pdf"]
+            instance.ncc_lessons_pdf_uploaded_by = uploaded_by
+            instance.ncc_lessons_pdf_updated_at = timezone.now()
+            instance.save(
+                update_fields=[
+                    "ncc_lessons_pdf",
+                    "ncc_lessons_pdf_uploaded_by",
+                    "ncc_lessons_pdf_updated_at",
+                ]
+            )
+            return instance
+
+        instance.commitment_form = validated_data.get(
+            "commitment_form", instance.commitment_form
+        )
+        instance.uploaded_by = uploaded_by
+        instance.save(update_fields=["commitment_form", "uploaded_by", "updated_at"])
+        return instance
+
+
+class LessonCompletionSerializer(serializers.Serializer):
+    note = serializers.CharField(required=False, allow_blank=True)
+    completed_at = serializers.DateTimeField(required=False)
+    completed_by = serializers.PrimaryKeyRelatedField(
+        queryset=Person.objects.all(), required=False
+    )
+
+
+class LessonStudentEnrollmentSerializer(serializers.ModelSerializer):
+    student = PersonNestedSerializer(read_only=True)
+    student_id = serializers.PrimaryKeyRelatedField(
+        queryset=Person.objects.all(),
+        source="student",
+        write_only=True,
+    )
+    teacher = PersonNestedSerializer(read_only=True, allow_null=True)
+    teacher_id = serializers.PrimaryKeyRelatedField(
+        queryset=Person.objects.exclude(role="VISITOR").exclude(role="ADMIN"),
+        source="teacher",
+        write_only=True,
+    )
+    teacher_display_name = serializers.SerializerMethodField()
+    note = serializers.CharField(
+        required=False, allow_blank=True, write_only=True, default=""
+    )
+
+    class Meta:
+        model = LessonStudentEnrollment
+        fields = [
+            "id",
+            "student",
+            "student_id",
+            "teacher",
+            "teacher_id",
+            "teacher_display_name",
+            "historical_teacher_first_name",
+            "historical_teacher_last_name",
+            "commitment_signed",
+            "commitment_signed_at",
+            "commitment_signed_by",
+            "is_active",
+            "assigned_at",
+            "updated_at",
+            "note",
+        ]
+        read_only_fields = [
+            "historical_teacher_first_name",
+            "historical_teacher_last_name",
+            "commitment_signed",
+            "commitment_signed_at",
+            "commitment_signed_by",
+            "assigned_at",
+            "updated_at",
+        ]
+
+    def get_teacher_display_name(self, obj: LessonStudentEnrollment) -> str:
+        return obj.teacher_display_name()
+
+    def validate(self, attrs: Dict[str, Any]) -> Dict[str, Any]:
+        student = attrs.get("student")
+        teacher = attrs.get("teacher")
+        if self.instance is not None:
+            if student is None:
+                student = self.instance.student
+            if teacher is None:
+                teacher = self.instance.teacher
+        _reject_student_as_own_teacher(student, teacher)
+        return attrs
+
+    def create(self, validated_data: Dict[str, Any]) -> LessonStudentEnrollment:
+        request = self.context.get("request")
+        assigned_by = (
+            request.user if request and isinstance(request.user, Person) else None
+        )
+        student = validated_data["student"]
+        teacher = validated_data["teacher"]
+        note = validated_data.pop("note", "") or ""
+        if LessonStudentEnrollment.objects.filter(student=student).exists():
+            raise serializers.ValidationError(
+                {"student_id": "This student already has a lessons teacher assigned."}
+            )
+        _validate_teacher_on_ncc_roster(teacher, student)
+        return ensure_lesson_enrollment(
+            student,
+            teacher,
+            assigned_by=assigned_by,
+            note=note,
+        )
+
+    def update(self, instance, validated_data):
+        validated_data.pop("note", None)
+        return super().update(instance, validated_data)
+
+
+class EnrollmentCommitmentSerializer(serializers.Serializer):
+    commitment_signed = serializers.BooleanField()
+    note = serializers.CharField(required=False, allow_blank=True, default="")
+
+    def validate(self, attrs: Dict[str, Any]) -> Dict[str, Any]:
+        enrollment: LessonStudentEnrollment = self.context["enrollment"]
+        if attrs["commitment_signed"]:
+            progresses = PersonLessonProgress.objects.filter(
+                person=enrollment.student,
+                lesson__is_latest=True,
+                lesson__is_active=True,
+            )
+            lesson_ids = list(
+                Lesson.objects.filter(is_latest=True, is_active=True).values_list(
+                    "id", flat=True
+                )
+            )
+            if not lesson_ids:
+                raise serializers.ValidationError(
+                    {
+                        "commitment_signed": (
+                            "Commitment can only be marked after all lessons are completed."
+                        )
+                    }
+                )
+
+            report_lesson_ids = set(
+                LessonSessionReport.objects.filter(
+                    student=enrollment.student,
+                    session_type=LessonSessionReport.SessionType.LESSON,
+                    lesson_id__isnull=False,
+                    lesson_id__in=lesson_ids,
+                ).values_list("lesson_id", flat=True)
+            )
+
+            # Legacy path: no lesson reports yet, fallback to manual progress completion.
+            if not report_lesson_ids:
+                is_complete = (
+                    progresses.exists()
+                    and progresses.count() == len(lesson_ids)
+                    and not progresses.exclude(
+                        status=PersonLessonProgress.Status.COMPLETED
+                    ).exists()
+                )
+            else:
+                is_complete = set(lesson_ids).issubset(report_lesson_ids)
+
+            if not is_complete:
+                raise serializers.ValidationError(
+                    {
+                        "commitment_signed": (
+                            "Commitment can only be marked after all lessons are completed."
+                        )
+                    }
+                )
+        return attrs
+
+    def save(self) -> LessonStudentEnrollment:
+        enrollment: LessonStudentEnrollment = self.context["enrollment"]
+        request = self.context.get("request")
+        signed_by = request.user if request and isinstance(request.user, Person) else None
+        commit = self.validated_data["commitment_signed"]
+        note = self.validated_data.get("note") or None
+        if commit:
+            set_enrollment_commitment_signed(
+                enrollment,
+                signed_by=signed_by,
+                signed_at=timezone.now(),
+                note=note,
+            )
+        else:
+            clear_enrollment_commitment_signed(enrollment)
+        enrollment.refresh_from_db()
+        return enrollment
+
+
+class LessonTeacherTransferSerializer(serializers.ModelSerializer):
+    from_teacher = PersonNestedSerializer(read_only=True, allow_null=True)
+    to_teacher = PersonNestedSerializer(read_only=True, allow_null=True)
+    transferred_by = PersonNestedSerializer(read_only=True, allow_null=True)
+
+    class Meta:
+        model = LessonTeacherTransfer
+        fields = [
+            "id",
+            "from_teacher",
+            "to_teacher",
+            "transferred_by",
+            "note",
+            "created_at",
+        ]
+        read_only_fields = fields
+
+
+class LessonTeacherTransferRequestSerializer(serializers.Serializer):
+    teacher_id = serializers.PrimaryKeyRelatedField(
+        queryset=Person.objects.exclude(role="VISITOR").exclude(role="ADMIN"),
+        source="teacher",
+    )
+    note = serializers.CharField(required=False, allow_blank=True, default="")
+
+    def validate(self, attrs: Dict[str, Any]) -> Dict[str, Any]:
+        enrollment: LessonStudentEnrollment = self.context["enrollment"]
+        teacher = attrs.get("teacher")
+        if teacher and enrollment.teacher_id == teacher.id:
+            raise serializers.ValidationError(
+                {"teacher_id": "This student is already assigned to that teacher."}
+            )
+        if teacher:
+            _reject_student_as_own_teacher(enrollment.student, teacher)
+            _validate_teacher_on_ncc_roster(teacher, enrollment.student)
+        return attrs
+
+    def create(self, validated_data: Dict[str, Any]) -> LessonTeacherTransfer:
+        enrollment: LessonStudentEnrollment = self.context["enrollment"]
+        request = self.context.get("request")
+        transferred_by = (
+            request.user if request and isinstance(request.user, Person) else None
+        )
+        return transfer_lesson_teacher(
+            enrollment,
+            validated_data["teacher"],
+            transferred_by=transferred_by,
+            note=validated_data.get("note") or "",
+        )
+
+
+class LessonBulkAssignSerializer(serializers.Serializer):
+    lesson_id = serializers.PrimaryKeyRelatedField(
+        queryset=Lesson.objects.all(), source="lesson"
+    )
+    person_ids = serializers.PrimaryKeyRelatedField(
+        queryset=Person.objects.all(), many=True, source="persons"
+    )
+    teacher_id = serializers.PrimaryKeyRelatedField(
+        queryset=Person.objects.exclude(role="VISITOR").exclude(role="ADMIN"),
+        source="teacher",
+        required=False,
+        allow_null=True,
+    )
+
+    def validate(self, attrs: Dict[str, Any]) -> Dict[str, Any]:
+        persons = attrs.get("persons") or []
+        lesson = attrs.get("lesson")
+        ineligible_labels = []
+        for person in persons:
+            reason = person_assignment_eligibility_error(person, lesson=lesson)
+            if reason:
+                display_name = person.get_full_name() or person.username
+                ineligible_labels.append(f"{display_name} ({reason})")
+        if ineligible_labels:
+            raise serializers.ValidationError(
+                {
+                    "person_ids": (
+                        "Cannot assign lessons to: "
+                        + "; ".join(ineligible_labels)
+                        + "."
+                    )
+                }
+            )
+
+        teacher = attrs.get("teacher")
+        needs_teacher = [
+            person
+            for person in persons
+            if not LessonStudentEnrollment.objects.filter(student=person).exists()
+        ]
+        if needs_teacher and not teacher:
+            raise serializers.ValidationError(
+                {
+                    "teacher_id": (
+                        "Teacher is required when assigning lessons to students "
+                        "who do not yet have a lessons teacher."
+                    )
+                }
+            )
+        if teacher:
+            for person in needs_teacher:
+                _reject_student_as_own_teacher(person, teacher)
+        return attrs

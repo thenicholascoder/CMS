@@ -1,0 +1,155 @@
+"use client";
+
+import { useState } from "react";
+import Button from "@/src/components/ui/Button";
+import { Person } from "@/src/types/person";
+
+interface GroupMembersSectionProps {
+  members: Person[];
+  coordinatorId?: number | string | null;
+  reporterIds?: number[];
+  bibleSharerIds?: number[];
+  onAddMember: () => void;
+  onBulkEnroll: () => void;
+  onRemoveMember: (person: Person) => void;
+  loading?: boolean;
+  canManage?: boolean;
+}
+
+export default function GroupMembersSection({
+  members,
+  coordinatorId,
+  reporterIds = [],
+  bibleSharerIds = [],
+  onAddMember,
+  onBulkEnroll,
+  onRemoveMember,
+  loading = false,
+  canManage = true,
+}: GroupMembersSectionProps) {
+  const [showMembers, setShowMembers] = useState(false);
+  const [showAll, setShowAll] = useState(false);
+  const DEFAULT_LIMIT = 5;
+
+  const displayedMembers = showAll ? members : members.slice(0, DEFAULT_LIMIT);
+  const hasMoreMembers = members.length > DEFAULT_LIMIT;
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3">
+        <h3 className="text-base font-semibold text-gray-900 md:text-lg">
+          Members
+          <span className="ml-2 text-sm font-normal text-gray-500">
+            ({members.length})
+          </span>
+        </h3>
+        {canManage && (
+          <div className="flex flex-col sm:flex-row gap-2 w-full sm:w-auto">
+            <Button
+              variant="secondary"
+              onClick={onBulkEnroll}
+              className="!text-green-600 bg-white border border-green-200 hover:bg-green-50 hover:border-green-300 w-full sm:w-auto min-h-[44px]"
+            >
+              Bulk Enroll
+            </Button>
+            <Button
+              onClick={onAddMember}
+              className="!bg-green-600 hover:!bg-green-700 w-full sm:w-auto min-h-[44px]"
+            >
+              Add Member
+            </Button>
+          </div>
+        )}
+      </div>
+
+      <div className="flex justify-center">
+        <button
+          type="button"
+          onClick={() => {
+            setShowMembers((prev) => !prev);
+            if (showMembers) {
+              setShowAll(false);
+            }
+          }}
+          className="text-sm text-primary hover:text-primary underline underline-offset-4"
+        >
+          {showMembers ? "Hide Members" : "Show Members"}
+        </button>
+      </div>
+
+      {showMembers ? (
+        loading ? (
+          <div className="text-center py-8 text-gray-500">Loading...</div>
+        ) : members.length === 0 ? (
+          <div className="text-center py-8 text-gray-500">
+            No members enrolled
+          </div>
+        ) : (
+          <>
+            <div className="overflow-hidden rounded-lg border border-gray-200 bg-white divide-y divide-gray-200">
+              {displayedMembers.map((row) => (
+                <div
+                  key={row.id}
+                  className="flex flex-col gap-2 px-3 py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4 sm:px-4 md:px-6"
+                >
+                  <div className="flex min-w-0 flex-1 flex-col gap-1.5 sm:flex-row sm:items-center sm:gap-2">
+                    <span className="min-w-0 break-words text-sm font-medium text-gray-900">
+                      {row.full_name || row.username || "N/A"}
+                    </span>
+                    <div className="flex flex-wrap gap-1">
+                      {String(row.id) === String(coordinatorId) && (
+                        <span className="inline-flex items-center rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium text-primary">
+                          Coordinator
+                        </span>
+                      )}
+                      {String(row.id) !== String(coordinatorId) &&
+                        bibleSharerIds.some(
+                          (id) => String(id) === String(row.id),
+                        ) && (
+                          <span className="inline-flex items-center rounded-full bg-rose-100 px-1.5 py-0.5 text-[10px] font-medium text-rose-800">
+                            Bible Sharer
+                          </span>
+                        )}
+                      {String(row.id) !== String(coordinatorId) &&
+                        reporterIds.some(
+                          (id) => String(id) === String(row.id),
+                        ) && (
+                          <span className="inline-flex items-center rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-800">
+                            Reporter
+                          </span>
+                        )}
+                    </div>
+                  </div>
+                  {canManage && (
+                    <div className="flex shrink-0 sm:justify-end">
+                      <Button
+                        variant="secondary"
+                        onClick={() => onRemoveMember(row)}
+                        className="w-full min-h-[44px] border border-red-200 bg-white px-2 py-1 text-xs !text-red-600 hover:border-red-300 hover:bg-red-50 sm:w-auto md:min-h-0"
+                      >
+                        Remove
+                      </Button>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+            {hasMoreMembers && (
+              <div className="flex justify-center pt-2">
+                <Button
+                  variant="tertiary"
+                  onClick={() => setShowAll(!showAll)}
+                  className="text-sm"
+                >
+                  {showAll
+                    ? "Show Less"
+                    : `Show More (${members.length - DEFAULT_LIMIT} more)`}
+                </Button>
+              </div>
+            )}
+          </>
+        )
+      ) : null}
+    </div>
+  );
+}

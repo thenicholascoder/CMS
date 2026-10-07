@@ -1,0 +1,704 @@
+import React, { useMemo, useState } from "react";
+import { Ministry, MinistryMember, UserSummary } from "@/src/types/ministry";
+import { formatPersonName } from "@/src/lib/name";
+import Button from "@/src/components/ui/Button";
+import PersonAvatar from "@/src/components/people/PersonAvatar";
+import ToolbarSearch from "@/src/components/ui/ToolbarSearch";
+import { useBranches } from "@/src/hooks/useBranches";
+import { formatLocaleDate } from "@/src/lib/date";
+import {
+  CLUSTER_BRANCH_CHIP_CLASSNAME,
+  getBranchOutlineBadgeStyle,
+  getBranchDisplayCode,
+} from "@/src/lib/branchChipColor";
+import { isNccRoster, isBibleSharersRoster } from "@/src/lib/ministries/systemMinistries";
+
+interface MinistryViewProps {
+  ministry: Ministry;
+  onEdit?: () => void;
+  onDelete?: () => void;
+  onHardDelete?: () => void;
+  onClose: () => void;
+  onViewPerson?: (person: UserSummary) => void;
+}
+
+export default function MinistryView({
+  ministry,
+  onEdit,
+  onDelete,
+  onHardDelete,
+  onClose,
+  onViewPerson,
+}: MinistryViewProps) {
+  const [memberSearch, setMemberSearch] = useState("");
+  const { branches } = useBranches();
+  const ministryBranch =
+    ministry.branch != null
+      ? (branches.find((b) => b.id === ministry.branch) ?? null)
+      : null;
+
+  const formatDate = (dateString: string) => {
+    if (!dateString) return "—";
+    try {
+      return formatLocaleDate(dateString) || dateString;
+    } catch {
+      return dateString;
+    }
+  };
+
+  const getCategoryLabel = (category: string) => {
+    const labels: Record<string, string> = {
+      worship: "Worship",
+      outreach: "Outreach",
+      care: "Care",
+      logistics: "Logistics",
+      other: "Other",
+    };
+    return labels[category] || category;
+  };
+
+  const getCadenceLabel = (cadence: string) => {
+    const labels: Record<string, string> = {
+      weekly: "Weekly",
+      monthly: "Monthly",
+      seasonal: "Seasonal",
+      event_driven: "Event Driven",
+      holiday: "Holiday",
+      ad_hoc: "Ad Hoc",
+    };
+    return labels[cadence] || cadence;
+  };
+
+  const getRoleLabel = (role: string) => {
+    const labels: Record<string, string> = {
+      primary_coordinator: "Primary Coordinator",
+      coordinator: "Coordinator",
+      team_member: "Team Member",
+      guest_helper: "Guest Helper",
+    };
+    return labels[role] || role;
+  };
+
+  const getRoleBadgeColor = (role: string) => {
+    switch (role) {
+      case "primary_coordinator":
+        return "bg-purple-100 text-purple-800";
+      case "coordinator":
+        return "chip-primary";
+      case "team_member":
+        return "bg-green-100 text-green-800";
+      case "guest_helper":
+        return "bg-orange-100 text-orange-800";
+      default:
+        return "bg-gray-100 text-gray-800";
+    }
+  };
+
+  // Parse meeting schedule
+  const meetingSchedule = ministry.meeting_schedule as Record<
+    string,
+    string
+  > | null;
+  const scheduleDay = meetingSchedule?.day || "";
+  const scheduleTime = meetingSchedule?.time || "";
+  const scheduleWindow = meetingSchedule?.window || "";
+  const scheduleNotes = meetingSchedule?.notes || "";
+
+  // Sort members by join date (most recent first) or by name
+  const sortedMembers = useMemo(() => {
+    const members = [...(ministry.memberships || [])];
+    return members.sort((a, b) => {
+      // Sort by active status first (active first), then by join date (most recent first)
+      if (a.is_active !== b.is_active) {
+        return a.is_active ? -1 : 1;
+      }
+      if (a.join_date && b.join_date) {
+        return (
+          new Date(b.join_date).getTime() - new Date(a.join_date).getTime()
+        );
+      }
+      // Fallback to name sorting
+      const nameA = formatPersonName(a.member).toLowerCase();
+      const nameB = formatPersonName(b.member).toLowerCase();
+      return nameA.localeCompare(nameB);
+    });
+  }, [ministry.memberships]);
+
+  const filteredMembers = useMemo(() => {
+    const term = memberSearch.trim().toLowerCase();
+    if (!term) {
+      return sortedMembers;
+    }
+    return sortedMembers.filter((membership) => {
+      const name = formatPersonName(membership.member).toLowerCase();
+      const role = getRoleLabel(membership.role).toLowerCase();
+      const skills = (membership.skills || "").toLowerCase();
+      return name.includes(term) || role.includes(term) || skills.includes(term);
+    });
+  }, [sortedMembers, memberSearch]);
+
+  const activeMembersCount = sortedMembers.filter((m) => m.is_active).length;
+  const inactiveMembersCount = sortedMembers.filter((m) => !m.is_active).length;
+  const isNcc = isNccRoster(ministry);
+  const isBibleSharers = isBibleSharersRoster(ministry);
+
+  return (
+    <div className="flex flex-col h-full space-y-0">
+      {/* Header */}
+      <div className="flex items-center justify-between p-3 tablet:p-4 border-b border-gray-200">
+        <div className="flex-1 min-w-0">
+          <h2 className="text-sm font-medium text-gray-900">
+            Ministry Details
+          </h2>
+          <p className="text-xs md:text-[11px] text-gray-600 mt-0.5 truncate">
+            {ministry.name}
+          </p>
+        </div>
+        <button
+          onClick={onClose}
+          className="text-red-600 hover:text-red-700 text-xl font-bold p-2 rounded-md hover:bg-red-50 transition-colors min-w-[44px] min-h-[44px] flex items-center justify-center flex-shrink-0 ml-2"
+          aria-label="Close"
+        >
+          <svg
+            className="w-5 h-5"
+            fill="none"
+            stroke="currentColor"
+            viewBox="0 0 24 24"
+          >
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              strokeWidth={2}
+              d="M6 18L18 6M6 6l12 12"
+            />
+          </svg>
+        </button>
+      </div>
+
+      {/* Content */}
+      <div className="p-4 tablet:p-5 overflow-y-auto flex-1">
+        <div className="space-y-4 md:space-y-5">
+          {/* Ministry Info Card */}
+          <div className="bg-gradient-to-r from-lighthouse-ivory to-muted rounded-lg p-4 border border-primary/20">
+            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-3">
+              <div className="min-w-0">
+                <div className="flex flex-row flex-wrap items-center gap-2">
+                  <h2 className="text-lg md:text-xl font-bold text-gray-900 truncate min-w-0">
+                    {ministry.name}
+                  </h2>
+                  {ministry.scope === "NATIONAL" ? (
+                    <span className="chip-primary text-sm flex-shrink-0">
+                      National
+                    </span>
+                  ) : ministryBranch ? (
+                    <span
+                      className={`${CLUSTER_BRANCH_CHIP_CLASSNAME} flex-shrink-0`}
+                      style={getBranchOutlineBadgeStyle(
+                        ministryBranch.id,
+                        ministryBranch.is_headquarters,
+                      )}
+                    >
+                      {getBranchDisplayCode(ministryBranch)}
+                    </span>
+                  ) : (
+                    <span className="chip-gray text-sm flex-shrink-0">
+                      Branch
+                    </span>
+                  )}
+                  {ministry.category && (
+                    <span className="chip-gray text-sm flex-shrink-0">
+                      {getCategoryLabel(ministry.category)}
+                    </span>
+                  )}
+                  <span
+                    className={`text-sm flex-shrink-0 ${
+                      ministry.is_active ? "chip-green" : "chip-gray"
+                    }`}
+                  >
+                    {ministry.is_active ? "Active" : "Inactive"}
+                  </span>
+                </div>
+                {ministry.code && (
+                  <div className="mt-1 text-sm text-gray-500">
+                    {ministry.code}
+                  </div>
+                )}
+              </div>
+              <div className="flex items-center gap-2 sm:gap-3 text-gray-700 flex-wrap">
+                <div className="flex items-center gap-1">
+                  <svg
+                    className="w-4 h-4"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                    strokeWidth={2}
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"
+                    />
+                  </svg>
+                  <span className="text-sm font-normal">
+                    {activeMembersCount} active
+                  </span>
+                </div>
+                {inactiveMembersCount > 0 && (
+                  <div className="flex items-center gap-1">
+                    <span className="text-sm font-normal text-gray-500">
+                      {inactiveMembersCount} inactive
+                    </span>
+                  </div>
+                )}
+                <div className="flex items-center gap-1">
+                  <svg
+                    className="w-4 h-4"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                    strokeWidth={2}
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"
+                    />
+                  </svg>
+                  <span className="text-sm font-normal">
+                    {getCadenceLabel(ministry.activity_cadence)}
+                  </span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Description */}
+          {ministry.description && (
+            <div className="bg-white rounded-lg border border-gray-200 p-4 shadow-sm">
+              <h3 className="text-sm font-semibold text-gray-900 mb-2">
+                Description
+              </h3>
+              <p className="text-sm text-gray-700 whitespace-pre-wrap">
+                {ministry.description}
+              </p>
+            </div>
+          )}
+
+          {/* Coordinators */}
+          <div className="bg-white rounded-lg border border-gray-200 p-4 shadow-sm">
+            <h3 className="text-sm font-semibold text-gray-900 mb-3">
+              Coordinators
+            </h3>
+            <div className="space-y-3">
+              {ministry.primary_coordinator ? (
+                <div className="flex items-center justify-between p-3 bg-purple-50 rounded-lg border border-purple-200">
+                  <div className="flex items-center gap-3">
+                    <PersonAvatar
+                      person={ministry.primary_coordinator}
+                      size="md"
+                    />
+                    <div>
+                      <p className="text-sm font-medium text-gray-900">
+                        {formatPersonName(ministry.primary_coordinator)}
+                      </p>
+                      <p className="text-xs text-gray-500">
+                        Primary Coordinator
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <p className="text-sm text-gray-400 italic">
+                  No primary coordinator assigned
+                </p>
+              )}
+
+              {ministry.support_coordinators &&
+              ministry.support_coordinators.length > 0 ? (
+                <div>
+                  <p className="text-xs font-medium text-gray-700 mb-2">
+                    Support Coordinators ({ministry.support_coordinators.length}
+                    )
+                  </p>
+                  <div className="space-y-2">
+                    {ministry.support_coordinators.map((coordinator) => (
+                      <div
+                        key={coordinator.id}
+                        className="flex items-center gap-3 p-2 bg-primary/10 rounded-lg border border-primary/20 cursor-pointer hover:bg-primary/15 transition-colors"
+                        onClick={() =>
+                          onViewPerson && onViewPerson(coordinator)
+                        }
+                      >
+                        <PersonAvatar person={coordinator} size="sm" />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-medium text-gray-900 truncate">
+                            {formatPersonName(coordinator)}
+                          </p>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <p className="text-sm text-gray-400 italic">
+                  No support coordinators assigned
+                </p>
+              )}
+            </div>
+          </div>
+
+          {/* Meeting Information */}
+          {(ministry.meeting_location ||
+            scheduleDay ||
+            scheduleTime ||
+            scheduleWindow ||
+            scheduleNotes) && (
+            <div className="bg-white rounded-lg border border-gray-200 p-4 shadow-sm">
+              <h3 className="text-sm font-semibold text-gray-900 mb-3">
+                Meeting Information
+              </h3>
+              <div className="space-y-2">
+                {ministry.meeting_location && (
+                  <div className="flex items-start gap-2">
+                    <svg
+                      className="w-5 h-5 text-gray-400 mt-0.5 flex-shrink-0"
+                      fill="none"
+                      viewBox="0 0 24 24"
+                      stroke="currentColor"
+                      strokeWidth={2}
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"
+                      />
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"
+                      />
+                    </svg>
+                    <div>
+                      <p className="text-xs font-medium text-gray-500">
+                        Location
+                      </p>
+                      <p className="text-sm text-gray-900">
+                        {ministry.meeting_location}
+                      </p>
+                    </div>
+                  </div>
+                )}
+                {(scheduleDay || scheduleTime) && (
+                  <div className="flex items-start gap-2">
+                    <svg
+                      className="w-5 h-5 text-gray-400 mt-0.5 flex-shrink-0"
+                      fill="none"
+                      viewBox="0 0 24 24"
+                      stroke="currentColor"
+                      strokeWidth={2}
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"
+                      />
+                    </svg>
+                    <div>
+                      <p className="text-xs font-medium text-gray-500">
+                        Schedule
+                      </p>
+                      <p className="text-sm text-gray-900">
+                        {scheduleDay && scheduleTime
+                          ? `${scheduleDay} at ${scheduleTime}`
+                          : scheduleDay || scheduleTime || "—"}
+                      </p>
+                    </div>
+                  </div>
+                )}
+                {scheduleWindow && (
+                  <div className="flex items-start gap-2">
+                    <svg
+                      className="w-5 h-5 text-gray-400 mt-0.5 flex-shrink-0"
+                      fill="none"
+                      viewBox="0 0 24 24"
+                      stroke="currentColor"
+                      strokeWidth={2}
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"
+                      />
+                    </svg>
+                    <div>
+                      <p className="text-xs font-medium text-gray-500">
+                        Season/Window
+                      </p>
+                      <p className="text-sm text-gray-900">{scheduleWindow}</p>
+                    </div>
+                  </div>
+                )}
+                {scheduleNotes && (
+                  <div className="flex items-start gap-2">
+                    <svg
+                      className="w-5 h-5 text-gray-400 mt-0.5 flex-shrink-0"
+                      fill="none"
+                      viewBox="0 0 24 24"
+                      stroke="currentColor"
+                      strokeWidth={2}
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"
+                      />
+                    </svg>
+                    <div>
+                      <p className="text-xs font-medium text-gray-500">Notes</p>
+                      <p className="text-sm text-gray-900 whitespace-pre-wrap">
+                        {scheduleNotes}
+                      </p>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Communication Channel */}
+          {ministry.communication_channel && (
+            <div className="bg-white rounded-lg border border-gray-200 p-4 shadow-sm">
+              <h3 className="text-sm font-semibold text-gray-900 mb-2">
+                Communication Channel
+              </h3>
+              <a
+                href={ministry.communication_channel}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-sm text-primary hover:text-primary hover:underline break-all"
+              >
+                {ministry.communication_channel}
+              </a>
+            </div>
+          )}
+
+          {/* Members */}
+          {sortedMembers.length > 0 && (
+            <div className="bg-white rounded-lg border border-gray-200 p-4 shadow-sm">
+              <h3 className="text-sm font-semibold text-gray-900 mb-3">
+                Members ({sortedMembers.length})
+              </h3>
+              <ToolbarSearch
+                value={memberSearch}
+                onChange={setMemberSearch}
+                placeholder="Search members…"
+                ariaLabel="Search members"
+                fullWidth
+                className="mb-2"
+              />
+              {memberSearch.trim() && (
+                <p className="mb-2 text-xs text-gray-500">
+                  Showing {filteredMembers.length} of {sortedMembers.length}
+                </p>
+              )}
+              {filteredMembers.length === 0 ? (
+                <p className="text-sm text-gray-500 italic">
+                  No members match your search
+                </p>
+              ) : (
+                <div className="max-h-80 overflow-y-auto space-y-2 pr-1">
+                {filteredMembers.map((membership: MinistryMember) => (
+                  <div
+                    key={membership.id}
+                    className={`flex items-center justify-between p-3 rounded-lg border transition-colors ${
+                      membership.is_active
+                        ? "bg-gray-50 border-gray-200 hover:bg-gray-100"
+                        : "bg-gray-100 border-gray-300 opacity-75"
+                    } ${onViewPerson ? "cursor-pointer" : ""}`}
+                    onClick={() =>
+                      onViewPerson &&
+                      membership.member &&
+                      onViewPerson(membership.member)
+                    }
+                  >
+                    <div className="flex items-center gap-3 flex-1 min-w-0">
+                      <PersonAvatar
+                        person={membership.member}
+                        size="md"
+                        className={
+                          membership.is_active ? "" : "opacity-60 grayscale"
+                        }
+                      />
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-medium text-gray-900 truncate">
+                          {formatPersonName(membership.member)}
+                        </p>
+                        <div className="flex flex-col gap-1.5 mt-1">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span
+                              className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium ${getRoleBadgeColor(
+                                membership.role
+                              )}`}
+                            >
+                              {getRoleLabel(membership.role)}
+                            </span>
+                            {membership.skills && (
+                              <span className="text-xs text-primary bg-primary/10 border border-primary/20 px-2 py-0.5 rounded">
+                                {membership.skills}
+                              </span>
+                            )}
+                            <span className="text-xs text-gray-500">
+                              Joined {formatDate(membership.join_date)}
+                            </span>
+                          </div>
+                          {membership.notes && (
+                            <div className="mt-0.5">
+                              <p className="text-xs font-medium text-gray-500 mb-0.5">
+                                Notes:
+                              </p>
+                              <p className="text-xs text-gray-700 whitespace-pre-wrap">
+                                {membership.notes}
+                              </p>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="flex flex-col items-end gap-1 ml-2 shrink-0">
+                      <span
+                        className={`inline-flex items-center px-2 py-1 rounded-full text-xs font-medium ${
+                          membership.is_active
+                            ? "bg-green-100 text-green-800"
+                            : "bg-gray-200 text-gray-600"
+                        }`}
+                      >
+                        {membership.is_active ? "Active" : "Inactive"}
+                      </span>
+                      {isNcc && (
+                        <span
+                          className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium ${
+                            membership.has_lessons_teacher_access
+                              ? "bg-blue-100 text-blue-800"
+                              : "bg-amber-50 text-amber-800"
+                          }`}
+                        >
+                          {membership.has_lessons_teacher_access
+                            ? "Lessons access"
+                            : "Roster only"}
+                        </span>
+                      )}
+                      {isBibleSharers && (
+                        <span
+                          className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium ${
+                            membership.has_evangelism_bible_sharer_access
+                              ? "bg-blue-100 text-blue-800"
+                              : "bg-amber-50 text-amber-800"
+                          }`}
+                        >
+                          {membership.has_evangelism_bible_sharer_access
+                            ? "Evangelism access"
+                            : "Roster only"}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Empty State for Members */}
+          {sortedMembers.length === 0 && (
+            <div className="bg-white rounded-lg border border-gray-200 p-4 shadow-sm">
+              <h3 className="text-sm font-semibold text-gray-900 mb-2">
+                Members
+              </h3>
+              <p className="text-sm text-gray-500 italic">
+                No members assigned to this ministry yet
+              </p>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Footer */}
+      {(onDelete || onHardDelete || onEdit) && (
+        <div className="flex flex-nowrap items-center gap-2 w-full overflow-x-auto p-3 tablet:p-4 border-t border-gray-200 bg-gray-50">
+          <div className="flex flex-nowrap items-center gap-2 shrink-0">
+            {onDelete && (
+              <Button
+                onClick={onDelete}
+                variant="secondary"
+                className="!text-gray-700 h-10 min-h-[44px] px-4 text-sm font-medium bg-white border border-gray-200 hover:bg-gray-50 hover:border-gray-300 flex items-center justify-center space-x-2 shrink-0"
+                aria-label="Mark ministry inactive"
+              >
+                <svg
+                  className="w-4 h-4"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={2}
+                    d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z"
+                  />
+                </svg>
+                <span>Mark Inactive</span>
+              </Button>
+            )}
+            {onHardDelete && (
+              <Button
+                onClick={onHardDelete}
+                variant="secondary"
+                className="!text-red-600 h-10 min-h-[44px] px-4 text-sm font-medium bg-white border border-red-200 hover:bg-red-50 hover:border-red-300 flex items-center justify-center shrink-0"
+                aria-label="Delete ministry permanently"
+                title="Delete ministry permanently"
+              >
+                <svg
+                  className="w-4 h-4"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={2}
+                    d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"
+                  />
+                </svg>
+              </Button>
+            )}
+          </div>
+          <div className="flex flex-nowrap items-center gap-2 shrink-0 ml-auto">
+            {onEdit && (
+              <Button
+                onClick={onEdit}
+                variant="secondary"
+                className="!text-primary h-10 min-h-[44px] px-4 text-sm font-medium bg-white border border-primary/20 hover:bg-primary/10 hover:border-primary/30 flex items-center justify-center space-x-2 shrink-0"
+              >
+                <svg
+                  className="w-4 h-4"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={2}
+                    d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"
+                  />
+                </svg>
+                <span>Edit</span>
+              </Button>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

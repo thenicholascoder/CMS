@@ -1,0 +1,517 @@
+from django.db import models
+from django.contrib.auth.models import AbstractUser, Group, Permission
+
+
+PERSON_STATUS_CHOICES = [
+    ("ACTIVE", "Active"),
+    ("SEMIACTIVE", "Semiactive"),
+    ("INACTIVE", "Inactive"),
+    ("DORMANT", "Dormant"),
+    ("FALLAWAY", "Fall Away"),
+    ("DECEASED", "Deceased"),
+    # For VISITOR role specialized states; UI can restrict selection conditionally
+    ("ONGOING", "Ongoing"),
+    ("NO_RESPONSE", "No Response"),
+]
+
+FOLLOW_UP_STATUSES = frozenset({"SEMIACTIVE", "INACTIVE", "DORMANT", "FALLAWAY"})
+REQUIRED_MANUAL_REASON_STATUSES = frozenset(
+    {"SEMIACTIVE", "INACTIVE", "DORMANT", "FALLAWAY", "DECEASED"}
+)
+
+
+class Branch(models.Model):
+    """Represents a church branch/location"""
+
+    name = models.CharField(max_length=200)
+    code = models.CharField(
+        max_length=50,
+        unique=True,
+        blank=True,
+        null=True,
+        help_text="Short code for the branch (e.g., 'HQ', 'BRANCH1')",
+    )
+    address = models.TextField(blank=True)
+    phone = models.CharField(max_length=20, blank=True)
+    email = models.EmailField(blank=True)
+    is_headquarters = models.BooleanField(
+        default=False, help_text="Mark this branch as the headquarters"
+    )
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name_plural = "Branches"
+        ordering = ["name"]
+        indexes = [
+            models.Index(fields=["is_headquarters"]),
+            models.Index(fields=["is_active"]),
+        ]
+
+    def __str__(self):
+        return self.name
+
+
+class Person(AbstractUser):
+    middle_name = models.CharField(blank=True, max_length=150)
+    suffix = models.CharField(blank=True, max_length=150)
+    nickname = models.CharField(blank=True, max_length=150)
+    maiden_name = models.CharField(blank=True, max_length=150)
+    gender = models.CharField(
+        blank=True,
+        max_length=20,
+        choices=[
+            ("MALE", "Male"),
+            ("FEMALE", "Female"),
+        ],
+    )
+    facebook_name = models.CharField(blank=True, max_length=150)
+    photo = models.ImageField(upload_to="profiles/", null=True, blank=True)
+    role = models.CharField(
+        max_length=20,
+        choices=[
+            ("MEMBER", "Member"),
+            ("VISITOR", "Visitor"),
+            ("PASTOR", "Pastor"),
+            ("ADMIN", "Admin"),
+        ],
+    )
+    phone = models.CharField(max_length=20, blank=True)
+    address = models.TextField(blank=True)
+    country = models.CharField(max_length=100, blank=True)
+    date_of_birth = models.DateField(null=True, blank=True)
+    date_first_invited = models.DateField(null=True, blank=True)
+    date_first_attended = models.DateField(null=True, blank=True)
+    water_baptism_date = models.DateField(null=True, blank=True)
+    spirit_baptism_date = models.DateField(null=True, blank=True)
+    has_finished_lessons = models.BooleanField(default=False)
+    lessons_started_at = models.DateField(null=True, blank=True)
+    lessons_finished_at = models.DateField(null=True, blank=True)
+    first_activity_attended = models.ForeignKey(
+        "events.EventType",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="first_activity_people",
+    )
+    inviter = models.ForeignKey(
+        "self",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="invited_people",
+    )
+    branch = models.ForeignKey(
+        Branch,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="members",
+        help_text="The church branch this person belongs to",
+    )
+    member_id = models.CharField(max_length=20, blank=True)  # LAMP ID
+    status = models.CharField(
+        blank=True,
+        max_length=20,
+        choices=PERSON_STATUS_CHOICES,
+    )
+    must_change_password = models.BooleanField(default=False)
+    first_login = models.BooleanField(default=True)
+
+    groups = models.ManyToManyField(
+        Group,
+        related_name="people_person_set",  # renamed to reflect new model name
+        blank=True,
+    )
+    user_permissions = models.ManyToManyField(
+        Permission,
+        related_name="people_person_permissions",  # renamed to reflect new model name
+        blank=True,
+    )
+
+    def __str__(self):
+        return self.username  # or full name if you prefer
+
+    def get_full_name(self):
+        from apps.people.name_formatting import format_person_display_name
+
+        return format_person_display_name(self) or self.username
+
+    def can_see_all_branches(self):
+        """
+        Check if this user can see all branches.
+        Returns True for:
+        - ADMIN users
+        - PASTOR users from headquarters branch
+        """
+        if self.role == "ADMIN":
+            return True
+        if self.role == "PASTOR" and self.branch and self.branch.is_headquarters:
+            return True
+        return False
+
+    def is_module_coordinator(self, module_type, level=None, resource_id=None):
+        """Check if user is a coordinator for a specific module"""
+        queryset = self.module_coordinator_assignments.filter(module=module_type)
+        if level:
+            queryset = queryset.filter(level=level)
+        if resource_id is not None:
+            queryset = queryset.filter(resource_id=resource_id)
+        return queryset.exists()
+
+    def is_senior_coordinator(self, module_type=None):
+        """Check if user is a senior coordinator (optionally for a specific module)"""
+        queryset = self.module_coordinator_assignments.filter(
+            level=ModuleCoordinator.CoordinatorLevel.SENIOR_COORDINATOR
+        )
+        if module_type:
+            queryset = queryset.filter(module=module_type)
+        return queryset.exists()
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["role"], name="people_person_role_idx"),
+            models.Index(fields=["status"], name="people_person_status_idx"),
+            models.Index(fields=["member_id"], name="people_person_member_id_idx"),
+            models.Index(
+                fields=["branch", "last_name", "first_name"],
+                name="people_person_branch_name_idx",
+            ),
+            models.Index(
+                fields=["branch", "role"],
+                name="people_person_branch_role_idx",
+            ),
+        ]
+
+
+class PersonStatusChange(models.Model):
+    """Queryable history of Person.status changes (manual, auto, or system)."""
+
+    class Source(models.TextChoices):
+        MANUAL = "MANUAL", "Manual"
+        AUTO_ATTENDANCE = "AUTO_ATTENDANCE", "Auto attendance"
+        SYSTEM = "SYSTEM", "System"
+
+    person = models.ForeignKey(
+        Person,
+        on_delete=models.CASCADE,
+        related_name="status_changes",
+    )
+    from_status = models.CharField(
+        max_length=20,
+        blank=True,
+        choices=PERSON_STATUS_CHOICES,
+    )
+    to_status = models.CharField(max_length=20, choices=PERSON_STATUS_CHOICES)
+    reason = models.TextField(blank=True)
+    source = models.CharField(max_length=20, choices=Source.choices)
+    changed_by = models.ForeignKey(
+        Person,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="person_status_changes_made",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+        verbose_name = "Person Status Change"
+        verbose_name_plural = "Person Status Changes"
+        indexes = [
+            models.Index(
+                fields=["person", "-created_at"],
+                name="people_statuschg_person_idx",
+            ),
+            models.Index(fields=["to_status"], name="people_statuschg_to_idx"),
+            models.Index(fields=["source"], name="people_statuschg_source_idx"),
+        ]
+
+    @property
+    def needs_follow_up(self) -> bool:
+        return self.to_status in FOLLOW_UP_STATUSES
+
+    def __str__(self):
+        return f"{self.person_id}: {self.from_status or '—'} → {self.to_status}"
+
+
+class MemberCareCase(models.Model):
+    """Pastoral care caseload for a member (cluster roster), not evangelism prospects."""
+
+    class RecommendedAction(models.TextChoices):
+        FOLLOW_UP_MONITOR = "FOLLOW_UP_MONITOR", "Follow up and monitor progress"
+        VISITATION = "VISITATION", "Visitation and follow up"
+        NO_ACTION = "NO_ACTION", "No action for now"
+        OTHER = "OTHER", "Other"
+
+    class CaseStatus(models.TextChoices):
+        OPEN = "OPEN", "Open"
+        IN_PROGRESS = "IN_PROGRESS", "In progress"
+        NO_ACTION = "NO_ACTION", "No action"
+        COMPLETED = "COMPLETED", "Completed"
+        RECOVERED = "RECOVERED", "Recovered"
+
+    person = models.OneToOneField(
+        Person,
+        on_delete=models.CASCADE,
+        related_name="care_case",
+    )
+    details = models.TextField(blank=True)
+    recommended_action = models.CharField(
+        max_length=30,
+        choices=RecommendedAction.choices,
+        blank=True,
+    )
+    recommended_action_other = models.CharField(max_length=255, blank=True)
+    assigned_to = models.ManyToManyField(
+        Person,
+        blank=True,
+        related_name="assigned_member_care_cases",
+    )
+    assigned_to_label = models.CharField(max_length=150, blank=True)
+    due_date = models.DateField(null=True, blank=True)
+    case_status = models.CharField(
+        max_length=20,
+        choices=CaseStatus.choices,
+        default=CaseStatus.OPEN,
+    )
+    remarks = models.TextField(blank=True)
+    source_status_change = models.ForeignKey(
+        PersonStatusChange,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="care_cases",
+    )
+    opened_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    updated_by = models.ForeignKey(
+        Person,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="updated_member_care_cases",
+    )
+
+    class Meta:
+        ordering = ["-updated_at", "-id"]
+        verbose_name = "Member Care Case"
+        verbose_name_plural = "Member Care Cases"
+        indexes = [
+            models.Index(fields=["case_status"], name="people_carecase_status_idx"),
+            models.Index(
+                fields=["recommended_action"],
+                name="people_carecase_action_idx",
+            ),
+        ]
+
+    @property
+    def is_open_caseload(self) -> bool:
+        return self.case_status in {
+            self.CaseStatus.OPEN,
+            self.CaseStatus.IN_PROGRESS,
+            self.CaseStatus.NO_ACTION,
+        }
+
+    def __str__(self):
+        return f"{self.person_id} ({self.case_status})"
+
+
+class Family(models.Model):
+    name = models.CharField(max_length=100)
+    leader = models.ForeignKey(
+        Person, on_delete=models.SET_NULL, null=True, related_name="led_families"
+    )
+    members = models.ManyToManyField(Person, related_name="families")
+    branch = models.ForeignKey(
+        "people.Branch",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="families",
+    )
+    address = models.TextField(blank=True)  # Physical address/location
+    notes = models.TextField(blank=True)  # Family notes/description
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return self.name
+
+    class Meta:
+        verbose_name_plural = "Families"
+        indexes = [
+            models.Index(fields=["is_active"], name="people_family_is_active_idx"),
+            models.Index(
+                fields=["branch", "name"], name="people_family_branch_name_idx"
+            ),
+        ]
+
+
+class Journey(models.Model):
+    user = models.ForeignKey(Person, on_delete=models.CASCADE, related_name="journeys")
+    title = models.CharField(blank=True, max_length=100)
+    date = models.DateField()
+    type = models.CharField(
+        max_length=20,
+        choices=[
+            ("LESSON", "Lesson"),
+            ("BAPTISM", "Baptism"),
+            ("SPIRIT", "Spirit"),
+            ("CLUSTER", "Cluster"),
+            ("NOTE", "Note"),
+            ("EVENT_ATTENDANCE", "Event Attendance"),
+            ("SUNDAY_SCHOOL", "Sunday School"),
+            ("MINISTRY", "Ministry"),
+            ("BRANCH_TRANSFER", "Branch Transfer"),
+        ],
+    )
+    description = models.TextField(blank=True)
+    verified_by = models.ForeignKey(
+        Person, on_delete=models.SET_NULL, null=True, related_name="verified_journeys"
+    )
+    historical_verified_first_name = models.CharField(max_length=150, blank=True)
+    historical_verified_last_name = models.CharField(max_length=150, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.user.username} - {self.type} - {self.date}"
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["user", "-date"], name="people_journey_user_date_idx"),
+            models.Index(fields=["user", "type"], name="people_journey_user_type_idx"),
+        ]
+        ordering = ["-date", "-created_at"]
+
+
+class ModuleCoordinator(models.Model):
+    """Tracks which users have coordinator access to specific modules"""
+
+    class ModuleType(models.TextChoices):
+        CLUSTER = "CLUSTER", "Cluster"
+        FINANCE = "FINANCE", "Finance"
+        EVANGELISM = "EVANGELISM", "Evangelism"
+        SUNDAY_SCHOOL = "SUNDAY_SCHOOL", "Sunday School"
+        LESSONS = "LESSONS", "Lessons"
+        EVENTS = "EVENTS", "Events"
+        MINISTRIES = "MINISTRIES", "Ministries"
+
+    class CoordinatorLevel(models.TextChoices):
+        COORDINATOR = "COORDINATOR", "Coordinator"  # Limited to assigned resources
+        SENIOR_COORDINATOR = (
+            "SENIOR_COORDINATOR",
+            "Senior Coordinator",
+        )  # Full module access
+        TEACHER = "TEACHER", "Teacher"  # For Sunday School/Lessons
+        BIBLE_SHARER = "BIBLE_SHARER", "Bible Sharer"  # For Evangelism
+        REPORTER = "REPORTER", "Reporter"  # Cluster / Evangelism weekly reports only
+
+    person = models.ForeignKey(
+        Person, on_delete=models.CASCADE, related_name="module_coordinator_assignments"
+    )
+    module = models.CharField(max_length=50, choices=ModuleType.choices)
+    level = models.CharField(max_length=50, choices=CoordinatorLevel.choices)
+    resource_id = models.IntegerField(
+        null=True,
+        blank=True,
+        help_text="For resource-specific assignments (e.g., specific cluster ID)",
+    )
+    resource_type = models.CharField(
+        max_length=50,
+        blank=True,
+        help_text="Type of resource (e.g., 'Cluster', 'EvangelismGroup')",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = [("person", "module", "resource_id")]
+        indexes = [
+            models.Index(fields=["person", "module"]),
+        ]
+        verbose_name = "Module Coordinator"
+        verbose_name_plural = "Module Coordinators"
+        ordering = ["person", "module", "level"]
+
+    def __str__(self):
+        resource_info = (
+            f" ({self.resource_type}#{self.resource_id})" if self.resource_id else ""
+        )
+        return f"{self.person.username} - {self.get_module_display()} {self.get_level_display()}{resource_info}"
+
+
+class ModuleSetting(models.Model):
+    """Stores global on/off state for each module."""
+
+    module = models.CharField(
+        max_length=50,
+        choices=ModuleCoordinator.ModuleType.choices,
+        unique=True,
+    )
+    is_enabled = models.BooleanField(default=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    updated_by = models.ForeignKey(
+        Person,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="updated_module_settings",
+    )
+
+    class Meta:
+        verbose_name = "Module Setting"
+        verbose_name_plural = "Module Settings"
+        ordering = ["module"]
+
+    def __str__(self):
+        status = "Enabled" if self.is_enabled else "Disabled"
+        return f"{self.get_module_display()}: {status}"
+
+
+class PeopleAutomationSetting(models.Model):
+    """Singleton flags for people-module automations (e.g. attendance status)."""
+
+    SOLO_PK = 1
+
+    auto_status_updates_enabled = models.BooleanField(
+        default=True,
+        help_text=(
+            "When enabled, ACTIVE/SEMIACTIVE/INACTIVE are auto-updated from "
+            "attendance patterns. Manual pastoral statuses are never overwritten."
+        ),
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+    updated_by = models.ForeignKey(
+        Person,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="updated_people_automation_settings",
+    )
+
+    class Meta:
+        verbose_name = "People Automation Setting"
+        verbose_name_plural = "People Automation Settings"
+
+    def save(self, *args, **kwargs):
+        self.pk = self.SOLO_PK
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        # Singleton must not be deleted; keep the row and reset to defaults.
+        self.auto_status_updates_enabled = True
+        self.updated_by = None
+        self.save(update_fields=["auto_status_updates_enabled", "updated_by", "updated_at"])
+
+    @classmethod
+    def get_solo(cls):
+        obj, _ = cls.objects.get_or_create(
+            pk=cls.SOLO_PK,
+            defaults={"auto_status_updates_enabled": True},
+        )
+        return obj
+
+    def __str__(self):
+        status = "Enabled" if self.auto_status_updates_enabled else "Disabled"
+        return f"Auto status updates: {status}"

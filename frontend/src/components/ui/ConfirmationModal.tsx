@@ -1,0 +1,161 @@
+"use client";
+
+import React, { ReactNode } from "react";
+import Button from "./Button";
+import ModalOverlay from "./ModalOverlay";
+
+interface ConfirmationModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  onConfirm: () => void;
+  title: string;
+  message: ReactNode;
+  confirmText?: string;
+  cancelText?: string;
+  variant?: "danger" | "warning" | "info";
+  loading?: boolean;
+  zIndex?: 70 | 80;
+}
+
+export default function ConfirmationModal({
+  isOpen,
+  onClose,
+  onConfirm,
+  title,
+  message,
+  confirmText = "Confirm",
+  cancelText = "Cancel",
+  variant = "danger",
+  loading = false,
+  zIndex = 70,
+}: ConfirmationModalProps) {
+  const getVariantStyles = () => {
+    switch (variant) {
+      case "danger":
+        return {
+          icon: "text-red-600",
+          iconBg: "bg-red-100",
+          confirmButton: "bg-red-600 hover:bg-red-700 text-white",
+        };
+      case "warning":
+        return {
+          icon: "text-yellow-600",
+          iconBg: "bg-yellow-100",
+          confirmButton: "bg-yellow-600 hover:bg-yellow-700 text-white",
+        };
+      case "info":
+        return {
+          icon: "text-primary",
+          iconBg: "chip-primary-surface",
+          confirmButton: "bg-primary hover:bg-lighthouse-navy text-white",
+        };
+      default:
+        return {
+          icon: "text-red-600",
+          iconBg: "bg-red-100",
+          confirmButton: "bg-red-600 hover:bg-red-700 text-white",
+        };
+    }
+  };
+
+  const getIcon = () => {
+    switch (variant) {
+      case "danger":
+        return (
+          <svg
+            className="w-6 h-6"
+            fill="none"
+            stroke="currentColor"
+            viewBox="0 0 24 24"
+          >
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              strokeWidth={2}
+              d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L3.732 16.5c-.77.833.192 2.5 1.732 2.5z"
+            />
+          </svg>
+        );
+      case "warning":
+        return (
+          <svg
+            className="w-6 h-6"
+            fill="none"
+            stroke="currentColor"
+            viewBox="0 0 24 24"
+          >
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              strokeWidth={2}
+              d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
+            />
+          </svg>
+        );
+      case "info":
+        return (
+          <svg
+            className="w-6 h-6"
+            fill="none"
+            stroke="currentColor"
+            viewBox="0 0 24 24"
+          >
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              strokeWidth={2}
+              d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
+            />
+          </svg>
+        );
+      default:
+        return null;
+    }
+  };
+
+  const styles = getVariantStyles();
+
+  return (
+    <ModalOverlay
+      isOpen={isOpen}
+      onClose={onClose}
+      zIndex={zIndex}
+      panelClassName="relative w-full max-w-lg"
+    >
+      <div className="overflow-hidden rounded-xl bg-white shadow-xl">
+        <div className="px-4 pt-5 pb-4 sm:p-6 sm:pb-4">
+          <div className="sm:flex sm:items-start">
+            <div
+              className={`mx-auto flex h-12 w-12 flex-shrink-0 items-center justify-center rounded-full ${styles.iconBg} sm:mx-0 sm:h-10 sm:w-10`}
+            >
+              <div className={styles.icon}>{getIcon()}</div>
+            </div>
+            <div className="mt-3 text-center sm:mt-0 sm:ml-4 sm:text-left">
+              <h3 className="text-lg font-medium leading-6 text-gray-900">
+                {title}
+              </h3>
+              <div className="mt-2 text-sm text-gray-500">{message}</div>
+            </div>
+          </div>
+        </div>
+        <div className="bg-gray-50 px-4 py-3 sm:flex sm:flex-row-reverse sm:px-6">
+          <Button
+            onClick={onConfirm}
+            disabled={loading}
+            className={`w-full min-h-[44px] sm:ml-3 sm:w-auto ${styles.confirmButton}`}
+          >
+            {loading ? "Processing..." : confirmText}
+          </Button>
+          <Button
+            variant="tertiary"
+            onClick={onClose}
+            disabled={loading}
+            className="mt-3 w-full min-h-[44px] sm:mt-0 sm:w-auto"
+          >
+            {cancelText}
+          </Button>
+        </div>
+      </div>
+    </ModalOverlay>
+  );
+}

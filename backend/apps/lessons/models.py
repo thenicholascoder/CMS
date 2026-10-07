@@ -1,0 +1,373 @@
+from django.core.validators import FileExtensionValidator
+from django.db import models
+from django.db.models import Q
+
+from apps.people.models import Journey, Person
+
+
+class Lesson(models.Model):
+    """
+    Stores the canonical lesson definition.
+    Multiple versions of the same lesson share the same `code` value.
+    """
+
+    code = models.CharField(
+        max_length=50,
+        help_text="Stable identifier used to group lesson versions together.",
+    )
+    version_label = models.CharField(
+        max_length=20,
+        default="v1",
+        help_text="Short label that indicates the lesson revision (e.g., v1, v2).",
+    )
+    title = models.CharField(max_length=200)
+    summary = models.TextField(blank=True)
+    outline = models.TextField(
+        blank=True,
+        help_text="Optional structured outline or talking points for the lesson.",
+    )
+    order = models.PositiveSmallIntegerField(
+        help_text="Display order within the conversion journey."
+    )
+    is_latest = models.BooleanField(
+        default=True,
+        help_text="Marks the latest published version for this lesson code.",
+    )
+    is_active = models.BooleanField(
+        default=True,
+        help_text="Allows disabling a lesson version without deleting it.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["order", "title"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["code", "version_label"],
+                name="unique_lesson_code_version",
+            ),
+            models.UniqueConstraint(
+                fields=["code"],
+                condition=Q(is_latest=True),
+                name="unique_latest_lesson_per_code",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.title} ({self.version_label})"
+
+
+class LessonJourney(models.Model):
+    """
+    Stores metadata that determines how a lesson completion appears in the conversion
+    timeline as a journey (LESSON type by default).
+    """
+
+    lesson = models.OneToOneField(
+        Lesson, on_delete=models.CASCADE, related_name="journey_config"
+    )
+    journey_type = models.CharField(
+        max_length=20,
+        choices=Journey._meta.get_field("type").choices,
+        default="LESSON",
+        help_text="Journey type to create when the lesson is completed.",
+    )
+    title_template = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text="Optional override for the journey title (defaults to lesson title).",
+    )
+    note_template = models.TextField(
+        blank=True,
+        help_text="Optional note body saved on the journey when the lesson is completed.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Lesson Journey Configuration"
+        verbose_name_plural = "Lesson Journey Configurations"
+
+    def __str__(self) -> str:
+        return f"{self.lesson.title} journey config"
+
+
+class PersonLessonProgress(models.Model):
+    """
+    Tracks an individual's journey through each lesson version.
+    """
+
+    class Status(models.TextChoices):
+        ASSIGNED = "ASSIGNED", "Assigned"
+        IN_PROGRESS = "IN_PROGRESS", "In progress"
+        COMPLETED = "COMPLETED", "Completed"
+        SKIPPED = "SKIPPED", "Skipped"
+
+    person = models.ForeignKey(
+        Person, on_delete=models.CASCADE, related_name="lesson_progress"
+    )
+    lesson = models.ForeignKey(
+        Lesson, on_delete=models.CASCADE, related_name="progress_records"
+    )
+    status = models.CharField(
+        max_length=20, choices=Status.choices, default=Status.ASSIGNED
+    )
+    assigned_at = models.DateTimeField(auto_now_add=True)
+    assigned_by = models.ForeignKey(
+        Person,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="lessons_assigned",
+    )
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    completed_by = models.ForeignKey(
+        Person,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="lessons_verified",
+    )
+    journey = models.OneToOneField(
+        Journey,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="lesson_progress",
+    )
+    notes = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["lesson__order", "person__last_name", "person__first_name"]
+        unique_together = ("person", "lesson")
+
+    def __str__(self) -> str:
+        return f"{self.person.get_full_name() or self.person.username} - {self.lesson}"
+
+
+class LessonStudentEnrollment(models.Model):
+    """
+    Canonical lessons-program assignment: one active teacher per student.
+    """
+
+    student = models.OneToOneField(
+        Person,
+        on_delete=models.CASCADE,
+        related_name="lesson_enrollment",
+    )
+    teacher = models.ForeignKey(
+        Person,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="lesson_students",
+        limit_choices_to=~Q(role="VISITOR"),
+    )
+    historical_teacher_first_name = models.CharField(max_length=150, blank=True)
+    historical_teacher_last_name = models.CharField(max_length=150, blank=True)
+    assigned_by = models.ForeignKey(
+        Person,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="lesson_enrollments_assigned",
+    )
+    commitment_signed = models.BooleanField(default=False)
+    commitment_signed_at = models.DateTimeField(null=True, blank=True)
+    commitment_signed_by = models.ForeignKey(
+        Person,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="lesson_commitments_verified",
+    )
+    is_active = models.BooleanField(default=True)
+    assigned_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["student__last_name", "student__first_name"]
+
+    def teacher_display_name(self) -> str:
+        if self.teacher_id:
+            return self.teacher.get_full_name() or self.teacher.username
+        name = " ".join(
+            part
+            for part in (
+                self.historical_teacher_first_name,
+                self.historical_teacher_last_name,
+            )
+            if part
+        ).strip()
+        return name or "Former / unknown teacher"
+
+    def __str__(self) -> str:
+        student_name = self.student.get_full_name() or self.student.username
+        return f"{student_name} — {self.teacher_display_name()}"
+
+
+class LessonTeacherTransfer(models.Model):
+    """Audit log when a student's lessons teacher changes."""
+
+    enrollment = models.ForeignKey(
+        LessonStudentEnrollment,
+        on_delete=models.CASCADE,
+        related_name="transfers",
+    )
+    from_teacher = models.ForeignKey(
+        Person,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="lesson_transfers_from",
+        limit_choices_to=~Q(role="VISITOR"),
+    )
+    to_teacher = models.ForeignKey(
+        Person,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="lesson_transfers_to",
+        limit_choices_to=~Q(role="VISITOR"),
+    )
+    transferred_by = models.ForeignKey(
+        Person,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="lesson_transfers_recorded",
+    )
+    note = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"Transfer #{self.pk} for enrollment {self.enrollment_id}"
+
+
+class LessonSettings(models.Model):
+    """
+    Stores global configuration for the lessons module, including the commitment
+    form and the printable NCC lessons booklet.
+    """
+
+    commitment_form = models.FileField(
+        upload_to="lessons/commitment_forms/", blank=True, null=True
+    )
+    uploaded_by = models.ForeignKey(
+        Person,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="uploaded_commitment_forms",
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+    ncc_lessons_pdf = models.FileField(
+        upload_to="lessons/ncc_lessons/",
+        blank=True,
+        null=True,
+        validators=[FileExtensionValidator(allowed_extensions=["pdf"])],
+    )
+    ncc_lessons_pdf_uploaded_by = models.ForeignKey(
+        Person,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="uploaded_ncc_lessons_pdfs",
+    )
+    ncc_lessons_pdf_updated_at = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self) -> str:
+        return "Lesson Settings"
+
+
+class LessonSessionReport(models.Model):
+    """
+    Records a 1:1 lesson session between a teacher and student.
+    """
+
+    class SessionType(models.TextChoices):
+        LESSON = "LESSON", "Lesson"
+        PRE_LESSON = "PRE_LESSON", "Pre-lesson"
+
+    class PreLessonKind(models.TextChoices):
+        INTRODUCTION = "INTRODUCTION", "Introduction"
+        OTHER = "OTHER", "Other"
+
+    session_type = models.CharField(
+        max_length=20,
+        choices=SessionType.choices,
+        default=SessionType.LESSON,
+    )
+    pre_lesson_kind = models.CharField(
+        max_length=20,
+        choices=PreLessonKind.choices,
+        null=True,
+        blank=True,
+    )
+
+    teacher = models.ForeignKey(
+        Person,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name="lesson_reports_as_teacher",
+        limit_choices_to=~Q(role="VISITOR"),
+    )
+    student = models.ForeignKey(
+        Person,
+        on_delete=models.CASCADE,
+        related_name="lesson_reports_as_student",
+    )
+    lesson = models.ForeignKey(
+        Lesson,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name="session_reports",
+    )
+    progress = models.ForeignKey(
+        PersonLessonProgress,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="session_reports",
+    )
+    journey = models.OneToOneField(
+        Journey,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="pre_lesson_session_report",
+    )
+
+    session_date = models.DateField()  # Scheduled calendar date for the session plan.
+    session_start = models.DateTimeField()  # Actual date/time when the session started.
+    score = models.CharField(max_length=100, blank=True)
+    next_session_date = models.DateField(null=True, blank=True)
+    remarks = models.TextField(blank=True)
+
+    submitted_by = models.ForeignKey(
+        Person,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name="lesson_reports_submitted",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self) -> str:
+        teacher_name = (
+            self.teacher.get_full_name() or self.teacher.username
+            if self.teacher
+            else "Unknown"
+        )
+        student_name = self.student.get_full_name() or self.student.username
+        return f"{teacher_name} -> {student_name} ({self.session_date})"
+
+    class Meta:
+        ordering = ("-session_date", "-session_start", "-created_at")

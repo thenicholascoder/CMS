@@ -1,0 +1,2475 @@
+from datetime import date, datetime, timedelta
+from typing import Optional
+
+from django.db.models import Count, Min, Q, Sum
+from django.db.models.functions import Coalesce, Greatest
+from django.utils import timezone
+from django_filters.rest_framework import DjangoFilterBackend
+from rest_framework.pagination import PageNumberPagination
+from rest_framework import filters, status, viewsets
+from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.response import Response
+
+from apps.attendance.models import AttendanceRecord
+from apps.events.models import Event, EventType
+from apps.people.models import Branch, ModuleCoordinator, Person
+from apps.clusters.models import Cluster, ClusterWeeklyReport
+from apps.lessons.models import LessonSessionReport
+from core.datetime_utils import church_calendar_date, church_today
+from apps.authentication.permissions import (
+    IsMemberOrAbove,
+    IsAuthenticatedAndNotVisitor,
+    IsModuleCoordinator,
+    HasModuleAccess,
+    CanEditAssignedResource,
+    IsAdmin,
+)
+
+from .filters import ConversionFilter, EvangelismGroupFilter, ProspectFilter
+from .group_counts import annotate_evangelism_group_counts
+from .permissions import (
+    CanApproveEvangelismGroup,
+    CanManageEach1Reach1Goals,
+    HasEvangelismGroupWrite,
+    HasEvangelismReportWrite,
+    accessible_evangelism_group_ids,
+    ensure_group_is_approved_for_operations,
+    ensure_user_can_mutate_evangelism_group_records,
+    ensure_user_can_submit_evangelism_report_or_privileged,
+    ensure_user_manages_evangelism_group_or_privileged,
+    filter_weekly_reports_for_user,
+    reportable_tally_group_ids_for_coordinator,
+    user_can_manage_each1reach1_cluster,
+)
+from .approval import (
+    initial_group_approval_status,
+    mark_group_approved,
+    mark_group_rejected,
+)
+from .models import (
+    EvangelismGroup,
+    EvangelismSession,
+    EvangelismWeeklyReport,
+    Prospect,
+    FollowUpTask,
+    DropOff,
+    Conversion,
+    MonthlyConversionTracking,
+    Each1Reach1Goal,
+)
+from .serializers import (
+    EvangelismGroupListSerializer,
+    EvangelismGroupSerializer,
+    EvangelismBulkEnrollSerializer,
+    EvangelismSessionSerializer,
+    EvangelismRecurringSessionSerializer,
+    EvangelismWeeklyReportSerializer,
+    EvangelismTallySerializer,
+    EvangelismPeopleTallySerializer,
+    EvangelismTallyDrilldownSerializer,
+    ProspectSerializer,
+    FollowUpTaskSerializer,
+    DropOffSerializer,
+    ConversionSerializer,
+    MonthlyConversionTrackingSerializer,
+    MonthlyStatisticsSerializer,
+    Each1Reach1GoalSerializer,
+    EvangelismSummarySerializer,
+    EvangelismDashboardStatsSerializer,
+)
+from .services import (
+    bulk_enroll_members,
+    create_person_from_prospect,
+    sync_prospect_invitation_journey_note,
+    mark_prospect_attended,
+    REPORT_BACKED_FIRST_ACTIVITIES,
+    update_monthly_tracking,
+    calculate_monthly_statistics,
+    parse_people_tally_months,
+    parse_people_tally_group_by,
+    is_unassigned_cluster_param,
+    build_people_tally_month_rows,
+    build_people_tally_cluster_rows,
+    people_tally_id_sets,
+    PEOPLE_TALLY_GROUP_BY_CLUSTER,
+    PEOPLE_TALLY_ROW_CLUSTER,
+    PEOPLE_TALLY_ROW_TOTAL,
+    check_conversion_completion,
+    endorse_visitor_to_cluster,
+    get_cluster_visitors,
+    previous_report_visitors_for_group,
+    detect_drop_offs,
+    check_lesson_completion,
+    update_person_baptism_dates,
+    update_each1reach1_goal,
+    sync_conversion_pipeline,
+    advance_prospect_to_taken_ncc,
+    annotate_people_reached_date,
+    people_meeting_reached_milestones,
+    get_default_each1reach1_target,
+    calculate_conversion_rate,
+    get_group_statistics,
+    get_cluster_statistics,
+    create_recurring_sessions,
+    generate_each1reach1_report,
+    get_evangelism_dashboard_stats,
+)
+
+
+class EvangelismGroupPagination(PageNumberPagination):
+    page_size = 25
+    page_size_query_param = "page_size"
+    max_page_size = 100
+
+
+class EvangelismRelatedPagination(PageNumberPagination):
+    page_size = 25
+    page_size_query_param = "page_size"
+    max_page_size = 100
+
+
+class EvangelismGroupViewSet(viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticatedAndNotVisitor]
+    queryset = EvangelismGroup.objects.select_related(
+        "coordinator", "cluster", "cluster__branch", "branch", "created_by", "reviewed_by"
+    ).all()
+    serializer_class = EvangelismGroupSerializer
+    pagination_class = EvangelismGroupPagination
+    filter_backends = (
+        DjangoFilterBackend,
+        filters.SearchFilter,
+        filters.OrderingFilter,
+    )
+    filterset_class = EvangelismGroupFilter
+    search_fields = (
+        "name",
+        "description",
+        "location",
+        "coordinator__first_name",
+        "coordinator__last_name",
+        "cluster__code",
+        "cluster__name",
+    )
+    ordering_fields = (
+        "name",
+        "created_at",
+        "members_count",
+        "visitors_count",
+        "cluster__code",
+        "id",
+    )
+    ordering = ("name", "id")
+
+    @staticmethod
+    def _assignment_ids_map(group_ids, level):
+        from collections import defaultdict
+
+        mapping = defaultdict(list)
+        if not group_ids:
+            return mapping
+        rows = ModuleCoordinator.objects.filter(
+            module=ModuleCoordinator.ModuleType.EVANGELISM,
+            level=level,
+            resource_id__in=group_ids,
+        ).values_list("resource_id", "person_id")
+        for resource_id, person_id in rows:
+            if resource_id is not None:
+                mapping[resource_id].append(person_id)
+        return mapping
+
+    def get_serializer(self, *args, **kwargs):
+        kwargs.setdefault("context", self.get_serializer_context())
+        instance = args[0] if args else kwargs.get("instance")
+        if (
+            instance is not None
+            and kwargs.get("data") is None
+            and "evangelism_bible_sharer_ids_map" not in kwargs["context"]
+            and self.get_serializer_class()
+            in (EvangelismGroupSerializer, EvangelismGroupListSerializer)
+        ):
+            if kwargs.get("many"):
+                group_ids = [g.id for g in instance]
+            else:
+                group_ids = [instance.id]
+            kwargs["context"]["evangelism_bible_sharer_ids_map"] = (
+                self._assignment_ids_map(
+                    group_ids, ModuleCoordinator.CoordinatorLevel.BIBLE_SHARER
+                )
+            )
+            if self.get_serializer_class() is EvangelismGroupSerializer:
+                kwargs["context"]["evangelism_reporter_ids_map"] = (
+                    self._assignment_ids_map(
+                        group_ids, ModuleCoordinator.CoordinatorLevel.REPORTER
+                    )
+                )
+        return super().get_serializer(*args, **kwargs)
+
+    def get_serializer_class(self):
+        if self.action == "list":
+            return EvangelismGroupListSerializer
+        return EvangelismGroupSerializer
+
+    def get_queryset(self):
+        user = self.request.user
+        queryset = annotate_evangelism_group_counts(super().get_queryset())
+        branch_id = self.request.query_params.get("branch")
+        if branch_id:
+            queryset = queryset.filter(branch_id=branch_id)
+
+        accessible = accessible_evangelism_group_ids(user)
+        if accessible is None:
+            queryset = queryset
+        elif not accessible:
+            queryset = queryset.none()
+        else:
+            queryset = queryset.filter(id__in=accessible)
+
+        if getattr(self, "action", None) != "list":
+            queryset = queryset.prefetch_related("members")
+        return queryset
+
+    def get_permissions(self):
+        if self.action in [
+            "list",
+            "retrieve",
+            "sessions",
+            "conversions",
+            "visitors",
+            "previous_visitors",
+            "summary",
+            "dashboard_stats",
+            "bible_sharers_coverage",
+        ]:
+            return [IsAuthenticatedAndNotVisitor(), IsMemberOrAbove()]
+        elif self.action in ["create", "update", "partial_update", "enroll"]:
+            return [IsAuthenticatedAndNotVisitor(), HasEvangelismGroupWrite()]
+        elif self.action in ["approve", "reject"]:
+            return [IsAuthenticatedAndNotVisitor(), CanApproveEvangelismGroup()]
+        elif self.action == "destroy":
+            return [IsAuthenticatedAndNotVisitor(), IsAdmin()]
+        return [IsAuthenticatedAndNotVisitor(), IsMemberOrAbove()]
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        extra = {
+            "created_by": user,
+            "approval_status": initial_group_approval_status(user),
+        }
+        if not serializer.validated_data.get("coordinator"):
+            extra["coordinator"] = user
+        serializer.save(**extra)
+
+    def get_object(self):
+        obj = super().get_object()
+        if self.action in ["update", "partial_update", "enroll"]:
+            ensure_user_manages_evangelism_group_or_privileged(
+                self.request.user, obj
+            )
+        return obj
+
+    @action(detail=True, methods=["post"])
+    def enroll(self, request, pk=None):
+        """Bulk enroll members into a group."""
+        evangelism_group = self.get_object()
+        serializer = EvangelismBulkEnrollSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        person_ids = serializer.validated_data["person_ids"]
+
+        created_count = bulk_enroll_members(evangelism_group, person_ids)
+
+        return Response(
+            {"created": created_count, "message": f"Enrolled {created_count} people"},
+            status=status.HTTP_201_CREATED if created_count else status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=["post"], url_path="approve")
+    def approve(self, request, pk=None):
+        group = self.get_object()
+        if group.approval_status != EvangelismGroup.ApprovalStatus.PENDING:
+            return Response(
+                {"detail": "Only pending groups can be approved."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        mark_group_approved(
+            group,
+            request.user,
+            note=request.data.get("review_note") or request.data.get("note") or "",
+        )
+        group.refresh_from_db()
+        return Response(self.get_serializer(group).data)
+
+    @action(detail=True, methods=["post"], url_path="reject")
+    def reject(self, request, pk=None):
+        group = self.get_object()
+        if group.approval_status != EvangelismGroup.ApprovalStatus.PENDING:
+            return Response(
+                {"detail": "Only pending groups can be rejected."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        mark_group_rejected(
+            group,
+            request.user,
+            note=request.data.get("review_note") or request.data.get("note") or "",
+        )
+        group.refresh_from_db()
+        return Response(self.get_serializer(group).data)
+
+    @action(detail=False, methods=["get"], url_path="dashboard-stats")
+    def dashboard_stats(self, request):
+        """Organization-wide evangelism dashboard counts (groups, visitors, reached)."""
+        year_param = request.query_params.get("year")
+        try:
+            year = int(year_param) if year_param is not None and year_param != "" else timezone.now().year
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "year must be a valid integer."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        stats = get_evangelism_dashboard_stats(year)
+        serializer = EvangelismDashboardStatsSerializer(instance=stats)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=["get"])
+    def sessions(self, request, pk=None):
+        """List sessions for a group."""
+        evangelism_group = self.get_object()
+        sessions = evangelism_group.sessions.all().order_by(
+            "-session_date", "-session_time"
+        )
+
+        date_from = request.query_params.get("date_from")
+        if date_from:
+            sessions = sessions.filter(session_date__gte=date_from)
+        date_to = request.query_params.get("date_to")
+        if date_to:
+            sessions = sessions.filter(session_date__lte=date_to)
+
+        serializer = EvangelismSessionSerializer(sessions, many=True)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=["get"])
+    def conversions(self, request, pk=None):
+        """List conversions for a group."""
+        evangelism_group = self.get_object()
+        conversions = (
+            evangelism_group.conversions.select_related(
+                "person",
+                "person__lesson_enrollment",
+                "person__lesson_enrollment__teacher",
+                "prospect",
+                "converted_by",
+                "evangelism_group",
+                "cluster",
+                "verified_by",
+            )
+            .all()
+            .order_by("-conversion_date")
+        )
+
+        serializer = ConversionSerializer(conversions, many=True)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=["get"])
+    def visitors(self, request, pk=None):
+        """List visitors associated with this group's cluster."""
+        evangelism_group = self.get_object()
+        cluster = evangelism_group.cluster
+
+        if not cluster:
+            return Response([])
+
+        visitors = get_cluster_visitors(cluster)
+        serializer = ProspectSerializer(visitors, many=True)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=["get"], url_path="previous_visitors")
+    def previous_visitors(self, request, pk=None):
+        """Visitor/member IDs from prior evangelism (and linked cluster) weekly reports."""
+        evangelism_group = self.get_object()
+        try:
+            year = int(request.query_params.get("year"))
+            week_number = int(request.query_params.get("week_number"))
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "year and week_number must be integers."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not (1 <= week_number <= 53):
+            return Response(
+                {"detail": "week_number must be between 1 and 53."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        exclude_raw = request.query_params.get("exclude_report")
+        exclude_report_id = None
+        if exclude_raw not in (None, ""):
+            try:
+                exclude_report_id = int(exclude_raw)
+            except (TypeError, ValueError):
+                return Response(
+                    {"detail": "exclude_report must be an integer."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        return Response(
+            previous_report_visitors_for_group(
+                evangelism_group,
+                year=year,
+                week_number=week_number,
+                exclude_report_id=exclude_report_id,
+            )
+        )
+
+    @action(detail=True, methods=["get"])
+    def summary(self, request):
+        """Group statistics."""
+        evangelism_group = self.get_object()
+        stats = get_group_statistics(evangelism_group)
+        return Response(stats)
+
+    @action(detail=False, methods=["get"], permission_classes=[IsAuthenticatedAndNotVisitor, IsMemberOrAbove])
+    def bible_sharers_coverage(self, request):
+        """People directory + cluster coverage for Bible Sharers."""
+        from .bible_sharers_directory import (
+            build_bible_sharers_coverage,
+            parse_coverage_branch_id,
+        )
+
+        branch_id = parse_coverage_branch_id(request.query_params.get("branch"))
+        return Response(
+            build_bible_sharers_coverage(user=request.user, branch_id=branch_id)
+        )
+
+
+class EvangelismSessionViewSet(viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticatedAndNotVisitor, IsMemberOrAbove]
+    queryset = EvangelismSession.objects.select_related(
+        "evangelism_group", "event"
+    ).all()
+    serializer_class = EvangelismSessionSerializer
+    filter_backends = (
+        DjangoFilterBackend,
+        filters.SearchFilter,
+        filters.OrderingFilter,
+    )
+    filterset_fields = ("evangelism_group", "session_date")
+    search_fields = ("topic", "notes", "evangelism_group__name")
+    ordering_fields = ("session_date", "session_time", "created_at")
+    ordering = ("-session_date", "-session_time")
+
+    def get_permissions(self):
+        if self.action in ["list", "retrieve"]:
+            return [IsAuthenticatedAndNotVisitor(), IsMemberOrAbove()]
+        if self.action == "destroy":
+            return [IsAuthenticatedAndNotVisitor(), IsAdmin()]
+        return [IsAuthenticatedAndNotVisitor(), HasModuleAccess("EVANGELISM", "write")]
+
+    def perform_create(self, serializer):
+        """Auto-create Event when session is created (if requested)."""
+        session = serializer.save()
+        create_event = serializer.validated_data.get("create_event", False)
+        if create_event:
+            self._create_event_for_session(session)
+
+    def perform_update(self, serializer):
+        """Update linked Event when session is updated."""
+        session = serializer.save()
+        if session.event:
+            self._update_event_for_session(session)
+
+    def perform_destroy(self, instance):
+        """Optionally delete linked Event when session is deleted."""
+        event = instance.event
+        instance.delete()
+
+    def _create_event_for_session(self, session: EvangelismSession):
+        """Create an Event for an Evangelism session."""
+        group = session.evangelism_group
+        meeting_time = (
+            session.session_time or group.meeting_time or timezone.now().time()
+        )
+
+        session_datetime = datetime.combine(session.session_date, meeting_time)
+        session_datetime = timezone.make_aware(session_datetime)
+        end_datetime = session_datetime + timedelta(hours=1)
+
+        event_title = group.name
+        if session.topic:
+            event_title = f"{event_title} - {session.topic}"
+
+        # Determine event type based on cluster affiliation
+        event_type = "BS/CLUSTER_EVANGELISM" if group.cluster else "BIBLE_STUDY"
+
+        event = Event.objects.create(
+            title=event_title,
+            description=f"Bible Study session for {group.name}",
+            start_date=session_datetime,
+            end_date=end_datetime,
+            event_type_id=event_type,
+            location=group.location or "",
+            is_recurring=False,
+        )
+
+        session.event = event
+        session.save(update_fields=["event"])
+
+    def _update_event_for_session(self, session: EvangelismSession):
+        """Update the linked Event when session is updated."""
+        if not session.event:
+            return
+
+        group = session.evangelism_group
+        meeting_time = (
+            session.session_time or group.meeting_time or timezone.now().time()
+        )
+
+        session_datetime = datetime.combine(session.session_date, meeting_time)
+        session_datetime = timezone.make_aware(session_datetime)
+        end_datetime = session_datetime + timedelta(hours=1)
+
+        event_title = group.name
+        if session.topic:
+            event_title = f"{event_title} - {session.topic}"
+
+        session.event.title = event_title
+        session.event.start_date = session_datetime
+        session.event.end_date = end_datetime
+        session.event.location = group.location or ""
+        session.event.save()
+
+    @action(detail=True, methods=["get"])
+    def attendance_report(self, request, pk=None):
+        """Generate attendance report for a session."""
+        session = self.get_object()
+        if not session.event:
+            return Response(
+                {"error": "Session has no linked event"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Get enrolled members
+        enrolled_members = session.evangelism_group.members.exclude(role="ADMIN")
+
+        # Get attendance records
+        attendance_records = AttendanceRecord.objects.filter(
+            event=session.event, occurrence_date=session.session_date
+        ).select_related("person")
+
+        present_count = attendance_records.filter(
+            status=AttendanceRecord.AttendanceStatus.PRESENT
+        ).count()
+        absent_count = attendance_records.filter(
+            status=AttendanceRecord.AttendanceStatus.ABSENT
+        ).count()
+        excused_count = attendance_records.filter(
+            status=AttendanceRecord.AttendanceStatus.EXCUSED
+        ).count()
+
+        total_enrolled = enrolled_members.count()
+        attendance_rate = (
+            round((present_count / total_enrolled * 100), 2)
+            if total_enrolled > 0
+            else 0.0
+        )
+
+        data = {
+            "session_id": session.id,
+            "session_date": session.session_date,
+            "topic": session.topic,
+            "total_enrolled": total_enrolled,
+            "present_count": present_count,
+            "absent_count": absent_count,
+            "excused_count": excused_count,
+            "attendance_rate": attendance_rate,
+        }
+
+        return Response(data)
+
+    @action(detail=False, methods=["post"])
+    def create_recurring(self, request):
+        """Create multiple sessions based on recurrence pattern."""
+        serializer = EvangelismRecurringSessionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        group_id = serializer.validated_data["evangelism_group_id"]
+        evangelism_group = EvangelismGroup.objects.get(id=group_id)
+        ensure_group_is_approved_for_operations(evangelism_group)
+
+        start_date = serializer.validated_data["start_date"]
+        end_date = serializer.validated_data.get("end_date")
+        num_occurrences = serializer.validated_data.get("num_occurrences")
+        recurrence_pattern = serializer.validated_data["recurrence_pattern"]
+        day_of_week = serializer.validated_data.get("day_of_week")
+        default_topic = serializer.validated_data.get("default_topic", "")
+
+        sessions = create_recurring_sessions(
+            evangelism_group=evangelism_group,
+            start_date=start_date,
+            end_date=end_date,
+            num_occurrences=num_occurrences,
+            recurrence_pattern=recurrence_pattern,
+            day_of_week=day_of_week,
+            default_topic=default_topic,
+        )
+
+        session_serializer = EvangelismSessionSerializer(sessions, many=True)
+        return Response(
+            {
+                "created": len(sessions),
+                "sessions": session_serializer.data,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class EvangelismWeeklyReportPagination(PageNumberPagination):
+    page_size = 50
+    page_size_query_param = "page_size"
+    max_page_size = 100
+
+
+class EvangelismWeeklyReportViewSet(viewsets.ModelViewSet):
+    class DrilldownPagination(PageNumberPagination):
+        page_size = 20
+        page_size_query_param = "page_size"
+        max_page_size = 100
+
+    permission_classes = [IsAuthenticatedAndNotVisitor, IsMemberOrAbove]
+    queryset = (
+        EvangelismWeeklyReport.objects.select_related(
+            "evangelism_group", "submitted_by"
+        )
+        .prefetch_related(
+            "members_attended",
+            "visitors_attended",
+            "prospects_invited__invited_by",
+        )
+        .all()
+    )
+    serializer_class = EvangelismWeeklyReportSerializer
+    pagination_class = EvangelismWeeklyReportPagination
+    filter_backends = (
+        DjangoFilterBackend,
+        filters.SearchFilter,
+        filters.OrderingFilter,
+    )
+    filterset_fields = ("evangelism_group", "year", "week_number", "gathering_type")
+    search_fields = ("topic", "notes", "evangelism_group__name")
+    ordering_fields = ("year", "week_number", "meeting_date")
+    ordering = ("-year", "-week_number")
+
+    def get_permissions(self):
+        if self.action in ["list", "retrieve"]:
+            return [IsAuthenticatedAndNotVisitor(), IsMemberOrAbove()]
+        if self.action == "destroy":
+            return [IsAuthenticatedAndNotVisitor(), IsAdmin()]
+        return [IsAuthenticatedAndNotVisitor(), HasEvangelismReportWrite()]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        queryset = filter_weekly_reports_for_user(self.request.user, queryset)
+
+        month = self.request.query_params.get("month")
+        if month:
+            try:
+                month_int = int(month)
+                if 1 <= month_int <= 12:
+                    queryset = queryset.filter(meeting_date__month=month_int)
+            except (TypeError, ValueError):
+                pass
+
+        cluster = self.request.query_params.get("cluster")
+        if cluster:
+            try:
+                cluster_int = int(cluster)
+                queryset = queryset.filter(evangelism_group__cluster_id=cluster_int)
+            except (TypeError, ValueError):
+                pass
+
+        branch = self.request.query_params.get("branch")
+        if branch:
+            try:
+                branch_int = int(branch)
+                queryset = queryset.filter(
+                    evangelism_group__branch_id=branch_int
+                )
+            except (TypeError, ValueError):
+                pass
+
+        return queryset
+
+    def perform_create(self, serializer):
+        group = serializer.validated_data.get("evangelism_group")
+        ensure_user_can_submit_evangelism_report_or_privileged(
+            self.request.user, group
+        )
+        serializer.save(submitted_by=self.request.user)
+
+    def perform_update(self, serializer):
+        group = serializer.validated_data.get(
+            "evangelism_group", serializer.instance.evangelism_group
+        )
+        ensure_user_can_submit_evangelism_report_or_privileged(
+            self.request.user, group
+        )
+        serializer.save()
+
+    @action(detail=False, methods=["get"], url_path="distinct_years")
+    def distinct_years(self, request):
+        """
+        Distinct report years present for facet filters only.
+
+        Applies branch, cluster, evangelism_group, and gathering_type when provided.
+        Ignores year, month, and week_number so the Year dropdown can list all years
+        that have matching reports (same pattern as cluster weekly distinct_years).
+        """
+        queryset = filter_weekly_reports_for_user(
+            request.user, EvangelismWeeklyReport.objects.all()
+        )
+
+        branch = request.query_params.get("branch")
+        if branch:
+            try:
+                queryset = queryset.filter(
+                    evangelism_group__branch_id=int(branch)
+                )
+            except (TypeError, ValueError):
+                pass
+
+        cluster = request.query_params.get("cluster")
+        if cluster:
+            try:
+                queryset = queryset.filter(evangelism_group__cluster_id=int(cluster))
+            except (TypeError, ValueError):
+                pass
+
+        eg = request.query_params.get("evangelism_group")
+        if eg:
+            try:
+                queryset = queryset.filter(evangelism_group_id=int(eg))
+            except (TypeError, ValueError):
+                pass
+
+        gathering = request.query_params.get("gathering_type")
+        if gathering:
+            queryset = queryset.filter(gathering_type=gathering)
+
+        years_iter = queryset.values_list("year", flat=True).distinct()
+        years = sorted(set(years_iter), reverse=True)
+        return Response({"years": years})
+
+    def _resolve_branch_id(self) -> Optional[int]:
+        branch = self.request.query_params.get("branch")
+        if branch in (None, ""):
+            return None
+        try:
+            branch_id = int(branch)
+        except (TypeError, ValueError):
+            raise ValidationError({"branch": "Branch must be a valid integer."})
+
+        if not Branch.objects.filter(id=branch_id).exists():
+            raise ValidationError({"branch": "Branch not found."})
+        return branch_id
+
+    def _resolve_cluster_id(self) -> Optional[int]:
+        cluster = self.request.query_params.get("cluster")
+        if cluster in (None, ""):
+            return None
+        try:
+            cluster_id = int(cluster)
+        except (TypeError, ValueError):
+            raise ValidationError({"cluster": "Cluster must be a valid integer."})
+
+        if not Cluster.objects.filter(id=cluster_id).exists():
+            raise ValidationError({"cluster": "Cluster not found."})
+        return cluster_id
+
+    def _resolve_evangelism_group_id(self) -> Optional[int]:
+        raw = self.request.query_params.get("evangelism_group")
+        if raw in (None, ""):
+            return None
+        try:
+            eg_id = int(raw)
+        except (TypeError, ValueError):
+            raise ValidationError(
+                {"evangelism_group": "Evangelism group must be a valid integer."}
+            )
+
+        if not EvangelismGroup.objects.filter(id=eg_id).exists():
+            raise ValidationError({"evangelism_group": "Evangelism group not found."})
+        return eg_id
+
+    @staticmethod
+    def _person_ids_for_evangelism_groups(group_ids) -> frozenset:
+        ids = [gid for gid in (group_ids or []) if gid is not None]
+        if not ids:
+            return frozenset()
+        member_ids = EvangelismGroup.objects.filter(pk__in=ids).values_list(
+            "members__id", flat=True
+        )
+        prospect_person_ids = Prospect.objects.filter(
+            evangelism_group_id__in=ids,
+            person_id__isnull=False,
+        ).values_list("person_id", flat=True)
+        return frozenset(member_ids) | frozenset(prospect_person_ids)
+
+    def _coordinator_tally_restriction(self):
+        allowed_groups = reportable_tally_group_ids_for_coordinator(self.request.user)
+        if allowed_groups is None:
+            return None
+        cluster_ids = set(
+            EvangelismGroup.objects.filter(
+                id__in=allowed_groups, cluster_id__isnull=False
+            ).values_list("cluster_id", flat=True)
+        )
+        return {
+            "group_ids": set(allowed_groups),
+            "cluster_ids": cluster_ids,
+            "person_ids": self._person_ids_for_evangelism_groups(allowed_groups),
+        }
+
+    def _apply_coordinator_people_tally_scope(
+        self, branch_id, cluster_id, eg_id, group_person_ids, unclustered
+    ):
+        restriction = self._coordinator_tally_restriction()
+        if restriction is None:
+            return branch_id, cluster_id, eg_id, group_person_ids, unclustered, None
+        allowed_groups = restriction["group_ids"]
+        allowed_clusters = restriction["cluster_ids"]
+        if eg_id is not None and eg_id not in allowed_groups:
+            raise PermissionDenied(
+                "You do not have access to tally this evangelism group."
+            )
+        if cluster_id is not None and cluster_id not in allowed_clusters:
+            raise PermissionDenied("You do not have access to tally this cluster.")
+        if unclustered:
+            return branch_id, None, None, frozenset(), False, allowed_clusters
+        if eg_id is not None:
+            return (
+                branch_id,
+                cluster_id,
+                eg_id,
+                group_person_ids,
+                False,
+                allowed_clusters,
+            )
+        group_ids = allowed_groups
+        if cluster_id is not None:
+            group_ids = set(
+                EvangelismGroup.objects.filter(
+                    id__in=allowed_groups, cluster_id=cluster_id
+                ).values_list("id", flat=True)
+            )
+        return (
+            branch_id,
+            cluster_id,
+            None,
+            self._person_ids_for_evangelism_groups(group_ids),
+            False,
+            allowed_clusters,
+        )
+
+    @staticmethod
+    def _person_ids_for_evangelism_group(evangelism_group_id: int) -> frozenset:
+        member_ids = (
+            EvangelismGroup.objects.filter(pk=evangelism_group_id).values_list(
+                "members__id", flat=True
+            ).distinct()
+        )
+        prospect_person_ids = Prospect.objects.filter(
+            evangelism_group_id=evangelism_group_id,
+            person_id__isnull=False,
+        ).values_list("person_id", flat=True)
+        return frozenset(member_ids) | frozenset(prospect_person_ids)
+
+    def _branch_cluster_group_scope(self):
+        """Branch optional; at most one of cluster vs evangelism group scope."""
+        branch_id = self._resolve_branch_id()
+        cluster_id = self._resolve_cluster_id()
+        eg_id = self._resolve_evangelism_group_id()
+
+        if cluster_id is not None and eg_id is not None:
+            raise ValidationError(
+                {"detail": "Specify at most one of cluster or evangelism_group."}
+            )
+
+        group_person_ids = None
+        if eg_id is not None:
+            eg_obj = EvangelismGroup.objects.select_related(
+                "cluster", "branch"
+            ).get(pk=eg_id)
+            if branch_id is not None:
+                group_branch_id = eg_obj.branch_id
+                if group_branch_id is None and getattr(eg_obj, "cluster_id", None):
+                    group_branch_id = eg_obj.cluster.branch_id
+                if group_branch_id is not None and group_branch_id != branch_id:
+                    raise ValidationError(
+                        {
+                            "evangelism_group": (
+                                "Evangelism group is not under the selected branch."
+                            ),
+                        },
+                    )
+
+            group_person_ids = self._person_ids_for_evangelism_group(eg_id)
+
+        return branch_id, cluster_id, eg_id, group_person_ids
+
+    def _people_tally_scope(self):
+        """Like `_branch_cluster_group_scope`, plus `cluster=unassigned`."""
+        cluster_raw = self.request.query_params.get("cluster")
+        if is_unassigned_cluster_param(cluster_raw):
+            branch_id = self._resolve_branch_id()
+            eg_id = self._resolve_evangelism_group_id()
+            if eg_id is not None:
+                raise ValidationError(
+                    {"detail": "Specify at most one of cluster or evangelism_group."}
+                )
+            return branch_id, None, None, None, True
+        branch_id, cluster_id, eg_id, group_person_ids = (
+            self._branch_cluster_group_scope()
+        )
+        return branch_id, cluster_id, eg_id, group_person_ids, False
+
+    def _parse_people_tally_months(self) -> list:
+        months_raw = self.request.query_params.get("months")
+        month_raw = self.request.query_params.get("month")
+        if months_raw in (None, "") and month_raw not in (None, ""):
+            months_raw = month_raw
+        try:
+            return parse_people_tally_months(months_raw)
+        except ValueError as exc:
+            raise ValidationError({"months": str(exc)}) from exc
+
+    @staticmethod
+    def _person_display_name(person: Person) -> str:
+        if hasattr(person, "get_full_name"):
+            full_name = person.get_full_name()
+            if full_name:
+                return full_name
+        fallback = f"{person.first_name or ''} {person.last_name or ''}".strip()
+        return fallback or person.username
+
+    @staticmethod
+    def _to_date(value):
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return church_calendar_date(value)
+        return value
+
+    def _serialize_people_rows(
+        self,
+        people_qs,
+        metric: str,
+        date_attr: Optional[str] = None,
+        date_map: Optional[dict] = None,
+    ):
+        def get_reached_date(person):
+            if hasattr(person, "reached_date") and getattr(person, "reached_date", None):
+                return person.reached_date
+            if person.water_baptism_date and person.spirit_baptism_date:
+                return max(person.water_baptism_date, person.spirit_baptism_date)
+            return None
+
+        rows = []
+        for person in people_qs:
+            event_date = None
+            if date_map is not None:
+                event_date = date_map.get(person.id)
+            elif date_attr:
+                event_date = getattr(person, date_attr, None)
+            rows.append(
+                {
+                    "entity_type": "person",
+                    "id": person.id,
+                    "display_name": self._person_display_name(person),
+                    "first_name": person.first_name,
+                    "middle_name": person.middle_name,
+                    "last_name": person.last_name,
+                    "suffix": person.suffix,
+                    "nickname": person.nickname,
+                    "username": person.username,
+                    "member_id": person.member_id,
+                    "role": person.role,
+                    "status": person.status,
+                    "pipeline_stage": None,
+                    "person_id": person.id,
+                    "event_date": self._to_date(event_date),
+                    "date_first_invited": person.date_first_invited,
+                    "date_first_attended": person.date_first_attended,
+                    "lessons_finished_at": person.lessons_finished_at,
+                    "water_baptism_date": person.water_baptism_date,
+                    "spirit_baptism_date": person.spirit_baptism_date,
+                    "reached_date": self._to_date(get_reached_date(person)),
+                    "metric": metric,
+                }
+            )
+        return rows
+
+    def _serialize_prospect_rows(
+        self,
+        prospects_qs,
+        metric: str,
+        date_map_by_person_id: Optional[dict] = None,
+    ):
+        def get_reached_date(person):
+            if not person:
+                return None
+            if person.water_baptism_date and person.spirit_baptism_date:
+                return max(person.water_baptism_date, person.spirit_baptism_date)
+            return None
+
+        return [
+            {
+                "entity_type": "prospect",
+                "id": prospect.id,
+                "display_name": (
+                    self._person_display_name(prospect.person)
+                    if prospect.person
+                    else prospect.display_name
+                ),
+                "first_name": prospect.person.first_name if prospect.person else prospect.first_name,
+                "middle_name": prospect.person.middle_name if prospect.person else prospect.middle_name or None,
+                "last_name": prospect.person.last_name if prospect.person else prospect.last_name,
+                "suffix": prospect.person.suffix if prospect.person else prospect.suffix or None,
+                "nickname": prospect.person.nickname if prospect.person else None,
+                "username": prospect.person.username if prospect.person else None,
+                "member_id": prospect.person.member_id if prospect.person else None,
+                "role": prospect.person.role if prospect.person else None,
+                "status": prospect.person.status if prospect.person else None,
+                "pipeline_stage": prospect.pipeline_stage,
+                "person_id": prospect.person.id if prospect.person else None,
+                "event_date": self._to_date(
+                    date_map_by_person_id.get(prospect.person_id)
+                    if date_map_by_person_id and prospect.person_id
+                    else None
+                ),
+                "date_first_invited": (
+                    prospect.person.date_first_invited
+                    if prospect.person
+                    else prospect.date_first_invited
+                ),
+                "date_first_attended": (
+                    prospect.person.date_first_attended if prospect.person else None
+                ),
+                "lessons_finished_at": (
+                    prospect.person.lessons_finished_at if prospect.person else None
+                ),
+                "water_baptism_date": (
+                    prospect.person.water_baptism_date if prospect.person else None
+                ),
+                "spirit_baptism_date": (
+                    prospect.person.spirit_baptism_date if prospect.person else None
+                ),
+                "reached_date": self._to_date(get_reached_date(prospect.person)),
+                "metric": metric,
+            }
+            for prospect in prospects_qs
+        ]
+
+    def _paginated_drilldown_response(self, rows):
+        paginator = self.DrilldownPagination()
+        page = paginator.paginate_queryset(rows, self.request, view=self)
+        serializer = EvangelismTallyDrilldownSerializer(page, many=True)
+        return paginator.get_paginated_response(serializer.data)
+
+    @staticmethod
+    def _build_weekly_tally_rows(evangelism_qs, cluster_qs):
+        """Aggregate evangelism + cluster weekly reports without per-report M2M queries."""
+        tallies = {}
+
+        def ensure_entry(cluster_id, cluster_name, cluster_code, year_val, week_val):
+            key = (cluster_id, int(year_val), int(week_val))
+            if key not in tallies:
+                if cluster_id is None:
+                    resolved_name = "Unassigned"
+                    resolved_code = "Unassigned"
+                else:
+                    # Preserve blank names/codes; only Unassigned when there is no cluster.
+                    resolved_name = cluster_name
+                    resolved_code = cluster_code
+                tallies[key] = {
+                    "cluster_id": cluster_id,
+                    "cluster_name": resolved_name,
+                    "cluster_code": resolved_code,
+                    "year": int(year_val),
+                    "week_number": int(week_val),
+                    "meeting_dates": [],
+                    "gathering_types": set(),
+                    "members_set": set(),
+                    "visitors_set": set(),
+                    "evangelism_reports_count": 0,
+                    "cluster_reports_count": 0,
+                    "new_prospects": 0,
+                    "conversions_this_week": 0,
+                }
+            return tallies[key]
+
+        for row in evangelism_qs.values(
+            "evangelism_group__cluster_id",
+            "evangelism_group__cluster__name",
+            "evangelism_group__cluster__code",
+            "year",
+            "week_number",
+        ).annotate(
+            evangelism_reports_count=Count("id"),
+            new_prospects=Coalesce(Sum("new_prospects"), 0),
+            conversions_this_week=Coalesce(Sum("conversions_this_week"), 0),
+            meeting_date=Min("meeting_date"),
+        ):
+            cluster_id = row["evangelism_group__cluster_id"]
+            entry = ensure_entry(
+                cluster_id,
+                row["evangelism_group__cluster__name"],
+                row["evangelism_group__cluster__code"],
+                row["year"],
+                row["week_number"],
+            )
+            entry["evangelism_reports_count"] += row["evangelism_reports_count"]
+            entry["new_prospects"] += row["new_prospects"] or 0
+            entry["conversions_this_week"] += row["conversions_this_week"] or 0
+            if row["meeting_date"] is not None:
+                entry["meeting_dates"].append(row["meeting_date"])
+
+        for row in cluster_qs.values(
+            "cluster_id",
+            "cluster__name",
+            "cluster__code",
+            "year",
+            "week_number",
+        ).annotate(
+            cluster_reports_count=Count("id"),
+            meeting_date=Min("meeting_date"),
+        ):
+            entry = ensure_entry(
+                row["cluster_id"],
+                row["cluster__name"],
+                row["cluster__code"],
+                row["year"],
+                row["week_number"],
+            )
+            entry["cluster_reports_count"] += row["cluster_reports_count"]
+            if row["meeting_date"] is not None:
+                entry["meeting_dates"].append(row["meeting_date"])
+
+        for cluster_id, year_val, week_val, gathering_type in evangelism_qs.values_list(
+            "evangelism_group__cluster_id",
+            "year",
+            "week_number",
+            "gathering_type",
+        ):
+            key = (cluster_id, int(year_val), int(week_val))
+            entry = tallies.get(key)
+            if entry is not None and gathering_type:
+                entry["gathering_types"].add(gathering_type)
+
+        for cluster_id, year_val, week_val, gathering_type in cluster_qs.values_list(
+            "cluster_id",
+            "year",
+            "week_number",
+            "gathering_type",
+        ):
+            key = (cluster_id, int(year_val), int(week_val))
+            entry = tallies.get(key)
+            if entry is not None and gathering_type:
+                entry["gathering_types"].add(gathering_type)
+
+        report_ids = evangelism_qs.values("id")
+        for cluster_id, year_val, week_val, person_id in (
+            EvangelismWeeklyReport.members_attended.through.objects.filter(
+                evangelismweeklyreport_id__in=report_ids
+            ).values_list(
+                "evangelismweeklyreport__evangelism_group__cluster_id",
+                "evangelismweeklyreport__year",
+                "evangelismweeklyreport__week_number",
+                "person_id",
+            )
+        ):
+            key = (cluster_id, int(year_val), int(week_val))
+            entry = tallies.get(key)
+            if entry is not None and person_id is not None:
+                entry["members_set"].add(person_id)
+
+        for cluster_id, year_val, week_val, person_id in (
+            EvangelismWeeklyReport.visitors_attended.through.objects.filter(
+                evangelismweeklyreport_id__in=report_ids
+            ).values_list(
+                "evangelismweeklyreport__evangelism_group__cluster_id",
+                "evangelismweeklyreport__year",
+                "evangelismweeklyreport__week_number",
+                "person_id",
+            )
+        ):
+            key = (cluster_id, int(year_val), int(week_val))
+            entry = tallies.get(key)
+            if entry is not None and person_id is not None:
+                entry["visitors_set"].add(person_id)
+
+        cluster_report_ids = cluster_qs.values("id")
+        for cluster_id, year_val, week_val, person_id in (
+            ClusterWeeklyReport.members_attended.through.objects.filter(
+                clusterweeklyreport_id__in=cluster_report_ids
+            ).values_list(
+                "clusterweeklyreport__cluster_id",
+                "clusterweeklyreport__year",
+                "clusterweeklyreport__week_number",
+                "person_id",
+            )
+        ):
+            key = (cluster_id, int(year_val), int(week_val))
+            entry = tallies.get(key)
+            if entry is not None and person_id is not None:
+                entry["members_set"].add(person_id)
+
+        for cluster_id, year_val, week_val, person_id in (
+            ClusterWeeklyReport.visitors_attended.through.objects.filter(
+                clusterweeklyreport_id__in=cluster_report_ids
+            ).values_list(
+                "clusterweeklyreport__cluster_id",
+                "clusterweeklyreport__year",
+                "clusterweeklyreport__week_number",
+                "person_id",
+            )
+        ):
+            key = (cluster_id, int(year_val), int(week_val))
+            entry = tallies.get(key)
+            if entry is not None and person_id is not None:
+                entry["visitors_set"].add(person_id)
+
+        rows = []
+        for entry in tallies.values():
+            gathering_types = entry["gathering_types"]
+            if not gathering_types:
+                gathering_type = "UNKNOWN"
+            elif len(gathering_types) == 1:
+                gathering_type = next(iter(gathering_types))
+            else:
+                gathering_type = "MIXED"
+
+            meeting_date = min(entry["meeting_dates"]) if entry["meeting_dates"] else None
+
+            rows.append(
+                {
+                    "cluster_id": entry["cluster_id"],
+                    "cluster_name": entry["cluster_name"],
+                    "cluster_code": entry["cluster_code"],
+                    "year": entry["year"],
+                    "week_number": entry["week_number"],
+                    "meeting_date": meeting_date,
+                    "gathering_type": gathering_type,
+                    "members_count": len(entry["members_set"]),
+                    "visitors_count": len(entry["visitors_set"]),
+                    "evangelism_reports_count": entry["evangelism_reports_count"],
+                    "cluster_reports_count": entry["cluster_reports_count"],
+                    "new_prospects": entry["new_prospects"],
+                    "conversions_this_week": entry["conversions_this_week"],
+                }
+            )
+
+        rows.sort(key=lambda r: (r["year"], r["week_number"]), reverse=True)
+        return rows
+
+    @action(detail=False, methods=["get"])
+    def tally(self, request):
+        """Unified weekly tally for evangelism + cluster reports."""
+        cluster_id = request.query_params.get("cluster")
+        year = request.query_params.get("year")
+        week_number = request.query_params.get("week_number")
+
+        evangelism_qs = EvangelismWeeklyReport.objects.all()
+        cluster_qs = ClusterWeeklyReport.objects.all()
+
+        if year:
+            evangelism_qs = evangelism_qs.filter(year=year)
+            cluster_qs = cluster_qs.filter(year=year)
+        if week_number:
+            evangelism_qs = evangelism_qs.filter(week_number=week_number)
+            cluster_qs = cluster_qs.filter(week_number=week_number)
+
+        cluster = None
+        if cluster_id:
+            try:
+                cluster = Cluster.objects.get(id=cluster_id)
+            except Cluster.DoesNotExist:
+                cluster = None
+
+        if cluster:
+            evangelism_qs = evangelism_qs.filter(evangelism_group__cluster=cluster)
+            cluster_qs = cluster_qs.filter(cluster=cluster)
+
+        restriction = self._coordinator_tally_restriction()
+        if restriction is not None:
+            allowed_groups = restriction["group_ids"]
+            allowed_clusters = restriction["cluster_ids"]
+            if cluster is not None and cluster.id not in allowed_clusters:
+                evangelism_qs = evangelism_qs.none()
+                cluster_qs = cluster_qs.none()
+            else:
+                evangelism_qs = evangelism_qs.filter(
+                    evangelism_group_id__in=allowed_groups or [-1]
+                )
+                if allowed_clusters:
+                    cluster_qs = cluster_qs.filter(cluster_id__in=allowed_clusters)
+                else:
+                    cluster_qs = cluster_qs.none()
+
+        rows = self._build_weekly_tally_rows(evangelism_qs, cluster_qs)
+        serializer = EvangelismTallySerializer(rows, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=["get"], url_path="people_tally")
+    def people_tally(self, request):
+        """Monthly tally based on person attendance/baptism dates."""
+        year = request.query_params.get("year")
+        year_int = int(year) if year else timezone.now().year
+
+        try:
+            group_by = parse_people_tally_group_by(
+                request.query_params.get("group_by")
+            )
+        except ValueError as exc:
+            raise ValidationError({"group_by": str(exc)}) from exc
+
+        branch_id, cluster_id, eg_id, group_person_ids, unclustered = (
+            self._people_tally_scope()
+        )
+        (
+            branch_id,
+            cluster_id,
+            eg_id,
+            group_person_ids,
+            unclustered,
+            allowed_clusters,
+        ) = self._apply_coordinator_people_tally_scope(
+            branch_id, cluster_id, eg_id, group_person_ids, unclustered
+        )
+
+        if group_by == PEOPLE_TALLY_GROUP_BY_CLUSTER:
+            if eg_id is not None:
+                raise ValidationError(
+                    {
+                        "evangelism_group": (
+                            "Do not send evangelism_group with group_by=cluster."
+                        )
+                    }
+                )
+            if branch_id is None:
+                raise ValidationError(
+                    {"branch": "branch is required when group_by=cluster."}
+                )
+            months = self._parse_people_tally_months()
+            base_qs = Person.objects.exclude(role="ADMIN").filter(branch_id=branch_id)
+            if group_person_ids is not None and eg_id is None:
+                gp_ids = group_person_ids or frozenset()
+                base_qs = (
+                    base_qs.filter(id__in=gp_ids) if gp_ids else base_qs.none()
+                )
+            rows = build_people_tally_cluster_rows(
+                year=year_int,
+                months=months,
+                branch_id=branch_id,
+                base_qs=base_qs,
+            )
+            if allowed_clusters is not None:
+                rows = [
+                    row
+                    for row in rows
+                    if row.get("row_kind") == PEOPLE_TALLY_ROW_TOTAL
+                    or (
+                        row.get("row_kind") == PEOPLE_TALLY_ROW_CLUSTER
+                        and row.get("cluster_id") in allowed_clusters
+                    )
+                ]
+            serializer = EvangelismPeopleTallySerializer(rows, many=True)
+            return Response(serializer.data)
+
+        base_qs = Person.objects.exclude(role="ADMIN")
+        if branch_id is not None:
+            base_qs = base_qs.filter(branch_id=branch_id)
+        if unclustered:
+            base_qs = base_qs.filter(clusters__isnull=True).distinct()
+        elif cluster_id is not None:
+            base_qs = base_qs.filter(clusters__id=cluster_id)
+            if group_person_ids is not None and eg_id is None:
+                gp_ids = group_person_ids or frozenset()
+                base_qs = (
+                    base_qs.filter(id__in=gp_ids) if gp_ids else base_qs.none()
+                )
+        elif eg_id is not None or group_person_ids is not None:
+            gp_ids = group_person_ids or frozenset()
+            base_qs = base_qs.filter(id__in=gp_ids) if gp_ids else base_qs.none()
+
+        rows = build_people_tally_month_rows(
+            year=year_int,
+            base_qs=base_qs,
+            branch_id=branch_id,
+            cluster_id=cluster_id,
+            evangelism_group_id=eg_id,
+            group_person_ids=group_person_ids,
+            unclustered=unclustered,
+        )
+        serializer = EvangelismPeopleTallySerializer(rows, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=["get"], url_path="people_tally_years")
+    def people_tally_years(self, request):
+        branch_id, cluster_id, eg_id, group_person_ids = self._branch_cluster_group_scope()
+        (
+            branch_id,
+            cluster_id,
+            eg_id,
+            group_person_ids,
+            _unclustered,
+            _allowed_clusters,
+        ) = self._apply_coordinator_people_tally_scope(
+            branch_id, cluster_id, eg_id, group_person_ids, False
+        )
+        years = set()
+
+        people_qs = Person.objects.exclude(role="ADMIN")
+        if branch_id is not None:
+            people_qs = people_qs.filter(branch_id=branch_id)
+        if cluster_id is not None:
+            people_qs = people_qs.filter(clusters__id=cluster_id)
+            if group_person_ids is not None and eg_id is None:
+                gp_ids = group_person_ids or frozenset()
+                people_qs = (
+                    people_qs.filter(id__in=gp_ids) if gp_ids else people_qs.none()
+                )
+        elif eg_id is not None or group_person_ids is not None:
+            gp_ids = group_person_ids or frozenset()
+            people_qs = (
+                people_qs.filter(id__in=gp_ids) if gp_ids else people_qs.none()
+            )
+
+        years.update(
+            people_qs.filter(
+                role="VISITOR",
+                date_joined__isnull=False,
+                date_first_attended__isnull=True,
+            )
+            .dates("date_joined", "year")
+        )
+        years.update(
+            people_qs.filter(
+                role="VISITOR",
+                date_first_attended__isnull=False,
+            )
+            .dates("date_first_attended", "year")
+        )
+        years.update(
+            people_qs.filter(water_baptism_date__isnull=False)
+            .dates("water_baptism_date", "year")
+        )
+        years.update(
+            people_qs.filter(spirit_baptism_date__isnull=False)
+            .dates("spirit_baptism_date", "year")
+        )
+
+        lesson_qs = LessonSessionReport.objects.filter(
+            session_date__isnull=False,
+            student_id__in=people_qs.values_list("id", flat=True),
+        )
+        years.update(lesson_qs.dates("session_date", "year"))
+
+        sorted_years = sorted([y.year for y in years], reverse=True)
+        current_year = timezone.now().year
+        return Response(
+            {
+                "years": sorted_years,
+                "default_year": sorted_years[0] if sorted_years else current_year,
+            }
+        )
+
+    @action(detail=False, methods=["get"], url_path="people_tally_detail")
+    def people_tally_detail(self, request):
+        year = request.query_params.get("year")
+        metric = request.query_params.get("metric")
+        branch_id, cluster_id, eg_id, group_person_ids, unclustered = (
+            self._people_tally_scope()
+        )
+        (
+            branch_id,
+            cluster_id,
+            eg_id,
+            group_person_ids,
+            unclustered,
+            _allowed_clusters,
+        ) = self._apply_coordinator_people_tally_scope(
+            branch_id, cluster_id, eg_id, group_person_ids, unclustered
+        )
+
+        valid_metrics = {
+            "invited",
+            "attended",
+            "students",
+            "baptized",
+            "received_hg",
+            "reached",
+            "unique_hc",
+        }
+        if metric not in valid_metrics:
+            return Response(
+                {
+                    "detail": (
+                        "metric must be one of invited, attended, students, "
+                        "baptized, received_hg, reached, unique_hc."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if request.query_params.get("months") in (None, "") and request.query_params.get(
+            "month"
+        ) in (None, ""):
+            return Response(
+                {"detail": "year and month (or months) must be provided."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            year_int = int(year) if year else timezone.now().year
+            months = self._parse_people_tally_months()
+        except (TypeError, ValueError, ValidationError) as exc:
+            if isinstance(exc, ValidationError):
+                raise
+            return Response(
+                {"detail": "year and month must be valid integers."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        base_people = Person.objects.exclude(role="ADMIN")
+        if branch_id is not None:
+            base_people = base_people.filter(branch_id=branch_id)
+        if unclustered:
+            base_people = base_people.filter(clusters__isnull=True).distinct()
+        elif cluster_id is not None:
+            base_people = base_people.filter(clusters__id=cluster_id)
+            if group_person_ids is not None and eg_id is None:
+                gp_ids = group_person_ids or frozenset()
+                base_people = (
+                    base_people.filter(id__in=gp_ids) if gp_ids else base_people.none()
+                )
+        elif eg_id is not None or group_person_ids is not None:
+            gp_ids = group_person_ids or frozenset()
+            base_people = (
+                base_people.filter(id__in=gp_ids) if gp_ids else base_people.none()
+            )
+
+        if metric == "invited":
+            rows = self._serialize_people_rows(
+                base_people.filter(
+                    role="VISITOR",
+                    date_joined__year=year_int,
+                    date_joined__month__in=months,
+                    date_first_attended__isnull=True,
+                ).order_by("first_name", "last_name", "username"),
+                metric,
+                date_attr="date_joined",
+            )
+        elif metric == "attended":
+            rows = self._serialize_people_rows(
+                base_people.filter(
+                    role="VISITOR",
+                    date_first_attended__year=year_int,
+                    date_first_attended__month__in=months,
+                ).order_by("first_name", "last_name", "username"),
+                metric,
+                date_attr="date_first_attended",
+            )
+        elif metric == "students":
+            lesson_base = LessonSessionReport.objects.filter(
+                session_date__year=year_int,
+                session_date__month__in=months,
+            )
+            if branch_id is not None:
+                lesson_base = lesson_base.filter(student__branch_id=branch_id)
+            if unclustered:
+                lesson_base = lesson_base.filter(student__clusters__isnull=True)
+            elif cluster_id is not None:
+                lesson_base = lesson_base.filter(student__clusters__id=cluster_id)
+            elif eg_id is not None:
+                gp_ids = group_person_ids or frozenset()
+                if gp_ids:
+                    lesson_base = lesson_base.filter(student_id__in=gp_ids)
+                else:
+                    lesson_base = lesson_base.none()
+
+            student_dates = {
+                entry["student_id"]: entry["event_date"]
+                for entry in lesson_base.values("student_id").annotate(
+                    event_date=Min("session_date")
+                )
+            }
+            student_ids = list(student_dates.keys())
+            for person in base_people.filter(id__in=student_ids):
+                advance_prospect_to_taken_ncc(
+                    person,
+                    activity_date=student_dates.get(person.id),
+                )
+            rows = self._serialize_people_rows(
+                base_people.filter(id__in=student_ids).order_by(
+                    "first_name", "last_name", "username"
+                ),
+                metric,
+                date_map=student_dates,
+            )
+        elif metric == "baptized":
+            rows = self._serialize_people_rows(
+                base_people.filter(
+                    water_baptism_date__year=year_int,
+                    water_baptism_date__month__in=months,
+                ).order_by("first_name", "last_name", "username"),
+                metric,
+                date_attr="water_baptism_date",
+            )
+        elif metric == "received_hg":
+            rows = self._serialize_people_rows(
+                base_people.filter(
+                    spirit_baptism_date__year=year_int,
+                    spirit_baptism_date__month__in=months,
+                ).order_by("first_name", "last_name", "username"),
+                metric,
+                date_attr="spirit_baptism_date",
+            )
+        elif metric == "reached":
+            rows = self._serialize_people_rows(
+                annotate_people_reached_date(
+                    people_meeting_reached_milestones(base_people)
+                )
+                .filter(
+                    reached_date__year=year_int,
+                    reached_date__month__in=months,
+                )
+                .order_by("first_name", "last_name", "username"),
+                metric,
+                date_attr="reached_date",
+            )
+        else:
+            id_sets = people_tally_id_sets(
+                year=year_int,
+                months=months,
+                base_qs=base_people,
+                branch_id=branch_id,
+                cluster_id=cluster_id,
+                evangelism_group_id=eg_id,
+                group_person_ids=group_person_ids,
+                unclustered=unclustered,
+            )
+            unique_ids = id_sets["unique_hc"]
+            rows = self._serialize_people_rows(
+                base_people.filter(id__in=unique_ids).order_by(
+                    "first_name", "last_name", "username"
+                ),
+                metric,
+            )
+            reached_by_id = {
+                person.id: person.reached_date
+                for person in annotate_people_reached_date(
+                    people_meeting_reached_milestones(
+                        base_people.filter(id__in=unique_ids)
+                    )
+                )
+            }
+            for row in rows:
+                row["reached_date"] = self._to_date(reached_by_id.get(row["id"]))
+
+        return self._paginated_drilldown_response(rows)
+
+    @action(detail=False, methods=["get"], url_path="tally_people_detail")
+    def tally_people_detail(self, request):
+        year = request.query_params.get("year")
+        week_number = request.query_params.get("week_number")
+        metric = request.query_params.get("metric")
+        cluster_id = request.query_params.get("cluster_id")
+
+        if metric not in {"members", "visitors"}:
+            return Response(
+                {"detail": "metric must be one of members, visitors."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if cluster_id is None:
+            return Response(
+                {"detail": "cluster_id is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            year_int = int(year) if year else timezone.now().year
+            week_int = int(week_number)
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "year and week_number must be valid integers."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        evangelism_qs = EvangelismWeeklyReport.objects.select_related("evangelism_group").filter(
+            year=year_int,
+            week_number=week_int,
+        )
+        cluster_qs = ClusterWeeklyReport.objects.filter(
+            year=year_int,
+            week_number=week_int,
+        )
+
+        if str(cluster_id).lower() in {"null", "none", "unassigned"}:
+            evangelism_qs = evangelism_qs.filter(evangelism_group__cluster__isnull=True)
+            cluster_qs = cluster_qs.none()
+        else:
+            try:
+                cluster = Cluster.objects.get(id=cluster_id)
+            except Cluster.DoesNotExist:
+                return Response(
+                    {"detail": "Cluster not found."},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+            evangelism_qs = evangelism_qs.filter(evangelism_group__cluster=cluster)
+            cluster_qs = cluster_qs.filter(cluster=cluster)
+
+        person_ids = set()
+        person_dates = {}
+
+        def collect_ids_and_dates(ids, meeting_date):
+            for person_id in ids:
+                person_ids.add(person_id)
+                existing_date = person_dates.get(person_id)
+                if existing_date is None or meeting_date < existing_date:
+                    person_dates[person_id] = meeting_date
+
+        for report in evangelism_qs:
+            if metric == "members":
+                collect_ids_and_dates(
+                    report.members_attended.values_list("id", flat=True),
+                    report.meeting_date,
+                )
+            else:
+                collect_ids_and_dates(
+                    report.visitors_attended.values_list("id", flat=True),
+                    report.meeting_date,
+                )
+        for report in cluster_qs:
+            if metric == "members":
+                collect_ids_and_dates(
+                    report.members_attended.values_list("id", flat=True),
+                    report.meeting_date,
+                )
+            else:
+                collect_ids_and_dates(
+                    report.visitors_attended.values_list("id", flat=True),
+                    report.meeting_date,
+                )
+
+        people = Person.objects.exclude(role="ADMIN").filter(id__in=person_ids).order_by(
+            "first_name", "last_name", "username"
+        )
+        rows = self._serialize_people_rows(people, metric, date_map=person_dates)
+        return self._paginated_drilldown_response(rows)
+
+
+class ProspectViewSet(viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticatedAndNotVisitor, IsMemberOrAbove]
+    queryset = Prospect.objects.select_related(
+        "invited_by",
+        "inviter_cluster",
+        "evangelism_group",
+        "endorsed_cluster",
+        "person",
+        "person__lesson_enrollment",
+        "person__lesson_enrollment__teacher",
+        "person__inviter",
+        "person__baptized_by",
+        "person__hg_witnessed_by",
+    ).all()
+    serializer_class = ProspectSerializer
+    pagination_class = EvangelismRelatedPagination
+    filter_backends = (
+        DjangoFilterBackend,
+        filters.SearchFilter,
+        filters.OrderingFilter,
+    )
+    filterset_class = ProspectFilter
+    search_fields = ("first_name", "middle_name", "last_name", "contact_info", "notes")
+    ordering_fields = ("last_activity_date", "created_at", "first_name", "last_name")
+    ordering = ("-last_activity_date", "last_name", "first_name")
+
+    def get_permissions(self):
+        if self.action in ["list", "retrieve"]:
+            return [IsAuthenticatedAndNotVisitor(), IsMemberOrAbove()]
+        if self.action == "destroy":
+            return [IsAuthenticatedAndNotVisitor(), IsAdmin()]
+        return [IsAuthenticatedAndNotVisitor(), HasModuleAccess("EVANGELISM", "write")]
+
+    def _group_from_serializer(self, serializer):
+        group = serializer.validated_data.get("evangelism_group")
+        if group is None and serializer.instance is not None:
+            group = serializer.instance.evangelism_group
+        return group
+
+    def _ensure_group_record_write(self, group):
+        ensure_user_can_mutate_evangelism_group_records(self.request.user, group)
+
+    def perform_create(self, serializer):
+        """Create an invited prospect or link an encoded visitor. Do not copy the inviter's cluster."""
+        self._ensure_group_record_write(serializer.validated_data.get("evangelism_group"))
+        extra = {}
+        person = serializer.validated_data.get("person")
+        if person is None:
+            extra["pipeline_stage"] = Prospect.PipelineStage.INVITED
+            if not serializer.validated_data.get("date_first_invited"):
+                extra["date_first_invited"] = church_today()
+            if not serializer.validated_data.get("last_activity_date"):
+                extra["last_activity_date"] = extra.get(
+                    "date_first_invited"
+                ) or church_today()
+        else:
+            if not serializer.validated_data.get("date_first_invited"):
+                extra["date_first_invited"] = (
+                    person.date_first_invited or church_today()
+                )
+            if not serializer.validated_data.get("last_activity_date"):
+                extra["last_activity_date"] = (
+                    person.date_first_attended
+                    or extra.get("date_first_invited")
+                    or person.date_first_invited
+                    or church_today()
+                )
+        serializer.save(**extra)
+
+    def perform_update(self, serializer):
+        self._ensure_group_record_write(self._group_from_serializer(serializer))
+        serializer.save()
+
+    @action(detail=True, methods=["post"])
+    def endorse_to_cluster(self, request, pk=None):
+        """Endorse visitor to a different cluster."""
+        prospect = self.get_object()
+        self._ensure_group_record_write(prospect.evangelism_group)
+        cluster_id = request.data.get("cluster_id")
+
+        if not cluster_id:
+            return Response(
+                {"error": "cluster_id is required"}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            cluster = Cluster.objects.get(id=cluster_id)
+        except Cluster.DoesNotExist:
+            return Response(
+                {"error": "Cluster not found"}, status=status.HTTP_404_NOT_FOUND
+            )
+
+        prospect = endorse_visitor_to_cluster(prospect, cluster)
+        serializer = self.get_serializer(prospect)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=["post"])
+    def update_progress(self, request, pk=None):
+        """Update visitor's pipeline stage and last activity."""
+        prospect = self.get_object()
+        self._ensure_group_record_write(prospect.evangelism_group)
+        pipeline_stage = request.data.get("pipeline_stage")
+        last_activity_date = request.data.get("last_activity_date")
+
+        if pipeline_stage == Prospect.PipelineStage.ATTENDED:
+            return self.mark_attended(request, pk=pk)
+
+        activity_date = last_activity_date or church_today()
+        if pipeline_stage:
+            prospect.pipeline_stage = pipeline_stage
+        if last_activity_date:
+            prospect.last_activity_date = last_activity_date
+        else:
+            prospect.last_activity_date = church_today()
+
+        prospect.save()
+
+        if prospect.person and prospect.person.role == "VISITOR":
+            person = prospect.person
+            fields_to_update = []
+            if pipeline_stage in [
+                Prospect.PipelineStage.INVITED,
+                Prospect.PipelineStage.ATTENDED,
+            ]:
+                person.status = "ONGOING"
+                fields_to_update.append("status")
+
+            if pipeline_stage == Prospect.PipelineStage.ATTENDED:
+                person.date_first_attended = activity_date
+                fields_to_update.append("date_first_attended")
+
+            if pipeline_stage == Prospect.PipelineStage.BAPTIZED:
+                person.water_baptism_date = activity_date
+                fields_to_update.append("water_baptism_date")
+
+            if pipeline_stage == Prospect.PipelineStage.RECEIVED_HG:
+                person.spirit_baptism_date = activity_date
+                fields_to_update.append("spirit_baptism_date")
+
+            if fields_to_update:
+                person.save(update_fields=fields_to_update)
+
+        if pipeline_stage and pipeline_stage in [
+            Prospect.PipelineStage.INVITED,
+            Prospect.PipelineStage.ATTENDED,
+            Prospect.PipelineStage.TAKEN_NCC,
+            Prospect.PipelineStage.BAPTIZED,
+            Prospect.PipelineStage.RECEIVED_HG,
+            Prospect.PipelineStage.REACHED,
+        ]:
+            cluster = prospect.inviter_cluster or prospect.endorsed_cluster
+            if cluster:
+                update_monthly_tracking(
+                    prospect, pipeline_stage, cluster, prospect.last_activity_date
+                )
+
+        serializer = self.get_serializer(prospect)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=["post"])
+    def mark_attended(self, request, pk=None):
+        """Mark prospect as attended (auto-creates/links Person, updates monthly tracking)."""
+        prospect = self.get_object()
+        self._ensure_group_record_write(prospect.evangelism_group)
+        last_activity_date = request.data.get("last_activity_date")
+        activity_date = None
+        if last_activity_date:
+            try:
+                activity_date = date.fromisoformat(last_activity_date)
+            except ValueError:
+                activity_date = None
+        if activity_date is None:
+            activity_date = church_today()
+
+        activity_code = request.data.get("first_activity_attended") or None
+        first_activity = None
+        if activity_code:
+            if activity_code in REPORT_BACKED_FIRST_ACTIVITIES:
+                if activity_code == "CLUSTERING":
+                    message = (
+                        "Record cluster attendance on a cluster weekly report instead."
+                    )
+                else:
+                    message = (
+                        "Record evangelism group attendance on an evangelism "
+                        "weekly report instead."
+                    )
+                return Response(
+                    {"detail": message},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            try:
+                first_activity = EventType.activity_queryset().get(pk=activity_code)
+            except EventType.DoesNotExist:
+                return Response(
+                    {"detail": "Invalid first_activity_attended."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        try:
+            prospect = mark_prospect_attended(
+                prospect,
+                activity_date=activity_date,
+                first_name=request.data.get("first_name"),
+                last_name=request.data.get("last_name"),
+                first_activity_attended=first_activity,
+            )
+        except ValueError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        serializer = self.get_serializer(prospect)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=["post"])
+    def create_person(self, request, pk=None):
+        """Manual action to create Person record from prospect."""
+        prospect = self.get_object()
+        self._ensure_group_record_write(prospect.evangelism_group)
+
+        if prospect.person:
+            return Response(
+                {"error": "Prospect already has a linked Person"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        first_name = request.data.get("first_name")
+        last_name = request.data.get("last_name")
+
+        if not first_name or not last_name:
+            return Response(
+                {"error": "first_name and last_name are required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        person = create_person_from_prospect(
+            prospect, first_name, last_name, **request.data
+        )
+        serializer = ProspectSerializer(prospect)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=["post"])
+    def mark_dropped_off(self, request, pk=None):
+        """Manually mark visitor as dropped off."""
+        prospect = self.get_object()
+        prospect.is_dropped_off = True
+        prospect.drop_off_date = church_today()
+        prospect.drop_off_stage = prospect.pipeline_stage
+        prospect.drop_off_reason = request.data.get("reason", "")
+        prospect.save()
+
+        # Create DropOff record
+        days_inactive = prospect.days_since_last_activity or 0
+        DropOff.objects.create(
+            prospect=prospect,
+            drop_off_date=prospect.drop_off_date,
+            drop_off_stage=prospect.drop_off_stage,
+            days_inactive=days_inactive,
+            reason=request.data.get("reason", ""),
+            reason_details=request.data.get("reason_details", ""),
+        )
+
+        serializer = self.get_serializer(prospect)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=["post"])
+    def recover(self, request, pk=None):
+        """Recover a dropped off visitor."""
+        prospect = self.get_object()
+        prospect.is_dropped_off = False
+        prospect.last_activity_date = church_today()
+        prospect.save()
+
+        # Update DropOff record if exists
+        if hasattr(prospect, "drop_off_record"):
+            drop_off = prospect.drop_off_record
+            drop_off.recovery_attempted = True
+            drop_off.recovery_date = church_today()
+            drop_off.recovered = True
+            drop_off.recovered_date = church_today()
+            drop_off.save()
+
+        serializer = self.get_serializer(prospect)
+        return Response(serializer.data)
+
+
+class FollowUpTaskViewSet(viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticatedAndNotVisitor, IsMemberOrAbove]
+    queryset = FollowUpTask.objects.select_related(
+        "prospect", "assigned_to", "created_by"
+    ).all()
+    serializer_class = FollowUpTaskSerializer
+    filter_backends = (
+        DjangoFilterBackend,
+        filters.SearchFilter,
+        filters.OrderingFilter,
+    )
+    filterset_fields = ("prospect", "assigned_to", "status", "priority")
+    search_fields = ("prospect__first_name", "prospect__last_name", "notes")
+    ordering_fields = ("due_date", "priority", "created_at")
+    ordering = ("due_date", "priority")
+
+    @action(detail=True, methods=["post"])
+    def complete(self, request, pk=None):
+        """Mark task as completed."""
+        task = self.get_object()
+        task.status = FollowUpTask.Status.COMPLETED
+        task.completed_date = church_today()
+        task.save()
+
+        serializer = self.get_serializer(task)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=["get"])
+    def overdue(self, request):
+        """List overdue tasks."""
+        today = church_today()
+        overdue_tasks = self.queryset.filter(
+            due_date__lt=today,
+            status__in=[FollowUpTask.Status.PENDING, FollowUpTask.Status.IN_PROGRESS],
+        )
+        serializer = self.get_serializer(overdue_tasks, many=True)
+        return Response(serializer.data)
+
+
+class DropOffViewSet(viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticatedAndNotVisitor, IsMemberOrAbove]
+    queryset = DropOff.objects.select_related("prospect").all()
+    serializer_class = DropOffSerializer
+    filter_backends = (
+        DjangoFilterBackend,
+        filters.SearchFilter,
+        filters.OrderingFilter,
+    )
+    filterset_fields = ("drop_off_stage", "reason", "recovered")
+    search_fields = ("prospect__first_name", "prospect__last_name", "reason_details")
+    ordering_fields = ("drop_off_date", "days_inactive")
+    ordering = ("-drop_off_date",)
+
+    @action(detail=True, methods=["post"])
+    def recover(self, request, pk=None):
+        """Attempt to recover a dropped off visitor."""
+        drop_off = self.get_object()
+        drop_off.recovery_attempted = True
+        drop_off.recovery_date = church_today()
+        drop_off.save()
+
+        # Update prospect
+        prospect = drop_off.prospect
+        prospect.is_dropped_off = False
+        prospect.last_activity_date = church_today()
+        prospect.save()
+
+        serializer = self.get_serializer(drop_off)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=["get"])
+    def analytics(self, request):
+        """Drop-off analytics by stage, reason, time period."""
+        drop_offs = self.queryset.all()
+
+        # Filter by date range if provided
+        start_date = request.query_params.get("start_date")
+        end_date = request.query_params.get("end_date")
+        if start_date:
+            drop_offs = drop_offs.filter(drop_off_date__gte=start_date)
+        if end_date:
+            drop_offs = drop_offs.filter(drop_off_date__lte=end_date)
+
+        # Group by stage
+        by_stage = {}
+        for stage in Prospect.PipelineStage.choices:
+            count = drop_offs.filter(drop_off_stage=stage[0]).count()
+            by_stage[stage[1]] = count
+
+        # Group by reason
+        by_reason = {}
+        for reason in DropOff.DropOffReason.choices:
+            count = drop_offs.filter(reason=reason[0]).count()
+            by_reason[reason[1]] = count
+
+        # Recovery statistics
+        total = drop_offs.count()
+        recovered = drop_offs.filter(recovered=True).count()
+        recovery_rate = round((recovered / total * 100), 2) if total > 0 else 0.0
+
+        return Response(
+            {
+                "total_drop_offs": total,
+                "recovered": recovered,
+                "recovery_rate": recovery_rate,
+                "by_stage": by_stage,
+                "by_reason": by_reason,
+            }
+        )
+
+
+class ConversionViewSet(viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticatedAndNotVisitor, IsMemberOrAbove]
+    queryset = Conversion.objects.select_related(
+        "person",
+        "person__lesson_enrollment",
+        "person__lesson_enrollment__teacher",
+        "prospect",
+        "converted_by",
+        "evangelism_group",
+        "cluster",
+        "verified_by",
+    ).all()
+    serializer_class = ConversionSerializer
+    pagination_class = EvangelismRelatedPagination
+    filter_backends = (
+        DjangoFilterBackend,
+        filters.SearchFilter,
+        filters.OrderingFilter,
+    )
+    filterset_class = ConversionFilter
+    search_fields = ("person__first_name", "person__last_name", "notes")
+    ordering_fields = ("conversion_date", "created_at")
+    ordering = ("-conversion_date",)
+
+    def _group_from_serializer(self, serializer):
+        group = serializer.validated_data.get("evangelism_group")
+        if group is None and serializer.instance is not None:
+            group = serializer.instance.evangelism_group
+        return group
+
+    def perform_create(self, serializer):
+        raise ValidationError(
+            {
+                "detail": (
+                    "Conversion create is deprecated. Update the Person profile "
+                    "from the evangelism group instead."
+                )
+            }
+        )
+
+    def perform_update(self, serializer):
+        raise ValidationError(
+            {
+                "detail": (
+                    "Conversion update is deprecated. Update the Person profile "
+                    "from the evangelism group instead."
+                )
+            }
+        )
+
+    def create(self, request, *args, **kwargs):
+        return Response(
+            {
+                "detail": (
+                    "Conversion create is deprecated. Update the Person profile "
+                    "from the evangelism group instead."
+                )
+            },
+            status=status.HTTP_410_GONE,
+        )
+
+    def update(self, request, *args, **kwargs):
+        return Response(
+            {
+                "detail": (
+                    "Conversion update is deprecated. Update the Person profile "
+                    "from the evangelism group instead."
+                )
+            },
+            status=status.HTTP_410_GONE,
+        )
+
+    def partial_update(self, request, *args, **kwargs):
+        return self.update(request, *args, **kwargs)
+
+
+class MonthlyConversionTrackingViewSet(viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticatedAndNotVisitor, IsMemberOrAbove]
+    queryset = MonthlyConversionTracking.objects.select_related(
+        "cluster", "prospect", "person"
+    ).all()
+    serializer_class = MonthlyConversionTrackingSerializer
+    filter_backends = (
+        DjangoFilterBackend,
+        filters.SearchFilter,
+        filters.OrderingFilter,
+    )
+    filterset_fields = ("cluster", "year", "month", "stage")
+    search_fields = ("prospect__first_name", "prospect__last_name")
+    ordering_fields = ("year", "month", "stage")
+    ordering = ("-year", "-month", "stage")
+
+    @action(detail=False, methods=["get"])
+    def statistics(self, request):
+        """Monthly statistics by stage."""
+        cluster_id = request.query_params.get("cluster")
+        year = request.query_params.get("year")
+        month = request.query_params.get("month")
+
+        cluster = None
+        if cluster_id:
+            try:
+                cluster = Cluster.objects.get(id=cluster_id)
+            except Cluster.DoesNotExist:
+                pass
+
+        year_int = int(year) if year else None
+        month_int = int(month) if month else None
+
+        stats = calculate_monthly_statistics(
+            cluster=cluster, year=year_int, month=month_int
+        )
+        serializer = MonthlyStatisticsSerializer(stats, many=True)
+        return Response(serializer.data)
+
+
+class Each1Reach1GoalViewSet(viewsets.ModelViewSet):
+    class GoalPagination(PageNumberPagination):
+        page_size = 20
+        page_size_query_param = "page_size"
+        max_page_size = 100
+
+    permission_classes = [IsAuthenticatedAndNotVisitor, IsMemberOrAbove]
+    queryset = Each1Reach1Goal.objects.select_related("cluster").all()
+    serializer_class = Each1Reach1GoalSerializer
+    pagination_class = GoalPagination
+    filter_backends = (
+        DjangoFilterBackend,
+        filters.SearchFilter,
+        filters.OrderingFilter,
+    )
+    filterset_fields = ("cluster", "cluster__branch", "year", "status")
+    search_fields = ("cluster__name", "cluster__evangelism_groups__name")
+    ordering_fields = ("year", "achieved_conversions")
+    ordering = ("-year", "cluster__name")
+
+    def get_permissions(self):
+        if self.action in ("create", "update", "partial_update", "destroy"):
+            return [IsAuthenticatedAndNotVisitor(), CanManageEach1Reach1Goals()]
+        return [IsAuthenticatedAndNotVisitor(), IsMemberOrAbove()]
+
+    def _ensure_goal_cluster_allowed(self, cluster):
+        cluster_id = getattr(cluster, "id", cluster)
+        if user_can_manage_each1reach1_cluster(self.request.user, cluster_id):
+            return
+        raise PermissionDenied(
+            "You can only create or edit Each 1 Reach 1 goals for your groups."
+        )
+
+    def perform_create(self, serializer):
+        self._ensure_goal_cluster_allowed(serializer.validated_data.get("cluster"))
+        serializer.save()
+
+    def perform_update(self, serializer):
+        cluster = serializer.validated_data.get("cluster", serializer.instance.cluster)
+        self._ensure_goal_cluster_allowed(cluster)
+        serializer.save()
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        # Joining evangelism group names can duplicate goal rows; DISTINCT keeps pagination correct.
+        if self.request.query_params.get("search"):
+            return qs.distinct()
+        return qs
+
+    def _resolve_goal_year(self):
+        year = self.request.query_params.get("year")
+        if not year:
+            return timezone.now().year
+        try:
+            return int(year)
+        except (TypeError, ValueError):
+            raise ValidationError({"year": "Year must be a valid integer."})
+
+    def _ensure_yearly_goals(self, year: int) -> None:
+        existing_cluster_ids = set(
+            Each1Reach1Goal.objects.filter(year=year).values_list("cluster_id", flat=True)
+        )
+        missing_clusters = Cluster.objects.exclude(id__in=existing_cluster_ids)
+
+        for cluster in missing_clusters:
+            Each1Reach1Goal.objects.get_or_create(
+                cluster=cluster,
+                year=year,
+                defaults={
+                    "target_conversions": get_default_each1reach1_target(cluster),
+                    "achieved_conversions": 0,
+                    "status": Each1Reach1Goal.Status.NOT_STARTED,
+                },
+            )
+
+    def list(self, request, *args, **kwargs):
+        self._ensure_yearly_goals(self._resolve_goal_year())
+        return super().list(request, *args, **kwargs)
+
+    @action(detail=False, methods=["get"], url_path="default_target")
+    def default_target(self, request):
+        cluster_id = request.query_params.get("cluster_id") or request.query_params.get("cluster")
+        if not cluster_id:
+            return Response(
+                {"detail": "cluster_id is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            cluster = Cluster.objects.get(id=cluster_id)
+        except Cluster.DoesNotExist:
+            return Response(
+                {"detail": "Cluster not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        year = request.query_params.get("year")
+        if year:
+            try:
+                year_int = int(year)
+            except (TypeError, ValueError):
+                return Response(
+                    {"detail": "Year must be a valid integer."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        else:
+            year_int = timezone.now().year
+
+        return Response(
+            {
+                "cluster_id": cluster.id,
+                "year": year_int,
+                "target_conversions": get_default_each1reach1_target(cluster),
+            }
+        )
+
+    @action(detail=True, methods=["get"])
+    def progress(self, request, pk=None):
+        """Cluster progress report."""
+        goal = self.get_object()
+        cluster_stats = get_cluster_statistics(goal.cluster, goal.year)
+        return Response(cluster_stats)
+
+    @action(detail=True, methods=["get"])
+    def member_progress(self, request, pk=None):
+        """Individual member progress within cluster (by inviter of reached people)."""
+        goal = self.get_object()
+        cluster = goal.cluster
+        year = goal.year
+        start = date(year, 1, 1)
+        end = date(year, 12, 31)
+
+        from apps.evangelism.services import (
+            annotate_people_reached_date,
+            people_meeting_reached_milestones,
+        )
+
+        reached = annotate_people_reached_date(
+            people_meeting_reached_milestones(
+                Person.objects.exclude(role="ADMIN")
+            )
+        ).filter(reached_date__gte=start, reached_date__lte=end)
+
+        prospects = (
+            Prospect.objects.filter(
+                is_dropped_off=False,
+                person_id__in=reached.values_list("id", flat=True),
+            )
+            .filter(
+                Q(inviter_cluster=cluster)
+                | Q(endorsed_cluster=cluster)
+                | Q(evangelism_group__cluster=cluster)
+            )
+            .select_related("invited_by", "person")
+        )
+
+        member_progress = {}
+        for prospect in prospects:
+            inviter = prospect.invited_by or (
+                prospect.person.inviter if prospect.person_id else None
+            )
+            if not inviter:
+                continue
+            converter_id = inviter.id
+            if converter_id not in member_progress:
+                member_progress[converter_id] = {
+                    "member_id": converter_id,
+                    "member_name": inviter.get_full_name() or inviter.username,
+                    "conversions": 0,
+                }
+            member_progress[converter_id]["conversions"] += 1
+
+        return Response(list(member_progress.values()))
+
+    @action(detail=False, methods=["get"])
+    def leaderboard(self, request):
+        """Top converting clusters."""
+        year = request.query_params.get("year")
+        year_int = int(year) if year else timezone.now().year
+
+        goals = self.queryset.filter(year=year_int).order_by("-achieved_conversions")[
+            :10
+        ]
+        serializer = self.get_serializer(goals, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=["get"])
+    def summary(self, request):
+        """Yearly summary statistics."""
+        year = request.query_params.get("year")
+        year_int = int(year) if year else timezone.now().year
+
+        report = generate_each1reach1_report(year=year_int)
+        return Response(report)

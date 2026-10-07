@@ -1,0 +1,385 @@
+import React, { useState, useEffect, useRef } from "react";
+import { FilterCondition } from "../people/FilterBar";
+
+// Local definition to align with ClusterFilterDropdown's FilterField
+interface FilterField {
+  key: string;
+  label: string;
+  type: "text" | "select" | "date" | "number" | "range";
+  options?: { value: string; label: string }[];
+}
+
+interface ClusterFilterCardProps {
+  field: FilterField;
+  isOpen: boolean;
+  onClose: () => void;
+  onApplyFilter: (filter: FilterCondition) => void;
+  /** Viewport-fixed placement; ignored when `anchored` is true. */
+  position?: { top: number; left: number };
+  /** Anchor under parent with absolute positioning (scrolls with page). */
+  anchored?: boolean;
+}
+
+const OPERATORS = {
+  text: [
+    { value: "contains", label: "Contains" },
+    { value: "is", label: "Is" },
+    { value: "is_not", label: "Is not" },
+    { value: "starts_with", label: "Starts with" },
+    { value: "ends_with", label: "Ends with" },
+  ],
+  select: [
+    { value: "is", label: "Is" },
+    { value: "is_not", label: "Is not" },
+  ],
+  date: [
+    { value: "is", label: "Is" },
+    { value: "is_not", label: "Is not" },
+    { value: "before", label: "Before" },
+    { value: "after", label: "After" },
+    { value: "between", label: "Between" },
+  ],
+  number: [
+    { value: "is", label: "Is" },
+    { value: "is_not", label: "Is not" },
+    { value: "greater_than", label: "Greater than" },
+    { value: "less_than", label: "Less than" },
+    { value: "between", label: "Between" },
+  ],
+  range: [
+    { value: "between", label: "Between" },
+    { value: "greater_than", label: "Greater than" },
+    { value: "less_than", label: "Less than" },
+  ],
+};
+
+export default function ClusterFilterCard({
+  field,
+  isOpen,
+  onClose,
+  onApplyFilter,
+  position = { top: 0, left: 0 },
+  anchored = false,
+}: ClusterFilterCardProps) {
+  const [operator, setOperator] = useState("contains");
+  const [value, setValue] = useState("");
+  const [value2, setValue2] = useState("");
+  const [selectedOption, setSelectedOption] = useState("");
+  const firstInputRef = useRef<HTMLInputElement | HTMLSelectElement | null>(
+    null
+  );
+  const cardRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (isOpen) {
+      // Reset form when opening
+      setOperator("contains");
+      setValue("");
+      setValue2("");
+      setSelectedOption("");
+      // Defer focus to next tick to ensure elements are rendered
+      setTimeout(() => {
+        firstInputRef.current?.focus();
+      }, 0);
+    }
+  }, [isOpen]);
+
+  // Handle click outside to close the filter card
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      const target = event.target as HTMLElement;
+      if (
+        cardRef.current &&
+        !cardRef.current.contains(target as Node)
+      ) {
+        // Don't close if clicking on the filter dropdown or filter button
+        const clickedButton = target.closest('button');
+        if (clickedButton) {
+          const buttonText = clickedButton.textContent || '';
+          if (buttonText.includes('Filter')) {
+            const svgPath = clickedButton.querySelector('path[d*="M12 6v6"]');
+            if (svgPath) {
+              return; // This is the filter button, don't close
+            }
+          }
+        }
+        // Don't close if clicking on the filter dropdown
+        const filterDropdown = target.closest('[class*="fixed z-50"]');
+        if (filterDropdown) {
+          return;
+        }
+        onClose();
+      }
+    };
+
+    if (isOpen) {
+      const timeoutId = setTimeout(() => {
+        document.addEventListener("mousedown", handleClickOutside);
+      }, 100);
+      
+      return () => {
+        clearTimeout(timeoutId);
+        document.removeEventListener("mousedown", handleClickOutside);
+      };
+    }
+  }, [isOpen, onClose]);
+
+  const handleApply = () => {
+    if (!operator) return;
+
+    let filterValue: string | [string, string];
+    let label: string;
+
+    if (field.type === "select") {
+      if (!selectedOption) return;
+      filterValue = selectedOption;
+      const optionLabel =
+        field.options?.find((opt) => opt.value === selectedOption)?.label ||
+        selectedOption;
+      label = `${field.label} ${
+        OPERATORS[field.type].find((op) => op.value === operator)?.label
+      } ${optionLabel}`;
+    } else if (operator === "between") {
+      if (!value || !value2) return;
+      filterValue = [value, value2];
+      label = `${field.label} ${
+        OPERATORS[field.type].find((op) => op.value === operator)?.label
+      } ${value} and ${value2}`;
+    } else {
+      if (!value) return;
+      filterValue = value;
+      label = `${field.label} ${
+        OPERATORS[field.type].find((op) => op.value === operator)?.label
+      } ${value}`;
+    }
+
+    const filter: FilterCondition = {
+      id: `${field.key}_${Date.now()}`,
+      field: field.key,
+      operator,
+      value: filterValue,
+      label,
+    };
+
+    onApplyFilter(filter);
+    onClose();
+  };
+
+  const handleKeyPress = (e: React.KeyboardEvent) => {
+    if (e.key === "Enter") {
+      handleApply();
+    }
+  };
+
+  if (!isOpen) return null;
+
+  // Adjust position for mobile (fixed placement only)
+  const adjustedPosition = {
+    top: position.top,
+    left: Math.max(16, Math.min(position.left, window.innerWidth - 336)), // 320 + 16 padding
+  };
+
+  return (
+    <div
+      ref={cardRef}
+      className={
+        anchored
+          ? "absolute inset-x-0 top-full mt-1.5 z-50 w-full tablet:right-0 tablet:left-auto tablet:w-80 max-w-[calc(100vw-2rem)] bg-white rounded-lg shadow-lg border border-gray-200 p-4"
+          : "fixed z-50 w-80 max-w-[calc(100vw-2rem)] bg-white rounded-lg shadow-lg border border-gray-200 p-4"
+      }
+      style={
+        anchored
+          ? undefined
+          : {
+              top: adjustedPosition.top,
+              left: adjustedPosition.left,
+            }
+      }
+    >
+      <div className="flex items-center justify-between mb-4">
+        <h3 className="text-sm font-medium text-gray-900">
+          Filter by {field.label}
+        </h3>
+        <button
+          onClick={onClose}
+          className="text-gray-400 hover:text-gray-600 min-w-[32px] min-h-[32px] flex items-center justify-center"
+          aria-label="Close filter"
+        >
+          <svg
+            className="w-4 h-4"
+            fill="none"
+            stroke="currentColor"
+            viewBox="0 0 24 24"
+          >
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              strokeWidth={2}
+              d="M6 18L18 6M6 6l12 12"
+            />
+          </svg>
+        </button>
+      </div>
+
+      <div className="space-y-4">
+        {/* Operator Selection */}
+        <div>
+          <label className="block text-xs font-medium text-gray-700 mb-1">
+            Operator
+          </label>
+          <select
+            value={operator}
+            onChange={(e) => setOperator(e.target.value)}
+            className="w-full px-3 py-2.5 md:py-2 border border-gray-300 rounded-md text-sm focus:ring-2 focus:ring-ring focus:border-transparent min-h-[44px] md:min-h-0"
+          >
+            {OPERATORS[field.type].map((op) => (
+              <option key={op.value} value={op.value}>
+                {op.label}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        {/* Value Input */}
+        {field.type === "select" ? (
+          <div>
+            <label className="block text-xs font-medium text-gray-700 mb-1">
+              Value
+            </label>
+            <select
+              ref={
+                firstInputRef as React.MutableRefObject<HTMLSelectElement | null>
+              }
+              value={selectedOption}
+              onChange={(e) => setSelectedOption(e.target.value)}
+              onKeyPress={handleKeyPress}
+              className="w-full px-3 py-2.5 md:py-2 border border-gray-300 rounded-md text-sm focus:ring-2 focus:ring-ring focus:border-transparent min-h-[44px] md:min-h-0"
+            >
+              <option value="">Select {field.label}</option>
+              {field.options?.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </div>
+        ) : field.type === "range" ? (
+          <div className="space-y-2">
+            <div>
+              <label className="block text-xs font-medium text-gray-700 mb-1">
+                {operator === "between" ? "Minimum" : "Value"}
+              </label>
+              <input
+                ref={
+                  firstInputRef as React.MutableRefObject<HTMLInputElement | null>
+                }
+                type="number"
+                value={value}
+                onChange={(e) => setValue(e.target.value)}
+                onKeyPress={handleKeyPress}
+                placeholder={
+                  operator === "between" ? "Min value" : "Enter value"
+                }
+                className="w-full px-3 py-2.5 md:py-2 border border-gray-300 rounded-md text-sm focus:ring-2 focus:ring-ring focus:border-transparent min-h-[44px] md:min-h-0"
+              />
+            </div>
+            {operator === "between" && (
+              <div>
+                <label className="block text-xs font-medium text-gray-700 mb-1">
+                  Maximum
+                </label>
+                <input
+                  type="number"
+                  value={value2}
+                  onChange={(e) => setValue2(e.target.value)}
+                  placeholder="Max value"
+                  className="w-full px-3 py-2.5 md:py-2 border border-gray-300 rounded-md text-sm focus:ring-2 focus:ring-ring focus:border-transparent min-h-[44px] md:min-h-0"
+                />
+              </div>
+            )}
+          </div>
+        ) : field.type === "date" ? (
+          <div className="space-y-2">
+            <div>
+              <label className="block text-xs font-medium text-gray-700 mb-1">
+                {operator === "between" ? "Start Date" : "Date"}
+              </label>
+              <input
+                ref={
+                  firstInputRef as React.MutableRefObject<HTMLInputElement | null>
+                }
+                type="date"
+                value={value}
+                onChange={(e) => setValue(e.target.value)}
+                onKeyPress={handleKeyPress}
+                className="w-full px-3 py-2.5 md:py-2 border border-gray-300 rounded-md text-sm focus:ring-2 focus:ring-ring focus:border-transparent min-h-[44px] md:min-h-0"
+              />
+            </div>
+            {operator === "between" && (
+              <div>
+                <label className="block text-xs font-medium text-gray-700 mb-1">
+                  End Date
+                </label>
+                <input
+                  type="date"
+                  value={value2}
+                  onChange={(e) => setValue2(e.target.value)}
+                  className="w-full px-3 py-2.5 md:py-2 border border-gray-300 rounded-md text-sm focus:ring-2 focus:ring-ring focus:border-transparent min-h-[44px] md:min-h-0"
+                />
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="space-y-2">
+            <div>
+              <label className="block text-xs font-medium text-gray-700 mb-1">
+                {operator === "between" ? "First Value" : "Value"}
+              </label>
+              <input
+                ref={
+                  firstInputRef as React.MutableRefObject<HTMLInputElement | null>
+                }
+                type={field.type === "number" ? "number" : "text"}
+                value={value}
+                onChange={(e) => setValue(e.target.value)}
+                onKeyPress={handleKeyPress}
+                placeholder={`Enter ${field.label.toLowerCase()}`}
+                className="w-full px-3 py-2.5 md:py-2 border border-gray-300 rounded-md text-sm focus:ring-2 focus:ring-ring focus:border-transparent min-h-[44px] md:min-h-0"
+              />
+            </div>
+            {operator === "between" && (
+              <div>
+                <label className="block text-xs font-medium text-gray-700 mb-1">
+                  Second Value
+                </label>
+                <input
+                  type={field.type === "number" ? "number" : "text"}
+                  value={value2}
+                  onChange={(e) => setValue2(e.target.value)}
+                  placeholder={`Enter second ${field.label.toLowerCase()}`}
+                  className="w-full px-3 py-2.5 md:py-2 border border-gray-300 rounded-md text-sm focus:ring-2 focus:ring-ring focus:border-transparent min-h-[44px] md:min-h-0"
+                />
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Action Buttons */}
+        <div className="flex flex-col sm:flex-row justify-end gap-2 pt-2">
+          <button
+            onClick={onClose}
+            className="px-3 py-2.5 md:py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-ring min-h-[44px] md:min-h-0 w-full sm:w-auto"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={handleApply}
+            className="px-3 py-2.5 md:py-2 text-sm font-medium text-white bg-primary border border-transparent rounded-md hover:bg-lighthouse-navy focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-ring min-h-[44px] md:min-h-0 w-full sm:w-auto"
+          >
+            Apply Filter
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}

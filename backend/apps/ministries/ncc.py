@@ -1,0 +1,390 @@
+"""NCC / Lessons teacher roster helpers (per-branch system ministry)."""
+
+from __future__ import annotations
+
+from typing import Iterable, Optional
+
+from django.db import transaction
+
+from apps.people.models import Branch, ModuleCoordinator, Person
+from apps.lessons.coordinator_access import (
+    can_pick_lessons_branch,
+    has_lessons_browse_all,
+)
+
+from .models import (
+    NCC_MINISTRY_CODE,
+    NCC_MINISTRY_NAME,
+    Ministry,
+    MinistryCategory,
+    MinistryCadence,
+    MinistryMember,
+    MinistryRole,
+    MinistryScope,
+)
+
+
+def is_ncc_ministry(ministry: Ministry | None) -> bool:
+    if ministry is None:
+        return False
+    return bool(ministry.is_ncc_roster)
+
+
+@transaction.atomic
+def ensure_ncc_ministry(branch: Branch) -> Ministry:
+    """Get or create the BRANCH-scoped NCC / Lessons roster ministry for a branch."""
+    ministry, created = Ministry.objects.get_or_create(
+        code=NCC_MINISTRY_CODE,
+        branch=branch,
+        defaults={
+            "name": NCC_MINISTRY_NAME,
+            "scope": MinistryScope.BRANCH,
+            "is_system": True,
+            "category": MinistryCategory.CARE,
+            "activity_cadence": MinistryCadence.WEEKLY,
+            "description": (
+                "New Converts Course / Lessons teachers roster for this branch."
+            ),
+            "is_active": True,
+        },
+    )
+    update_fields = []
+    if not ministry.is_system:
+        ministry.is_system = True
+        update_fields.append("is_system")
+    if ministry.scope != MinistryScope.BRANCH:
+        ministry.scope = MinistryScope.BRANCH
+        update_fields.append("scope")
+    if ministry.name != NCC_MINISTRY_NAME and created is False:
+        # Keep custom renames if admins changed display name; only set on create.
+        pass
+    if update_fields:
+        ministry.save(update_fields=update_fields + ["updated_at"])
+    return ministry
+
+
+def seed_ncc_ministries_for_all_branches() -> int:
+    """Ensure an NCC ministry exists for every active branch. Returns created count."""
+    created = 0
+    for branch in Branch.objects.filter(is_active=True).iterator():
+        _, was_created = Ministry.objects.get_or_create(
+            code=NCC_MINISTRY_CODE,
+            branch=branch,
+            defaults={
+                "name": NCC_MINISTRY_NAME,
+                "scope": MinistryScope.BRANCH,
+                "is_system": True,
+                "category": MinistryCategory.CARE,
+                "activity_cadence": MinistryCadence.WEEKLY,
+                "description": (
+                    "New Converts Course / Lessons teachers roster for this branch."
+                ),
+                "is_active": True,
+            },
+        )
+        if was_created:
+            created += 1
+        else:
+            ensure_ncc_ministry(branch)
+    return created
+
+
+def _lessons_module_assignment(person: Person) -> Optional[ModuleCoordinator]:
+    return ModuleCoordinator.objects.filter(
+        person=person,
+        module=ModuleCoordinator.ModuleType.LESSONS,
+        resource_id=None,
+    ).first()
+
+
+def grant_lessons_teacher_access(person: Person) -> Optional[ModuleCoordinator]:
+    """
+    Ensure the person can access Lessons as a teacher.
+
+    ModuleCoordinator is unique on (person, module, resource_id), so a Lessons
+    coordinator/senior already covers access — do not create a duplicate TEACHER row.
+    """
+    existing = _lessons_module_assignment(person)
+    if existing:
+        return existing
+    return ModuleCoordinator.objects.create(
+        person=person,
+        module=ModuleCoordinator.ModuleType.LESSONS,
+        level=ModuleCoordinator.CoordinatorLevel.TEACHER,
+        resource_id=None,
+        resource_type="",
+    )
+
+
+def grant_lessons_coordinator_access(person: Person) -> Optional[ModuleCoordinator]:
+    """
+    Ensure a non-senior Lessons Coordinator assignment.
+
+    Unique on (person, LESSONS, resource_id=None): leave SENIOR in place, upgrade
+    TEACHER to COORDINATOR, or create COORDINATOR.
+    """
+    if person is None or not getattr(person, "pk", None):
+        return None
+    existing = _lessons_module_assignment(person)
+    if existing:
+        if existing.level == ModuleCoordinator.CoordinatorLevel.SENIOR_COORDINATOR:
+            return existing
+        if existing.level != ModuleCoordinator.CoordinatorLevel.COORDINATOR:
+            existing.level = ModuleCoordinator.CoordinatorLevel.COORDINATOR
+            existing.save(update_fields=["level"])
+        return existing
+    return ModuleCoordinator.objects.create(
+        person=person,
+        module=ModuleCoordinator.ModuleType.LESSONS,
+        level=ModuleCoordinator.CoordinatorLevel.COORDINATOR,
+        resource_id=None,
+        resource_type="",
+    )
+
+
+def _person_should_keep_lessons_teacher_access(person: Person) -> bool:
+    return MinistryMember.objects.filter(
+        ministry__code=NCC_MINISTRY_CODE,
+        member=person,
+        is_active=True,
+    ).exists()
+
+
+def revoke_lessons_coordinator_access(person: Person) -> None:
+    """
+    Drop auto-granted Lessons Coordinator access when the person is no longer
+    NCC support (and not NCC primary). Demote to TEACHER when they still have
+    an active NCC roster membership; otherwise delete the COORDINATOR row.
+    Never demotes SENIOR_COORDINATOR.
+    """
+    if person is None or not getattr(person, "pk", None):
+        return
+    from apps.lessons.coordinator_access import (
+        is_ncc_primary_coordinator,
+        is_ncc_support_coordinator,
+    )
+
+    if is_ncc_support_coordinator(person) or is_ncc_primary_coordinator(person):
+        return
+    existing = _lessons_module_assignment(person)
+    if (
+        existing is None
+        or existing.level != ModuleCoordinator.CoordinatorLevel.COORDINATOR
+    ):
+        return
+    if _person_should_keep_lessons_teacher_access(person):
+        existing.level = ModuleCoordinator.CoordinatorLevel.TEACHER
+        existing.save(update_fields=["level"])
+        return
+    existing.delete()
+
+
+def sync_ncc_support_coordinator_access(
+    ministry: Ministry,
+    *,
+    removed_support_ids: Optional[Iterable[int]] = None,
+) -> None:
+    """Grant/revoke Lessons Coordinator rows for an NCC ministry's support list."""
+    if not is_ncc_ministry(ministry):
+        return
+    for person in ministry.support_coordinators.all():
+        grant_lessons_coordinator_access(person)
+    for person_id in set(removed_support_ids or []):
+        person = Person.objects.filter(pk=person_id).first()
+        if person:
+            revoke_lessons_coordinator_access(person)
+
+
+_LESSONS_ACCESS_LEVELS = (
+    ModuleCoordinator.CoordinatorLevel.TEACHER,
+    ModuleCoordinator.CoordinatorLevel.COORDINATOR,
+    ModuleCoordinator.CoordinatorLevel.SENIOR_COORDINATOR,
+)
+
+
+def _assignment_grants_lessons_teacher_access(assignment: ModuleCoordinator) -> bool:
+    return (
+        assignment.module == ModuleCoordinator.ModuleType.LESSONS
+        and assignment.level in _LESSONS_ACCESS_LEVELS
+    )
+
+
+def person_has_lessons_teacher_access(person: Person) -> bool:
+    if getattr(person, "role", None) in ("ADMIN", "PASTOR"):
+        return True
+    cache = getattr(person, "_prefetched_objects_cache", None) or {}
+    if "module_coordinator_assignments" in cache:
+        return any(
+            _assignment_grants_lessons_teacher_access(assignment)
+            for assignment in person.module_coordinator_assignments.all()
+        )
+    return person.module_coordinator_assignments.filter(
+        module=ModuleCoordinator.ModuleType.LESSONS,
+        level__in=_LESSONS_ACCESS_LEVELS,
+    ).exists()
+
+
+def lessons_teacher_access_person_ids(people: Iterable[Person]) -> set[int]:
+    """
+    Return person IDs that have Lessons teacher-level access.
+
+    One ModuleCoordinator query for the batch, plus ADMIN/PASTOR roles from
+    the given person objects (no extra queries).
+    """
+    people_list = list(people)
+    if not people_list:
+        return set()
+
+    access_ids: set[int] = {
+        person.pk
+        for person in people_list
+        if getattr(person, "role", None) in ("ADMIN", "PASTOR")
+    }
+    remaining_ids = [
+        person.pk for person in people_list if person.pk not in access_ids
+    ]
+    if remaining_ids:
+        access_ids.update(
+            ModuleCoordinator.objects.filter(
+                person_id__in=remaining_ids,
+                module=ModuleCoordinator.ModuleType.LESSONS,
+                level__in=_LESSONS_ACCESS_LEVELS,
+            ).values_list("person_id", flat=True)
+        )
+    return access_ids
+
+
+def revoke_lessons_teacher_access(person: Person) -> int:
+    """Remove LESSONS TEACHER assignments only (not coordinator levels)."""
+    deleted, _ = ModuleCoordinator.objects.filter(
+        person=person,
+        module=ModuleCoordinator.ModuleType.LESSONS,
+        level=ModuleCoordinator.CoordinatorLevel.TEACHER,
+    ).delete()
+    return deleted
+
+
+def sync_ncc_member_access(
+    membership: MinistryMember,
+    *,
+    grant_lessons_teacher_access_flag: Optional[bool] = None,
+) -> None:
+    """
+    Apply Lessons TEACHER ModuleCoordinator sync for an NCC roster membership.
+
+    - Inactive membership always revokes TEACHER access.
+    - Active membership: grant when flag is True; revoke when flag is False;
+      when flag is None on update, leave access unchanged.
+    """
+    if not is_ncc_ministry(membership.ministry):
+        return
+
+    if not membership.is_active:
+        revoke_lessons_teacher_access(membership.member)
+        return
+
+    if grant_lessons_teacher_access_flag is True:
+        grant_lessons_teacher_access(membership.member)
+    elif grant_lessons_teacher_access_flag is False:
+        revoke_lessons_teacher_access(membership.member)
+
+
+def user_is_lessons_roster_manager(user: Person) -> bool:
+    if not user or not getattr(user, "is_authenticated", False):
+        return False
+    if user.role in ("ADMIN", "PASTOR"):
+        return True
+    return has_lessons_browse_all(user)
+
+
+def user_can_manage_ncc_ministry(user: Person, ministry: Ministry) -> bool:
+    """Branch-limited NCC roster management for Lessons managers / pastors / admins."""
+    if not is_ncc_ministry(ministry):
+        return False
+    if not user_is_lessons_roster_manager(user):
+        return False
+    if can_pick_lessons_branch(user):
+        return True
+    return bool(user.branch_id and ministry.branch_id == user.branch_id)
+
+
+def ncc_roster_person_ids_for_branch(branch_id: int) -> Iterable[int]:
+    ministry = (
+        Ministry.objects.filter(
+            code=NCC_MINISTRY_CODE,
+            branch_id=branch_id,
+        )
+        .only("id")
+        .first()
+    )
+    if not ministry:
+        return []
+    return MinistryMember.objects.filter(ministry=ministry).values_list(
+        "member_id", flat=True
+    )
+
+
+def person_on_ncc_roster(person: Person, branch: Optional[Branch] = None) -> bool:
+    """True if person is on the branch NCC roster (active or inactive)."""
+    branch = branch or getattr(person, "branch", None)
+    if branch is None:
+        return False
+    return MinistryMember.objects.filter(
+        ministry__code=NCC_MINISTRY_CODE,
+        ministry__branch=branch,
+        member=person,
+    ).exists()
+
+
+def _ensure_ncc_membership(person: Person, branch: Branch) -> bool:
+    """Create an NCC roster row if missing. Returns True when a row was created."""
+    if person is None or branch is None:
+        return False
+    ministry = ensure_ncc_ministry(branch)
+    _, created = MinistryMember.objects.get_or_create(
+        ministry=ministry,
+        member=person,
+        defaults={"role": MinistryRole.TEAM_MEMBER, "is_active": True},
+    )
+    return created
+
+
+def backfill_ncc_roster_from_lessons_teachers() -> int:
+    """
+    Add existing Lessons teachers onto per-branch NCC rosters.
+
+    Sources:
+    - ModuleCoordinator LESSONS at TEACHER / COORDINATOR / SENIOR (person.branch)
+    - Current LessonStudentEnrollment.teacher (student.branch)
+
+    Does not create extra LESSONS TEACHER coordinator rows.
+    Returns the number of memberships created.
+    """
+    from apps.lessons.models import LessonStudentEnrollment
+
+    created = 0
+    coordinator_people = (
+        Person.objects.filter(
+            branch__isnull=False,
+            module_coordinator_assignments__module=ModuleCoordinator.ModuleType.LESSONS,
+            module_coordinator_assignments__level__in=_LESSONS_ACCESS_LEVELS,
+        )
+        .select_related("branch")
+        .distinct()
+    )
+    for person in coordinator_people.iterator():
+        if _ensure_ncc_membership(person, person.branch):
+            created += 1
+
+    enrollments = (
+        LessonStudentEnrollment.objects.filter(teacher__isnull=False)
+        .select_related("teacher", "student__branch")
+        .iterator()
+    )
+    for enrollment in enrollments:
+        student_branch = getattr(enrollment.student, "branch", None)
+        if student_branch is None:
+            continue
+        if _ensure_ncc_membership(enrollment.teacher, student_branch):
+            created += 1
+    return created

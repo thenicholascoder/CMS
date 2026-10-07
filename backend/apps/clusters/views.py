@@ -1,0 +1,1259 @@
+from rest_framework import viewsets, filters, status
+from rest_framework.exceptions import ValidationError
+from rest_framework.pagination import PageNumberPagination
+from django_filters.rest_framework import DjangoFilterBackend
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from django.db.models import Sum, Count, Q
+from django.db.models.functions import TruncMonth
+from django.http import HttpResponse
+from datetime import datetime, timedelta
+from django.utils import timezone
+
+from core.datetime_utils import church_today
+import csv
+import io
+from .models import (
+    Cluster,
+    ClusterComplianceNote,
+    ClusterWeeklyReport,
+    member_attendance_rate_q,
+)
+from .filters import ClusterFilter
+from .roster_counts import annotate_cluster_roster_counts
+from .report_membership import sync_report_visitors_to_cluster_members
+from .serializers import (
+    ClusterSerializer,
+    ClusterListSerializer,
+    ClusterWeeklyReportSerializer,
+    ClusterComplianceSerializer,
+    ComplianceSummarySerializer,
+    ClusterComplianceNoteSerializer,
+    ClusterStatusTallySerializer,
+    ClusterStatusTallyDetailSerializer,
+)
+from .status_tally import (
+    MEMBER_STATUSES,
+    build_status_tally_rows,
+    people_ids_for_status_tally_detail,
+    should_include_unassigned,
+    snapshot_change_in_window,
+    status_tally_years,
+)
+from apps.evangelism.services import (
+    is_unassigned_cluster_param,
+    parse_people_tally_months,
+)
+from apps.people.name_formatting import format_person_display_name
+from .utils import (
+    calculate_cluster_compliance,
+    calculate_trend,
+    is_at_risk,
+    get_weeks_in_range,
+)
+from apps.authentication.permissions import (
+    IsAuthenticatedAndNotVisitor,
+    IsModuleCoordinator,
+    IsSeniorCoordinator,
+    CanEditOwnResource,
+    HasModuleAccess,
+    IsAdmin,
+)
+from apps.people.models import ModuleCoordinator, Person
+from apps.people.views import PersonViewSet, PersonPagination
+from apps.people.serializers import PersonListSerializer
+from apps.clusters.permissions import (
+    ClusterCoordinatorScopedPermission,
+    ClusterMutationAttemptPermission,
+    ClusterReportMutationAttemptPermission,
+    ClusterReportReadPermission,
+    ClusterWeeklyReportScopedPermission,
+    can_pick_cluster_branch,
+    apply_cluster_branch_scope,
+    apply_report_branch_scope,
+    clusters_for_overdue,
+    ensure_user_can_submit_cluster_report_or_privileged,
+    ensure_user_manages_cluster_or_privileged,
+    filter_clusters_for_read,
+    filter_weekly_reports_for_user,
+)
+
+
+class ClusterPagination(PageNumberPagination):
+    page_size = 25
+    page_size_query_param = "page_size"
+    max_page_size = 100
+
+
+class ClusterViewSet(viewsets.ModelViewSet):
+    queryset = Cluster.objects.all()
+    serializer_class = ClusterSerializer
+    pagination_class = ClusterPagination
+    permission_classes = [IsAuthenticatedAndNotVisitor]
+    filter_backends = [
+        filters.SearchFilter,
+        DjangoFilterBackend,
+        filters.OrderingFilter,
+    ]
+    filterset_class = ClusterFilter
+    search_fields = ["name", "code", "location", "description"]
+    ordering_fields = [
+        "name",
+        "code",
+        "created_at",
+        "member_count",
+        "visitor_count",
+        "family_count",
+        "id",
+    ]
+    ordering = ["name", "id"]
+
+    def get_serializer_class(self):
+        if self.action == "list":
+            return ClusterListSerializer
+        return ClusterSerializer
+
+    def get_queryset(self):
+        user = self.request.user
+        queryset = super().get_queryset()
+        queryset = filter_clusters_for_read(user, queryset)
+
+        include_inactive = self.request.query_params.get("include_inactive", "").lower()
+        if include_inactive not in ("1", "true", "yes"):
+            queryset = queryset.filter(is_active=True)
+
+        branch_param = self.request.query_params.get(
+            "branch_id"
+        ) or self.request.query_params.get("branch")
+        queryset = apply_cluster_branch_scope(queryset, user, branch_param)
+
+        # Subquery role counts so visitors are not included in member_count.
+        queryset = annotate_cluster_roster_counts(queryset).annotate(
+            family_count=Count("families", distinct=True),
+        )
+
+        if getattr(self, "action", None) == "list":
+            return queryset.select_related("coordinator")
+
+        return queryset.select_related("coordinator").prefetch_related(
+            "members",
+            "families",
+            "families__members",
+        )
+
+    @staticmethod
+    def _cluster_reporter_ids_map(cluster_ids):
+        from collections import defaultdict
+        from apps.people.models import ModuleCoordinator
+
+        mapping = defaultdict(list)
+        if not cluster_ids:
+            return mapping
+        rows = ModuleCoordinator.objects.filter(
+            module=ModuleCoordinator.ModuleType.CLUSTER,
+            level=ModuleCoordinator.CoordinatorLevel.REPORTER,
+            resource_id__in=cluster_ids,
+        ).values_list("resource_id", "person_id")
+        for resource_id, person_id in rows:
+            if resource_id is not None:
+                mapping[resource_id].append(person_id)
+        return mapping
+
+    def get_serializer(self, *args, **kwargs):
+        kwargs.setdefault("context", self.get_serializer_context())
+        instance = args[0] if args else kwargs.get("instance")
+        # Bulk-load reporter IDs for reads only. Write serializers must query after
+        # save so to_representation reflects synced assignments.
+        if (
+            instance is not None
+            and kwargs.get("data") is None
+            and "cluster_reporter_ids_map" not in kwargs["context"]
+            and self.get_serializer_class() is ClusterSerializer
+        ):
+            if kwargs.get("many"):
+                cluster_ids = [c.id for c in instance]
+            else:
+                cluster_ids = [instance.id]
+            kwargs["context"]["cluster_reporter_ids_map"] = (
+                self._cluster_reporter_ids_map(cluster_ids)
+            )
+        return super().get_serializer(*args, **kwargs)
+
+    def get_permissions(self):
+        """
+        Override to set permissions based on action.
+        """
+        if self.action == "create":
+            # Only ADMIN, PASTOR, or Senior Coordinator can create
+            return [IsAuthenticatedAndNotVisitor(), HasModuleAccess("CLUSTER", "create")]
+        elif self.action in ["update", "partial_update"]:
+            return [
+                IsAuthenticatedAndNotVisitor(),
+                ClusterMutationAttemptPermission(),
+                ClusterCoordinatorScopedPermission(),
+            ]
+        elif self.action == "destroy":
+            return [IsAuthenticatedAndNotVisitor(), IsAdmin()]
+        else:
+            # Read operations (list, retrieve, summary, unassigned_people)
+            return [IsAuthenticatedAndNotVisitor(), HasModuleAccess("CLUSTER", "read")]
+
+    class StatusTallyDetailPagination(PageNumberPagination):
+        page_size = 20
+        page_size_query_param = "page_size"
+        max_page_size = 100
+
+    def _status_tally_branch_id(self):
+        raw = self.request.query_params.get(
+            "branch_id"
+        ) or self.request.query_params.get("branch")
+        if raw in (None, ""):
+            raise ValidationError({"branch": "branch is required."})
+        try:
+            branch_id = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError({"branch": "branch must be an integer."}) from exc
+        user = self.request.user
+        if not can_pick_cluster_branch(user):
+            if not user.branch_id:
+                raise ValidationError({"branch": "branch is required."})
+            return user.branch_id
+        return branch_id
+
+    def _status_tally_year(self):
+        raw = self.request.query_params.get("year")
+        if raw in (None, ""):
+            return church_today().year
+        try:
+            return int(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError({"year": "year must be an integer."}) from exc
+
+    def _status_tally_months(self):
+        raw = self.request.query_params.get("months")
+        if raw in (None, "") and self.request.query_params.get("month") not in (
+            None,
+            "",
+        ):
+            raw = self.request.query_params.get("month")
+        try:
+            return parse_people_tally_months(raw)
+        except ValueError as exc:
+            raise ValidationError({"months": str(exc)}) from exc
+
+    def _status_tally_clusters(self, branch_id: int):
+        queryset = Cluster.objects.filter(is_active=True, branch_id=branch_id)
+        queryset = filter_clusters_for_read(self.request.user, queryset)
+        queryset = apply_cluster_branch_scope(
+            queryset, self.request.user, str(branch_id)
+        )
+        return list(queryset.order_by("name", "id"))
+
+    @action(detail=False, methods=["get"], url_path="status_tally")
+    def status_tally(self, request):
+        branch_id = self._status_tally_branch_id()
+        year = self._status_tally_year()
+        months = self._status_tally_months()
+        clusters = self._status_tally_clusters(branch_id)
+        rows = build_status_tally_rows(
+            year=year,
+            months=months,
+            branch_id=branch_id,
+            clusters=clusters,
+            include_unassigned=should_include_unassigned(request.user),
+        )
+        serializer = ClusterStatusTallySerializer(rows, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=["get"], url_path="status_tally_years")
+    def status_tally_years_action(self, request):
+        branch_id = self._status_tally_branch_id()
+        years = status_tally_years(branch_id)
+        default_year = church_today().year
+        if default_year not in years:
+            years = [default_year, *years]
+        return Response({"years": years, "default_year": default_year})
+
+    @action(detail=False, methods=["get"], url_path="status_tally_detail")
+    def status_tally_detail(self, request):
+        branch_id = self._status_tally_branch_id()
+        year = self._status_tally_year()
+        months = self._status_tally_months()
+        status_param = (request.query_params.get("status") or "").strip()
+        valid_statuses = set(MEMBER_STATUSES) | {"members"}
+        if status_param not in valid_statuses:
+            raise ValidationError(
+                {
+                    "status": (
+                        "status must be one of ACTIVE, SEMIACTIVE, INACTIVE, "
+                        "DORMANT, FALLAWAY, DECEASED, or members."
+                    )
+                }
+            )
+
+        cluster_raw = request.query_params.get("cluster")
+        unassigned = is_unassigned_cluster_param(cluster_raw)
+        cluster_id = None
+        if cluster_raw not in (None, "") and not unassigned:
+            try:
+                cluster_id = int(cluster_raw)
+            except (TypeError, ValueError) as exc:
+                raise ValidationError(
+                    {"cluster": "cluster must be an id or unassigned."}
+                ) from exc
+
+        include_unassigned = should_include_unassigned(request.user)
+        if unassigned and not include_unassigned:
+            raise ValidationError({"cluster": "Unassigned is not available."})
+
+        clusters = self._status_tally_clusters(branch_id)
+        person_ids, snapshots, _as_of = people_ids_for_status_tally_detail(
+            year=year,
+            months=months,
+            branch_id=branch_id,
+            clusters=clusters,
+            include_unassigned=include_unassigned,
+            cluster_id=cluster_id,
+            unassigned=unassigned,
+            status=status_param,
+        )
+        people = Person.objects.filter(id__in=person_ids).order_by(
+            "first_name", "last_name", "id"
+        )
+        rows = []
+        for person in people:
+            snapshot = snapshots.get(person.id) or {}
+            changed_at = snapshot.get("changed_at")
+            rows.append(
+                {
+                    "id": person.id,
+                    "display_name": format_person_display_name(person)
+                    or person.username,
+                    "first_name": person.first_name,
+                    "middle_name": person.middle_name,
+                    "last_name": person.last_name,
+                    "suffix": person.suffix,
+                    "nickname": person.nickname,
+                    "username": person.username,
+                    "role": person.role,
+                    "status": snapshot.get("status") or person.status,
+                    "from_status": snapshot.get("from_status"),
+                    "to_status": snapshot.get("to_status"),
+                    "changed_at": changed_at,
+                    "source": snapshot.get("source"),
+                    "in_window": snapshot_change_in_window(
+                        changed_at, year, months
+                    ),
+                }
+            )
+        paginator = self.StatusTallyDetailPagination()
+        page = paginator.paginate_queryset(rows, request, view=self)
+        serializer = ClusterStatusTallyDetailSerializer(page, many=True)
+        return paginator.get_paginated_response(serializer.data)
+
+    def _scoped_people_for_unassigned(self, request):
+        person_view = PersonViewSet()
+        person_view.request = request
+        person_view.args = getattr(self, "args", ())
+        person_view.kwargs = getattr(self, "kwargs", {})
+        person_view.action = "list"
+        person_view.format_kwarg = getattr(self, "format_kwarg", None)
+        return person_view
+
+    @action(detail=False, methods=["get"], url_path="unassigned-people")
+    def unassigned_people(self, request):
+        """Paginated people not in any active cluster (scoped like Person list)."""
+        person_view = self._scoped_people_for_unassigned(request)
+        people_qs = person_view._scoped_people_queryset(for_profile=False)
+        assigned_ids = (
+            Person.objects.filter(clusters__is_active=True)
+            .values_list("id", flat=True)
+            .distinct()
+        )
+        people_qs = (
+            people_qs.exclude(id__in=assigned_ids)
+            .exclude(role="PASTOR")
+            .exclude(username="admin")
+            .exclude(Q(first_name="") | Q(last_name=""))
+            .exclude(first_name__isnull=True)
+            .exclude(last_name__isnull=True)
+            .select_related("branch", "first_activity_attended")
+            .prefetch_related("clusters", "families")
+            .order_by("last_name", "first_name", "id")
+        )
+
+        search = (request.query_params.get("search") or "").strip()
+        if search:
+            people_qs = people_qs.filter(
+                Q(first_name__icontains=search)
+                | Q(last_name__icontains=search)
+                | Q(nickname__icontains=search)
+                | Q(email__icontains=search)
+                | Q(member_id__icontains=search)
+            )
+
+        paginator = PersonPagination()
+        page = paginator.paginate_queryset(people_qs, request, view=self)
+        serializer = PersonListSerializer(
+            page, many=True, context=person_view.get_serializer_context()
+        )
+        return paginator.get_paginated_response(serializer.data)
+
+    @action(detail=False, methods=["get"], url_path="summary")
+    def summary(self, request):
+        """
+        KPI totals under the same branch / include_inactive scope as list.
+        Toolbar text filters beyond branch do not apply (Phase 1).
+        """
+        qs = self.filter_queryset(self.get_queryset())
+        cluster_count = qs.count()
+        member_agg = qs.aggregate(total_members=Sum("member_count"))
+        member_count = member_agg.get("total_members") or 0
+
+        person_view = self._scoped_people_for_unassigned(request)
+        people_qs = person_view._scoped_people_queryset(for_profile=False)
+        assigned_ids = (
+            Person.objects.filter(clusters__is_active=True)
+            .values_list("id", flat=True)
+            .distinct()
+        )
+        unassigned_count = (
+            people_qs.exclude(id__in=assigned_ids)
+            .exclude(role="PASTOR")
+            .exclude(username="admin")
+            .exclude(Q(first_name="") | Q(last_name=""))
+            .exclude(first_name__isnull=True)
+            .exclude(last_name__isnull=True)
+            .count()
+        )
+
+        return Response(
+            {
+                "cluster_count": cluster_count,
+                "member_count": member_count,
+                "unassigned_count": unassigned_count,
+            }
+        )
+
+
+class ClusterWeeklyReportPagination(PageNumberPagination):
+    page_size = 50
+    page_size_query_param = "page_size"
+    max_page_size = 100
+
+
+class ClusterWeeklyReportViewSet(viewsets.ModelViewSet):
+    queryset = ClusterWeeklyReport.objects.all()
+    permission_classes = [IsAuthenticatedAndNotVisitor]
+    serializer_class = ClusterWeeklyReportSerializer
+    pagination_class = ClusterWeeklyReportPagination
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = [
+        "cluster",
+        "year",
+        "week_number",
+        "gathering_type",
+        "submitted_by",
+    ]
+
+    def get_queryset(self):
+        user = self.request.user
+        queryset = super().get_queryset()
+
+        # Apply month filter if provided
+        month = self.request.query_params.get("month")
+        if month:
+            try:
+                month_int = int(month)
+                if 1 <= month_int <= 12:
+                    queryset = queryset.filter(meeting_date__month=month_int)
+            except ValueError:
+                pass
+
+        # Permission-based visibility (before branch scoping)
+        queryset = filter_weekly_reports_for_user(user, queryset)
+
+        branch_param = self.request.query_params.get(
+            "branch_id"
+        ) or self.request.query_params.get("branch")
+        return apply_report_branch_scope(queryset, user, branch_param)
+    
+    def get_permissions(self):
+        """
+        Override to set permissions based on action.
+        """
+        if self.action == 'create':
+            return [
+                IsAuthenticatedAndNotVisitor(),
+                ClusterReportMutationAttemptPermission(),
+            ]
+        elif self.action in ['update', 'partial_update']:
+            return [
+                IsAuthenticatedAndNotVisitor(),
+                ClusterReportMutationAttemptPermission(),
+                ClusterWeeklyReportScopedPermission(),
+            ]
+        elif self.action == 'destroy':
+            return [IsAuthenticatedAndNotVisitor(), IsAdmin()]
+        else:
+            # Read operations
+            return [IsAuthenticatedAndNotVisitor(), ClusterReportReadPermission()]
+
+    def _submitter(self):
+        user = self.request.user
+        return user if isinstance(user, Person) else None
+
+    def perform_create(self, serializer):
+        cluster = serializer.validated_data.get("cluster")
+        ensure_user_can_submit_cluster_report_or_privileged(self.request.user, cluster)
+        report = serializer.save(submitted_by=self._submitter())
+        sync_report_visitors_to_cluster_members(
+            report,
+            report.visitors_attended.values_list("id", flat=True),
+            verified_by=self._submitter(),
+        )
+
+    def perform_update(self, serializer):
+        old_cluster = serializer.instance.cluster
+        new_cluster = serializer.validated_data.get("cluster", old_cluster)
+        ensure_user_can_submit_cluster_report_or_privileged(self.request.user, new_cluster)
+        if getattr(new_cluster, "pk", None) != getattr(old_cluster, "pk", None):
+            ensure_user_can_submit_cluster_report_or_privileged(
+                self.request.user, old_cluster
+            )
+        save_kwargs = {}
+        if serializer.instance.submitted_by_id is None:
+            submitter = self._submitter()
+            if submitter is not None:
+                save_kwargs["submitted_by"] = submitter
+        report = serializer.save(**save_kwargs)
+        sync_report_visitors_to_cluster_members(
+            report,
+            report.visitors_attended.values_list("id", flat=True),
+            verified_by=self._submitter(),
+        )
+
+    @action(detail=False, methods=["get"])
+    def distinct_years(self, request):
+        """
+        Distinct calendar years present in weekly reports (facet filters only).
+
+        Scoped like list/retrieve for non-senior coordinators (managed clusters only).
+        Optional query params: branch_id / branch, cluster, gathering_type.
+        """
+        queryset = self.get_queryset()
+
+        cluster_param = request.query_params.get("cluster")
+        if cluster_param:
+            try:
+                queryset = queryset.filter(cluster_id=int(cluster_param))
+            except (TypeError, ValueError):
+                pass
+
+        gathering = request.query_params.get("gathering_type")
+        if gathering:
+            queryset = queryset.filter(gathering_type=gathering)
+
+        years_iter = queryset.values_list("year", flat=True).distinct()
+        years = sorted(set(years_iter), reverse=True)
+        return Response({"years": years})
+
+    @action(detail=False, methods=["get"])
+    def analytics(self, request):
+        """Generate analytics from cluster weekly reports"""
+        # get_queryset() already applies filters from filterset_fields (cluster, year, gathering_type)
+        # and the month filter from get_queryset() override
+        queryset = self.get_queryset()
+
+        report_count = queryset.count()
+
+        # Aggregate via M2M through models. Django forbids Sum() over annotations that use Count()
+        # (nested aggregates), so we count link rows instead of summing per-report counts.
+        member_links = ClusterWeeklyReport.members_attended.through.objects.filter(
+            clusterweeklyreport__in=queryset
+        )
+        visitor_links = ClusterWeeklyReport.visitors_attended.through.objects.filter(
+            clusterweeklyreport__in=queryset
+        )
+
+        total_members = member_links.count()
+        total_visitors = visitor_links.count()
+
+        avg_members = total_members / report_count if report_count > 0 else 0
+        avg_visitors = total_visitors / report_count if report_count > 0 else 0
+
+        monthly_members = (
+            member_links.annotate(
+                _month=TruncMonth("clusterweeklyreport__meeting_date")
+            )
+            .values("_month")
+            .annotate(members=Count("id"))
+        )
+        monthly_visitors = (
+            visitor_links.annotate(
+                _month=TruncMonth("clusterweeklyreport__meeting_date")
+            )
+            .values("_month")
+            .annotate(visitors=Count("id"))
+        )
+
+        members_by_month = {}
+        for row in monthly_members:
+            mt = row["_month"]
+            if mt is None:
+                continue
+            members_by_month[mt] = row["members"]
+
+        visitors_by_month = {}
+        for row in monthly_visitors:
+            mt = row["_month"]
+            if mt is None:
+                continue
+            visitors_by_month[mt] = row["visitors"]
+
+        all_months = sorted(
+            set(members_by_month.keys()) | set(visitors_by_month.keys())
+        )
+        monthly_attendance = []
+        for mt in all_months:
+            monthly_attendance.append(
+                {
+                    "month_key": mt.strftime("%Y-%m"),
+                    "month_label": mt.strftime("%b %Y"),
+                    "members": int(members_by_month.get(mt, 0)),
+                    "visitors": int(visitors_by_month.get(mt, 0)),
+                }
+            )
+
+        member_counts_by_cluster = {
+            row["clusterweeklyreport__cluster_id"]: row["sum_members_attended"]
+            for row in member_links.values("clusterweeklyreport__cluster_id").annotate(
+                sum_members_attended=Count("id")
+            )
+        }
+
+        # Roster sizes and attended counts matching member_attendance_rate
+        # (non-ADMIN + ACTIVE/SEMIACTIVE/INACTIVE only).
+        cluster_ids = list(queryset.values_list("cluster_id", flat=True).distinct())
+        roster_by_cluster = {
+            row["id"]: row["mc"]
+            for row in Cluster.objects.filter(id__in=cluster_ids)
+            .annotate(
+                mc=Count(
+                    "members",
+                    filter=member_attendance_rate_q("members__"),
+                    distinct=True,
+                )
+            )
+            .values("id", "mc")
+        }
+        rate_member_links = member_links.filter(member_attendance_rate_q("person__"))
+        attended_per_report = {
+            row["clusterweeklyreport_id"]: row["c"]
+            for row in rate_member_links.values("clusterweeklyreport_id").annotate(
+                c=Count("id")
+            )
+        }
+        rate_attended_by_cluster = {
+            row["clusterweeklyreport__cluster_id"]: row["sum_members_attended"]
+            for row in rate_member_links.values(
+                "clusterweeklyreport__cluster_id"
+            ).annotate(sum_members_attended=Count("id"))
+        }
+
+        report_rates = []
+        for report in queryset.values("id", "cluster_id"):
+            roster = roster_by_cluster.get(report["cluster_id"], 0) or 0
+            attended = attended_per_report.get(report["id"], 0) or 0
+            if roster == 0:
+                report_rates.append(0.0)
+            else:
+                report_rates.append(min(100.0, (attended / roster) * 100))
+        average_member_attendance_rate = (
+            round(sum(report_rates) / len(report_rates), 1) if report_rates else 0.0
+        )
+
+        cluster_comparison = []
+        cluster_qs = (
+            queryset.values("cluster_id", "cluster__name", "cluster__code")
+            .annotate(report_count=Count("id"))
+            .order_by("cluster_id")
+        )
+        for row in cluster_qs:
+            cid = row["cluster_id"]
+            name = row["cluster__name"] or ""
+            code = row["cluster__code"] or ""
+            if code and name:
+                label = f"{code} - {name}"
+            elif name:
+                label = name
+            elif code:
+                label = code
+            else:
+                label = f"Cluster {cid}"
+            rc = row["report_count"]
+            member_count = int(roster_by_cluster.get(cid, 0) or 0)
+            sum_attended = int(member_counts_by_cluster.get(cid, 0))
+            rate_sum = int(rate_attended_by_cluster.get(cid, 0))
+            denom = member_count * rc
+            attendance_rate = (
+                min(100.0, round((rate_sum / denom) * 100, 1)) if denom > 0 else 0.0
+            )
+            cluster_comparison.append(
+                {
+                    "cluster_id": cid,
+                    "cluster_label": label,
+                    "report_count": rc,
+                    "sum_members_attended": sum_attended,
+                    "member_count": member_count,
+                    "attendance_rate": attendance_rate,
+                }
+            )
+
+        analytics_data = {
+            "total_reports": report_count,
+            "total_attendance": {
+                "members": total_members,
+                "visitors": total_visitors,
+            },
+            "average_attendance": {
+                "avg_members": round(avg_members, 2),
+                "avg_visitors": round(avg_visitors, 2),
+            },
+            "average_member_attendance_rate": average_member_attendance_rate,
+            "total_offerings": queryset.aggregate(total=Sum("offerings"))["total"] or 0,
+            "gathering_type_distribution": list(
+                queryset.values("gathering_type").annotate(count=Count("id"))
+            ),
+            "chart_series": {
+                "monthly_attendance": monthly_attendance,
+                "cluster_comparison": cluster_comparison,
+            },
+        }
+
+        return Response(analytics_data)
+
+    @action(detail=False, methods=["get"])
+    def overdue(self, request):
+        """Get clusters with overdue reports for current week"""
+        # Get current year and week number
+        today = church_today()
+        current_year = today.year
+        current_week = today.isocalendar()[1]  # ISO week number
+
+        # Get clusters in scope for this user
+        all_clusters = clusters_for_overdue(request.user)
+
+        # Get clusters that have submitted for current week
+        submitted_cluster_ids = ClusterWeeklyReport.objects.filter(
+            year=current_year, week_number=current_week
+        ).values_list("cluster_id", flat=True)
+
+        # Clusters without submission
+        overdue_clusters = all_clusters.exclude(id__in=submitted_cluster_ids)
+
+        return Response(
+            {
+                "current_year": current_year,
+                "current_week": current_week,
+                "overdue_count": overdue_clusters.count(),
+                "overdue_clusters": ClusterSerializer(overdue_clusters, many=True).data,
+            }
+        )
+
+    def _check_compliance_access(self, user):
+        """Check if user has access to compliance features"""
+        if user.role in ["ADMIN", "PASTOR"]:
+            return True
+        if user.is_senior_coordinator(ModuleCoordinator.ModuleType.CLUSTER):
+            return True
+        return False
+
+    @action(detail=False, methods=["get"])
+    def compliance(self, request):
+        """
+        Get compliance data for all clusters.
+        Accessible to ADMIN, PASTOR, and Senior Coordinators only.
+        
+        Query params:
+        - start_date (YYYY-MM-DD): Start of compliance period (default: 4 weeks ago)
+        - end_date (YYYY-MM-DD): End of compliance period (default: today)
+        - branch_id: Filter by branch
+        - coordinator_id: Filter by coordinator
+        - status: Filter by compliance status (COMPLIANT, NON_COMPLIANT, PARTIAL)
+        - min_compliance_rate: Minimum compliance rate threshold (0-100)
+        """
+        # Check permissions
+        if not self._check_compliance_access(request.user):
+            return Response(
+                {"error": "You do not have permission to access compliance data."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        # Parse date range (default: last 4 weeks)
+        today = church_today()
+        start_date_str = request.query_params.get('start_date')
+        end_date_str = request.query_params.get('end_date')
+        
+        if start_date_str:
+            try:
+                start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
+            except ValueError:
+                return Response({"error": "Invalid start_date format. Use YYYY-MM-DD."}, status=400)
+        else:
+            start_date = today - timedelta(weeks=4)
+        
+        if end_date_str:
+            try:
+                end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
+            except ValueError:
+                return Response({"error": "Invalid end_date format. Use YYYY-MM-DD."}, status=400)
+        else:
+            end_date = today
+        
+        # Get clusters with filters
+        clusters = Cluster.objects.all()
+        
+        branch_id = request.query_params.get('branch_id')
+        if branch_id:
+            try:
+                clusters = clusters.filter(branch_id=int(branch_id))
+            except ValueError:
+                pass
+        
+        coordinator_id = request.query_params.get('coordinator_id')
+        if coordinator_id:
+            try:
+                clusters = clusters.filter(coordinator_id=int(coordinator_id))
+            except ValueError:
+                pass
+        
+        # Calculate compliance for each cluster
+        compliance_data = []
+        for cluster in clusters:
+            cluster_compliance = calculate_cluster_compliance(cluster, start_date, end_date)
+            
+            # Calculate trend (compare with previous period)
+            previous_start = start_date - timedelta(days=(end_date - start_date).days + 1)
+            previous_end = start_date - timedelta(days=1)
+            previous_compliance = calculate_cluster_compliance(cluster, previous_start, previous_end)
+            trend = calculate_trend(cluster_compliance, previous_compliance)
+            
+            # Get compliance notes for this period
+            notes = ClusterComplianceNote.objects.filter(
+                cluster=cluster,
+                period_start__lte=end_date,
+                period_end__gte=start_date
+            ).select_related('created_by').order_by('-created_at')
+            
+            compliance_data.append({
+                "cluster": cluster,
+                "status": cluster_compliance["status"],
+                "reports_submitted": cluster_compliance["reports_submitted"],
+                "reports_expected": cluster_compliance["reports_expected"],
+                "compliance_rate": cluster_compliance["compliance_rate"],
+                "missing_weeks": cluster_compliance["missing_weeks"],
+                "last_report_date": cluster_compliance["last_report_date"],
+                "days_since_last_report": cluster_compliance["days_since_last_report"],
+                "consecutive_missing_weeks": cluster_compliance["consecutive_missing_weeks"],
+                "trend": trend,
+                "compliance_notes": notes,
+            })
+        
+        # Apply status filter
+        status_filter = request.query_params.get('status')
+        if status_filter:
+            compliance_data = [d for d in compliance_data if d["status"] == status_filter]
+        
+        # Apply min compliance rate filter
+        min_rate = request.query_params.get('min_compliance_rate')
+        if min_rate:
+            try:
+                min_rate_float = float(min_rate)
+                compliance_data = [d for d in compliance_data if d["compliance_rate"] >= min_rate_float]
+            except ValueError:
+                pass
+        
+        # Calculate summary
+        total_clusters = len(compliance_data)
+        compliant_count = sum(1 for d in compliance_data if d["status"] == "COMPLIANT")
+        non_compliant_count = sum(1 for d in compliance_data if d["status"] == "NON_COMPLIANT")
+        partial_count = sum(1 for d in compliance_data if d["status"] == "PARTIAL")
+        
+        overall_compliance_rate = (
+            sum(d["compliance_rate"] for d in compliance_data) / total_clusters
+            if total_clusters > 0 else 0.0
+        )
+        
+        weeks_expected = len(get_weeks_in_range(start_date, end_date))
+        
+        summary = {
+            "total_clusters": total_clusters,
+            "compliant_clusters": compliant_count,
+            "non_compliant_clusters": non_compliant_count,
+            "partial_compliant_clusters": partial_count,
+            "compliance_rate": round(overall_compliance_rate, 2),
+            "period": {
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+                "weeks_expected": weeks_expected,
+            }
+        }
+        
+        # Group by status
+        by_status = {
+            "compliant": [d for d in compliance_data if d["status"] == "COMPLIANT"],
+            "non_compliant": [d for d in compliance_data if d["status"] == "NON_COMPLIANT"],
+            "partial": [d for d in compliance_data if d["status"] == "PARTIAL"],
+        }
+        
+        # Serialize data
+        serializer = ClusterComplianceSerializer(compliance_data, many=True)
+        
+        # Serialize by_status groups
+        compliant_serialized = ClusterComplianceSerializer(by_status["compliant"], many=True).data
+        non_compliant_serialized = ClusterComplianceSerializer(by_status["non_compliant"], many=True).data
+        partial_serialized = ClusterComplianceSerializer(by_status["partial"], many=True).data
+        
+        return Response({
+            "summary": summary,
+            "clusters": serializer.data,
+            "by_status": {
+                "compliant": compliant_serialized,
+                "non_compliant": non_compliant_serialized,
+                "partial": partial_serialized,
+            }
+        })
+
+    @action(detail=False, methods=["get"])
+    def at_risk(self, request):
+        """
+        Get clusters that are at risk of non-compliance.
+        Criteria:
+        - 2+ consecutive weeks without reports
+        - No reports in last 2-3 weeks
+        - Declining compliance trend
+        
+        Query params:
+        - weeks_back: Number of weeks to check (default: 4)
+        """
+        # Check permissions
+        if not self._check_compliance_access(request.user):
+            return Response(
+                {"error": "You do not have permission to access at-risk clusters data."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        weeks_back = int(request.query_params.get('weeks_back', 4))
+        today = church_today()
+        start_date = today - timedelta(weeks=weeks_back)
+        end_date = today
+        
+        # Get all clusters
+        clusters = Cluster.objects.all()
+        
+        at_risk_clusters = []
+        for cluster in clusters:
+            compliance = calculate_cluster_compliance(cluster, start_date, end_date)
+            
+            # Calculate trend
+            previous_start = start_date - timedelta(days=(end_date - start_date).days + 1)
+            previous_end = start_date - timedelta(days=1)
+            previous_compliance = calculate_cluster_compliance(cluster, previous_start, previous_end)
+            trend = calculate_trend(compliance, previous_compliance)
+            compliance["trend"] = trend
+            
+            # Check if at risk
+            is_risk, reason = is_at_risk(compliance, weeks_back)
+            if is_risk:
+                at_risk_clusters.append({
+                    "cluster": cluster,
+                    "compliance": compliance,
+                    "risk_reason": reason,
+                })
+        
+        # Serialize
+        result = []
+        for item in at_risk_clusters:
+            cluster_data = ClusterSerializer(item["cluster"]).data
+            compliance_data = ClusterComplianceSerializer([{
+                "cluster": item["cluster"],
+                **item["compliance"]
+            }], many=True).data[0]
+            
+            result.append({
+                "cluster": cluster_data,
+                "compliance": compliance_data,
+                "risk_reason": item["risk_reason"],
+            })
+        
+        return Response(result)
+
+    @action(detail=False, methods=["get"])
+    def compliance_history(self, request):
+        """
+        Get historical compliance data for trend analysis.
+        
+        Query params:
+        - months: Number of months to look back (default: 3)
+        - cluster_id: Specific cluster (optional)
+        - coordinator_id: Specific coordinator (optional)
+        - group_by: "week" | "month" (default: "week")
+        """
+        # Check permissions
+        if not self._check_compliance_access(request.user):
+            return Response(
+                {"error": "You do not have permission to access compliance history."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        months = int(request.query_params.get('months', 3))
+        group_by = request.query_params.get('group_by', 'week')
+        
+        today = church_today()
+        start_date = today - timedelta(days=months * 30)
+        end_date = today
+        
+        # Get clusters to analyze
+        clusters = Cluster.objects.all()
+        
+        cluster_id = request.query_params.get('cluster_id')
+        if cluster_id:
+            try:
+                clusters = clusters.filter(id=int(cluster_id))
+            except ValueError:
+                pass
+        
+        coordinator_id = request.query_params.get('coordinator_id')
+        if coordinator_id:
+            try:
+                clusters = clusters.filter(coordinator_id=int(coordinator_id))
+            except ValueError:
+                pass
+        
+        if group_by == 'week':
+            # Group by week
+            weeks = get_weeks_in_range(start_date, end_date)
+            history_data = []
+            
+            for year, week in weeks:
+                # Get week start and end dates
+                week_start = datetime.strptime(f"{year}-W{week:02d}-1", "%Y-W%W-%w").date()
+                week_end = week_start + timedelta(days=6)
+                
+                # Calculate compliance for this week
+                total_expected = clusters.count()
+                total_submitted = ClusterWeeklyReport.objects.filter(
+                    cluster__in=clusters,
+                    year=year,
+                    week_number=week,
+                    meeting_date__gte=week_start,
+                    meeting_date__lte=week_end
+                ).count()
+                
+                compliance_rate = (total_submitted / total_expected * 100) if total_expected > 0 else 0.0
+                
+                history_data.append({
+                    "period": f"{year}-W{week:02d}",
+                    "compliance_rate": round(compliance_rate, 2),
+                    "reports_expected": total_expected,
+                    "reports_submitted": total_submitted,
+                })
+        else:
+            # Group by month
+            history_data = []
+            current = start_date.replace(day=1)
+            
+            while current <= end_date:
+                month_start = current
+                if current.month == 12:
+                    month_end = current.replace(day=31)
+                    next_month = current.replace(year=current.year + 1, month=1, day=1)
+                else:
+                    next_month = current.replace(month=current.month + 1, day=1)
+                    month_end = next_month - timedelta(days=1)
+                
+                # Calculate compliance for this month
+                total_expected = clusters.count() * 4  # Approx 4 weeks per month
+                total_submitted = ClusterWeeklyReport.objects.filter(
+                    cluster__in=clusters,
+                    meeting_date__gte=month_start,
+                    meeting_date__lte=month_end
+                ).count()
+                
+                compliance_rate = (total_submitted / total_expected * 100) if total_expected > 0 else 0.0
+                
+                history_data.append({
+                    "period": f"{current.year}-{current.month:02d}",
+                    "compliance_rate": round(compliance_rate, 2),
+                    "reports_expected": total_expected,
+                    "reports_submitted": total_submitted,
+                })
+                
+                current = next_month
+        
+        return Response({
+            "data": history_data,
+            "group_by": group_by,
+            "period_start": start_date.isoformat(),
+            "period_end": end_date.isoformat(),
+        })
+
+    @action(detail=False, methods=["post"])
+    def add_compliance_note(self, request):
+        """
+        Add a compliance note for a cluster.
+        Required fields: cluster_id, note, period_start, period_end
+        """
+        # Check permissions
+        if not self._check_compliance_access(request.user):
+            return Response(
+                {"error": "You do not have permission to add compliance notes."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        cluster_id = request.data.get('cluster_id')
+        note_text = request.data.get('note')
+        period_start_str = request.data.get('period_start')
+        period_end_str = request.data.get('period_end')
+        
+        if not all([cluster_id, note_text, period_start_str, period_end_str]):
+            return Response(
+                {"error": "Missing required fields: cluster_id, note, period_start, period_end"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            cluster = Cluster.objects.get(id=cluster_id)
+            period_start = datetime.strptime(period_start_str, '%Y-%m-%d').date()
+            period_end = datetime.strptime(period_end_str, '%Y-%m-%d').date()
+        except (Cluster.DoesNotExist, ValueError) as e:
+            return Response(
+                {"error": f"Invalid data: {str(e)}"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        compliance_note = ClusterComplianceNote.objects.create(
+            cluster=cluster,
+            note=note_text,
+            period_start=period_start,
+            period_end=period_end,
+            created_by=request.user
+        )
+        
+        serializer = ClusterComplianceNoteSerializer(compliance_note)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=["get"])
+    def compliance_notes(self, request):
+        """
+        Get compliance notes for clusters.
+        Query params:
+        - cluster_id: Filter by specific cluster
+        - start_date: Notes for periods starting after this date
+        - end_date: Notes for periods ending before this date
+        """
+        # Check permissions
+        if not self._check_compliance_access(request.user):
+            return Response(
+                {"error": "You do not have permission to view compliance notes."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        notes = ClusterComplianceNote.objects.all().select_related('cluster', 'created_by')
+        
+        cluster_id = request.query_params.get('cluster_id')
+        if cluster_id:
+            try:
+                notes = notes.filter(cluster_id=int(cluster_id))
+            except ValueError:
+                pass
+        
+        start_date_str = request.query_params.get('start_date')
+        if start_date_str:
+            try:
+                start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
+                notes = notes.filter(period_start__gte=start_date)
+            except ValueError:
+                pass
+        
+        end_date_str = request.query_params.get('end_date')
+        if end_date_str:
+            try:
+                end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
+                notes = notes.filter(period_end__lte=end_date)
+            except ValueError:
+                pass
+        
+        serializer = ClusterComplianceNoteSerializer(notes, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=["get"])
+    def compliance_export_csv(self, request):
+        """Export compliance data as CSV"""
+        # Check permissions
+        if not self._check_compliance_access(request.user):
+            return Response(
+                {"error": "You do not have permission to export compliance data."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        # Get compliance data (reuse compliance endpoint logic)
+        response = self.compliance(request)
+        if response.status_code != 200:
+            return response
+        
+        compliance_data = response.data
+        
+        # Create CSV
+        output = io.StringIO()
+        writer = csv.writer(output)
+        
+        # Write header
+        writer.writerow([
+            'Cluster Code', 'Cluster Name', 'Coordinator', 'Status',
+            'Reports Submitted', 'Reports Expected', 'Compliance Rate (%)',
+            'Missing Weeks', 'Last Report Date', 'Days Since Last Report',
+            'Consecutive Missing Weeks', 'Trend'
+        ])
+        
+        # Write data
+        for cluster_data in compliance_data['clusters']:
+            cluster = cluster_data['cluster']
+            writer.writerow([
+                cluster.get('code', ''),
+                cluster.get('name', ''),
+                f"{cluster.get('coordinator', {}).get('first_name', '')} {cluster.get('coordinator', {}).get('last_name', '')}".strip() if cluster.get('coordinator') else '',
+                cluster_data['status'],
+                cluster_data['reports_submitted'],
+                cluster_data['reports_expected'],
+                cluster_data['compliance_rate'],
+                ', '.join(map(str, cluster_data['missing_weeks'])),
+                cluster_data['last_report_date'] or '',
+                cluster_data['days_since_last_report'] or '',
+                cluster_data['consecutive_missing_weeks'],
+                cluster_data['trend'] or '',
+            ])
+        
+        # Create HTTP response
+        response = HttpResponse(output.getvalue(), content_type='text/csv')
+        response['Content-Disposition'] = 'attachment; filename="cluster_compliance.csv"'
+        return response
+
+    @action(detail=False, methods=["get"])
+    def compliance_export_pdf(self, request):
+        """Export compliance data as PDF"""
+        # Check permissions
+        if not self._check_compliance_access(request.user):
+            return Response(
+                {"error": "You do not have permission to export compliance data."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        # For now, return CSV (PDF generation can be added later with reportlab/weasyprint)
+        # This is a placeholder - you may want to implement proper PDF generation
+        return Response(
+            {"error": "PDF export not yet implemented. Use CSV export instead."},
+            status=status.HTTP_501_NOT_IMPLEMENTED
+        )
+

@@ -1,0 +1,614 @@
+from datetime import date
+from typing import Optional
+
+from django.utils import dateparse, timezone
+from rest_framework import serializers
+from rest_framework.exceptions import ValidationError
+
+from apps.attendance.serializers import AttendanceRecordSerializer
+from .models import AttendanceVenue, Event, EventRoom, EventType, EventSetting
+from .permissions import NATIONAL_EVENT_TYPE_CODES, can_manage_national_events
+from .services.conflicts import (
+    validate_room_booking,
+    validate_sunday_service_uniqueness,
+)
+from .services.recurrence import (
+    RecurrencePatternError,
+    clean_recurrence_pattern,
+    generate_occurrences,
+)
+
+import re
+
+EVENT_TYPE_CODE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_/]*$")
+ATTENDANCE_VENUE_CODE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+
+class EventTypeSerializer(serializers.ModelSerializer):
+    event_count = serializers.IntegerField(read_only=True, default=0)
+
+    class Meta:
+        model = EventType
+        fields = [
+            "code",
+            "label",
+            "color",
+            "sort_order",
+            "is_system",
+            "counts_as_activity",
+            "event_count",
+        ]
+        read_only_fields = ["is_system", "counts_as_activity", "event_count"]
+
+    def validate_code(self, value):
+        if not EVENT_TYPE_CODE_PATTERN.match(value):
+            raise ValidationError(
+                "Code must start with a letter and contain only uppercase letters, numbers, underscores, or slashes."
+            )
+        if self.instance and value != self.instance.code:
+            raise ValidationError("Event type code cannot be changed.")
+        return value
+
+    def validate_color(self, value):
+        normalized = value.strip().upper()
+        if not re.fullmatch(r"#[0-9A-F]{6}", normalized):
+            raise ValidationError("Color must be a hex value like #RRGGBB.")
+        return normalized
+
+    def validate(self, attrs):
+        if self.instance:
+            attrs.pop("code", None)
+        return super().validate(attrs)
+
+
+class AttendanceVenueSerializer(serializers.ModelSerializer):
+    attendance_count = serializers.IntegerField(read_only=True, default=0)
+
+    class Meta:
+        model = AttendanceVenue
+        fields = [
+            "code",
+            "label",
+            "color",
+            "sort_order",
+            "is_active",
+            "is_system",
+            "attendance_count",
+        ]
+        read_only_fields = ["is_system", "attendance_count"]
+
+    def validate_code(self, value):
+        normalized = value.strip().upper()
+        if not ATTENDANCE_VENUE_CODE_PATTERN.match(normalized):
+            raise ValidationError(
+                "Code must start with a letter and contain only uppercase letters, numbers, or underscores."
+            )
+        if self.instance and normalized != self.instance.code:
+            raise ValidationError("Attendance venue code cannot be changed.")
+        return normalized
+
+    def validate_color(self, value):
+        normalized = value.strip().upper()
+        if not re.fullmatch(r"#[0-9A-F]{6}", normalized):
+            raise ValidationError("Color must be a hex value like #RRGGBB.")
+        return normalized
+
+    def validate_label(self, value):
+        label = (value or "").strip()
+        if not label:
+            raise ValidationError("Label is required.")
+        return label
+
+    def validate(self, attrs):
+        if self.instance:
+            attrs.pop("code", None)
+        return super().validate(attrs)
+
+
+class EventRoomSerializer(serializers.ModelSerializer):
+    branch_name = serializers.CharField(
+        source="branch.name", read_only=True, allow_null=True
+    )
+    event_count = serializers.IntegerField(read_only=True, default=0)
+
+    class Meta:
+        model = EventRoom
+        fields = [
+            "id",
+            "branch",
+            "branch_name",
+            "name",
+            "capacity",
+            "notes",
+            "is_active",
+            "sort_order",
+            "event_count",
+        ]
+
+    def validate_name(self, value):
+        cleaned = (value or "").strip()
+        if not cleaned:
+            raise ValidationError("Name is required.")
+        return cleaned
+
+    def validate(self, attrs):
+        instance = getattr(self, "instance", None)
+        name = attrs.get("name") or getattr(instance, "name", None)
+        branch = attrs.get("branch") if "branch" in attrs else getattr(
+            instance, "branch", None
+        )
+        request = self.context.get("request") if self.context else None
+        user = getattr(request, "user", None) if request else None
+
+        if user and user.is_authenticated and not user.can_see_all_branches():
+            if not user.branch_id:
+                raise ValidationError(
+                    {"branch": "Your account has no branch assigned."}
+                )
+            if branch is None:
+                branch = user.branch
+                attrs["branch"] = branch
+            elif getattr(branch, "pk", branch) != user.branch_id:
+                raise ValidationError(
+                    {"branch": "You can only manage rooms for your own branch."}
+                )
+
+        if not branch:
+            raise ValidationError({"branch": "Branch is required."})
+
+        if name:
+            qs = EventRoom.objects.filter(branch=branch, name__iexact=name)
+            if instance:
+                qs = qs.exclude(pk=instance.pk)
+            if qs.exists():
+                raise ValidationError(
+                    {"name": "A room with this name already exists in this branch."}
+                )
+        return super().validate(attrs)
+
+
+class EventSerializer(serializers.ModelSerializer):
+    type = serializers.SlugRelatedField(
+        slug_field="code",
+        queryset=EventType.objects.all(),
+        source="event_type",
+    )
+    type_display = serializers.CharField(source="event_type.label", read_only=True)
+    location = serializers.CharField(allow_blank=True, required=False)
+    room = serializers.PrimaryKeyRelatedField(
+        queryset=EventRoom.objects.all(),
+        allow_null=True,
+        required=False,
+    )
+    room_name = serializers.CharField(
+        source="room.name", read_only=True, allow_null=True
+    )
+    branch_name = serializers.CharField(
+        source="branch.name", read_only=True, allow_null=True
+    )
+    branch_is_headquarters = serializers.BooleanField(
+        source="branch.is_headquarters",
+        read_only=True,
+        allow_null=True,
+    )
+    occurrences = serializers.SerializerMethodField()
+    next_occurrence = serializers.SerializerMethodField()
+    attendance_count = serializers.SerializerMethodField()
+    attendance_records = serializers.SerializerMethodField()
+    attendee_badges = serializers.SerializerMethodField()
+    created_by_name = serializers.SerializerMethodField()
+    updated_by_name = serializers.SerializerMethodField()
+    reviewed_by_name = serializers.SerializerMethodField()
+    tardy_grace_minutes = serializers.IntegerField(min_value=0, required=False)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        request = self.context.get("request") if self.context else None
+        user = getattr(request, "user", None)
+        if (
+            user
+            and user.is_authenticated
+            and not user.can_see_all_branches()
+            and user.branch_id
+        ):
+            self.fields["room"].queryset = EventRoom.objects.filter(
+                branch_id=user.branch_id
+            )
+
+    class Meta:
+        model = Event
+        fields = [
+            "id",
+            "title",
+            "description",
+            "start_date",
+            "end_date",
+            "type",
+            "type_display",
+            "location",
+            "room",
+            "room_name",
+            "branch",
+            "branch_name",
+            "branch_is_headquarters",
+            "is_recurring",
+            "recurrence_pattern",
+            "booking_status",
+            "reviewed_by",
+            "reviewed_by_name",
+            "reviewed_at",
+            "review_note",
+            "expected_include_active",
+            "expected_include_semiactive",
+            "expected_include_inactive",
+            "expected_include_ongoing_visitors",
+            "track_expected_attendees",
+            "allow_cross_branch_attendance",
+            "tardy_grace_minutes",
+            "self_checkin_enabled",
+            "attendance_format",
+            "registration_enabled",
+            "onsite_registration_required",
+            "online_registration_required",
+            "onsite_capacity",
+            "online_capacity",
+            "occurrences",
+            "next_occurrence",
+            "attendee_badges",
+            "attendance_count",
+            "attendance_records",
+            "created_by",
+            "created_by_name",
+            "created_at",
+            "updated_by",
+            "updated_by_name",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "attendee_badges",
+            "attendance_count",
+            "attendance_records",
+            "created_by",
+            "created_by_name",
+            "created_at",
+            "updated_by",
+            "updated_by_name",
+            "updated_at",
+            "booking_status",
+            "reviewed_by",
+            "reviewed_by_name",
+            "reviewed_at",
+            "review_note",
+        ]
+
+    def get_created_by_name(self, obj):
+        if not obj.created_by:
+            return None
+        return obj.created_by.get_full_name() or obj.created_by.username
+
+    def get_updated_by_name(self, obj):
+        if not obj.updated_by:
+            return None
+        return obj.updated_by.get_full_name() or obj.updated_by.username
+
+    def get_reviewed_by_name(self, obj):
+        if not obj.reviewed_by:
+            return None
+        return obj.reviewed_by.get_full_name() or obj.reviewed_by.username
+
+    def _parse_dt(self, value: Optional[str]):
+        if not value:
+            return None
+        parsed = dateparse.parse_datetime(value)
+        if not parsed:
+            return None
+        if timezone.is_naive(parsed):
+            parsed = timezone.make_aware(parsed, timezone.get_current_timezone())
+        return parsed
+
+    def _get_occurrence_payload(self, obj):
+        cached = getattr(obj, "_occurrence_cache", None)
+        if cached is not None:
+            return cached
+
+        request = self.context.get("request") if self.context else None
+        start_param = request.query_params.get("start") if request else None
+        end_param = request.query_params.get("end") if request else None
+
+        start_dt = self._parse_dt(start_param)
+        end_dt = self._parse_dt(end_param)
+
+        pattern = {}
+        if obj.is_recurring:
+            try:
+                pattern = clean_recurrence_pattern(
+                    obj.recurrence_pattern, obj.start_date
+                )
+            except RecurrencePatternError:
+                pattern = obj.recurrence_pattern or {}
+
+        occurrences = generate_occurrences(obj, pattern, start_dt, end_dt)
+        payload = [occ.as_dict() for occ in occurrences]
+        obj._occurrence_cache = payload
+        return payload
+
+    def get_occurrences(self, obj):
+        return self._get_occurrence_payload(obj)
+
+    def get_next_occurrence(self, obj):
+        occurrences = self._get_occurrence_payload(obj)
+        if not occurrences:
+            return None
+
+        now = timezone.now()
+        for occurrence in occurrences:
+            start_value = self._parse_dt(occurrence.get("start_date"))
+            if start_value and start_value >= now:
+                return occurrence
+        return occurrences[0]
+
+    def validate(self, attrs):
+        instance = getattr(self, "instance", None)
+
+        start_date = attrs.get("start_date") or getattr(instance, "start_date", None)
+        end_date = attrs.get("end_date") or getattr(instance, "end_date", None)
+        if start_date and end_date and end_date <= start_date:
+            raise ValidationError({"end_date": "End date must be after start date."})
+
+        raw_pattern = attrs.get("recurrence_pattern")
+        is_recurring = attrs.get(
+            "is_recurring",
+            getattr(instance, "is_recurring", False),
+        )
+        if raw_pattern and not is_recurring:
+            is_recurring = True
+            attrs["is_recurring"] = True
+
+        if is_recurring:
+            if not start_date or not end_date:
+                raise ValidationError(
+                    "Recurring events require both start_date and end_date."
+                )
+            try:
+                cleaned_pattern = clean_recurrence_pattern(raw_pattern, start_date)
+            except RecurrencePatternError as exc:
+                raise ValidationError({"recurrence_pattern": str(exc)})
+            attrs["recurrence_pattern"] = cleaned_pattern
+        else:
+            attrs["recurrence_pattern"] = None
+
+        room = attrs["room"] if "room" in attrs else getattr(instance, "room", None)
+        branch = attrs["branch"] if "branch" in attrs else getattr(
+            instance, "branch", None
+        )
+        location = attrs["location"] if "location" in attrs else getattr(
+            instance, "location", ""
+        )
+        event_type = attrs.get("event_type", getattr(instance, "event_type", None))
+        event_type_code = getattr(event_type, "pk", None) if event_type else None
+        request = (self.context or {}).get("request")
+        user = getattr(request, "user", None) if request else None
+        is_national_type = event_type_code in NATIONAL_EVENT_TYPE_CODES
+
+        if is_national_type and not can_manage_national_events(user):
+            raise ValidationError(
+                {
+                    "type": (
+                        "Only HQ Events coordinators and above can manage AWTA events."
+                    )
+                }
+            )
+
+        if branch is None:
+            if not is_national_type:
+                raise ValidationError(
+                    {
+                        "branch": (
+                            "Branch is required. Church-wide is only available for AWTA."
+                        )
+                    }
+                )
+            if not can_manage_national_events(user):
+                raise ValidationError(
+                    {
+                        "branch": (
+                            "Only HQ Events coordinators and above can create "
+                            "church-wide events."
+                        )
+                    }
+                )
+            if room is not None:
+                raise ValidationError(
+                    {
+                        "room": (
+                            "Church-wide events must use Other / off-site with a "
+                            "dedicated venue location."
+                        )
+                    }
+                )
+            attrs["allow_cross_branch_attendance"] = False
+
+        if event_type is not None and not getattr(
+            event_type, "counts_as_activity", True
+        ):
+            if room is None:
+                raise ValidationError(
+                    {
+                        "room": (
+                            "Meeting events must use a room in the church building."
+                        )
+                    }
+                )
+
+        self_checkin_enabled = attrs.get(
+            "self_checkin_enabled",
+            getattr(instance, "self_checkin_enabled", False),
+        )
+        attendance_format = attrs.get(
+            "attendance_format",
+            getattr(instance, "attendance_format", Event.AttendanceFormat.HYBRID),
+        )
+        if self_checkin_enabled and event_type is not None and not getattr(
+            event_type, "counts_as_activity", True
+        ):
+            raise ValidationError(
+                {
+                    "self_checkin_enabled": (
+                        "Self-check-in is not available for Meeting room holds."
+                    )
+                }
+            )
+        elif (
+            instance is None
+            and "self_checkin_enabled"
+            not in getattr(self, "initial_data", {})
+            and event_type is not None
+            and getattr(event_type, "pk", None) == "SUNDAY_SERVICE"
+        ):
+            attrs["self_checkin_enabled"] = True
+            self_checkin_enabled = True
+
+        if (
+            self_checkin_enabled
+            and attendance_format == Event.AttendanceFormat.ONSITE_ONLY
+        ):
+            raise ValidationError(
+                {
+                    "self_checkin_enabled": (
+                        "Self-check-in cannot be enabled for onsite-only events."
+                    )
+                }
+            )
+
+        if room is not None:
+            room_branch_id = room.branch_id
+            selected_branch_id = getattr(branch, "pk", branch) if branch else None
+            if selected_branch_id is not None and room_branch_id != selected_branch_id:
+                raise ValidationError(
+                    {"room": "Room must belong to the selected branch."}
+                )
+            attrs["branch"] = room.branch
+            attrs["location"] = room.name
+        else:
+            location_text = (location or "").strip()
+            if not location_text:
+                raise ValidationError(
+                    {
+                        "location": "Location is required when no room is selected."
+                    }
+                )
+            attrs["location"] = location_text
+            if "branch" in attrs or instance is None:
+                attrs["branch"] = branch
+        context = self.context or {}
+        ignore_dates = context.get("schedule_ignore_dates")
+        conflict_kwargs = dict(
+            start=start_date,
+            end=end_date,
+            is_recurring=is_recurring,
+            recurrence_pattern=attrs.get("recurrence_pattern"),
+            exclude_event_id=getattr(instance, "pk", None),
+            ignore_event_id=context.get("schedule_ignore_event_id"),
+            ignore_dates=set(ignore_dates) if ignore_dates else None,
+            ignore_dates_gte=context.get("schedule_ignore_dates_gte"),
+        )
+        validate_sunday_service_uniqueness(
+            event_type=event_type,
+            branch=attrs.get("branch"),
+            **conflict_kwargs,
+        )
+        validate_room_booking(
+            room=attrs.get("room") if "room" in attrs else getattr(
+                instance, "room", None
+            ),
+            **conflict_kwargs,
+        )
+
+        return super().validate(attrs)
+
+    def _should_include_attendance_records(self) -> bool:
+        request = self.context.get("request") if self.context else None
+        if not request:
+            return True
+        flag = request.query_params.get("include_attendance", "")
+        return flag.lower() in {"1", "true", "yes", "on"}
+
+    def _filter_attendance_queryset(self, obj):
+        queryset = obj.attendance_records.all()
+        request = self.context.get("request") if self.context else None
+        if not request:
+            return queryset
+
+        occurrence_date = request.query_params.get("attendance_date")
+        if occurrence_date:
+            try:
+                target_date = date.fromisoformat(occurrence_date)
+                queryset = queryset.filter(occurrence_date=target_date)
+            except ValueError:
+                # Invalid date filters yield empty results
+                queryset = queryset.none()
+        return queryset
+
+    def get_attendance_count(self, obj):
+        return self._filter_attendance_queryset(obj).count()
+
+    def get_attendance_records(self, obj):
+        queryset = self._filter_attendance_queryset(obj)
+        if not self._should_include_attendance_records():
+            return []
+        serializer = AttendanceRecordSerializer(
+            queryset, many=True, context=self.context
+        )
+        return serializer.data
+
+    def get_attendee_badges(self, obj):
+        queryset = self._filter_attendance_queryset(obj)
+        badges = []
+        for record in queryset.select_related("person"):
+            person = record.person
+            cluster_code = (
+                person.clusters.values_list("code", flat=True)
+                .exclude(code__isnull=True)
+                .exclude(code__exact="")
+                .first()
+            )
+            family_name = person.families.values_list("name", flat=True).first()
+            badges.append(
+                {
+                    "id": str(person.pk),
+                    "full_name": " ".join(
+                        filter(
+                            None,
+                            [
+                                person.first_name,
+                                person.middle_name,
+                                person.last_name,
+                                person.suffix,
+                            ],
+                        )
+                    ),
+                    "cluster_code": cluster_code,
+                    "family_name": family_name,
+                }
+            )
+        return badges
+
+
+class EventSettingSerializer(serializers.ModelSerializer):
+    updated_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = EventSetting
+        fields = [
+            "id",
+            "member_self_checkin_enabled",
+            "updated_at",
+            "updated_by",
+            "updated_by_name",
+        ]
+        read_only_fields = ["id", "updated_at", "updated_by", "updated_by_name"]
+
+    def get_updated_by_name(self, obj):
+        if not obj.updated_by:
+            return None
+        return obj.updated_by.get_full_name() or obj.updated_by.username

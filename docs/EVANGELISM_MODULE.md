@@ -1,0 +1,999 @@
+# Evangelism Module Guide
+
+## Overview
+
+The Evangelism module manages Bible Study/Evangelism groups, tracks visitor progress through a conversion pipeline, implements the "Each 1 Reach 1" program (where each member should convert one person per year), and provides comprehensive reporting on conversions, drop-offs, and follow-up workflows. The module integrates closely with the Clusters module for cluster-based tracking and goal management.
+
+Key features include:
+
+- **Group Management**: Create/manage Bible Study groups with leaders, members, and optional cluster affiliation
+- **Session Scheduling**: Schedule one-time or recurring Bible study sessions with automatic event creation
+- **Reports**: Submit evangelism reports (one per meeting date) and aggregate them with cluster weekly reports for unified weekly tallies
+- **Visitor Pipeline**: Track visitors through stages (UI focuses on INVITED → ATTENDED; nurture/baptism continues on Person)
+- **Prospect Tracking**: Track invited visitors separately until they attend; creating a Person happens on ATTENDED
+- **Person progress**: Group-scoped form updates contact, photo, and baptism/invite milestones on Person (Conversion create/update is deprecated)
+- **Follow-up Workflow**: Create and assign follow-up tasks, track completion, auto-generate tasks for inactive visitors
+- **Drop-off Detection & Tracking**: Automatic detection based on inactivity period, track drop-off stage and reason, recovery tracking
+- **Conversion Recording**: Deprecated product writes; record baptism/HG on Person (evangelism progress form or People). Historical Conversion rows remain until a later migration.
+- **Each 1 Reach 1 Goals**: Cluster-based goal tracking with automatic progress updates
+- **Monthly Conversion Tracking**: Track unique persons per month at each stage (INVITED, ATTENDED, BAPTIZED, RECEIVED_HG, CONVERTED)
+- **Reporting**: People tally (Invited, Attended, NCC, Baptized, Received HG, Reached, Unique HC) by cluster or by month, and weekly unified tallies
+
+## Data Model & Storage
+
+### EvangelismGroup Model
+
+- `apps.evangelism.models.EvangelismGroup` represents a Bible Study/Evangelism group with:
+  - `name` (string, max 200 chars) – group name (e.g., "North Bible Study")
+  - `description` (text field, blank) – group description
+  - `coordinator` (ForeignKey to `people.Person`, nullable) – group coordinator
+  - `cluster` (ForeignKey to `clusters.Cluster`, nullable) – associated cluster (if any)
+  - `location` (string, max 200 chars, blank) – meeting location
+  - `meeting_time` (TimeField, nullable) – regular meeting time
+  - `meeting_day` (CharField, choices: MONDAY-SUNDAY, blank) – day of week
+  - `meeting_frequency` (CharField, choices: WEEKLY, BIWEEKLY, MONTHLY, IRREGULAR, default WEEKLY) – how often the group meets; drives report due reminders
+  - `approval_status` (`pending` | `approved` | `rejected`, default `approved`) – coordinator-created groups start pending until an Evangelism Senior Coordinator, Pastor, or Admin approves
+  - `created_by` (nullable FK) – who submitted the group
+  - `reviewed_by`, `reviewed_at`, `review_note` – approval decision
+  - `is_active` (BooleanField, default True) – whether the group is active
+  - `is_bible_sharers_group` (BooleanField, default False) – unused for coverage; kept for compatibility. Bible Sharers are **people** with an `EVANGELISM` + `BIBLE_SHARER` assignment.
+  - `members` (ManyToManyField to `people.Person`, blank) – people enrolled in the group; reverse accessor on Person is `person.evangelism_groups`
+  - `created_at`, `updated_at` (DateTimeFields)
+- **Event Type Logic**: When sessions are created, event type is:
+  - `CLUSTER_BS_EVANGELISM` if `cluster` is not null
+  - `BIBLE_STUDY` if `cluster` is null
+- **Bible Sharers**: People assigned as Bible Sharers on one or more evangelism groups. They can facilitate studies and submit reports for those groups. Coverage monitoring counts unique assigned people per cluster (not a group flag). Ideally each cluster should have at least one Bible Sharer. The Evangelism **Bible Sharers** tab is a people directory (HQ roster, group assignments, grant-only) plus that cluster coverage.
+  - **HQ roster**: Headquarters evangelism groups may only assign Bible Sharers who are on the system-managed **Bible Sharers** ministry (`code=BIBLE_SHARERS`, HQ branch). Add people under Ministries first. Inactive roster members remain selectable. Groups whose cluster is not on the headquarters branch keep the previous rule (any group member).
+  - **Two-layer access**: **Grant Evangelism access** on the HQ roster (default on) creates a module-wide `BIBLE_SHARER` assignment (`resource_id` empty). That grant is **read-only** (open Evangelism; no group edits; no reports). Adding or editing reports still requires a **group-scoped** Bible Sharer (or Coordinator / Reporter) assignment. Unchecking the grant or marking the roster row inactive deletes only the module-wide row; group assignments stay. Being enrolled as a group member without a Bible Sharer / Reporter / Coordinator role does not allow reports.
+- **Evangelism Reporters**: Members who can submit reports for assigned groups without managing the group. Coordinator on a group replaces Bible Sharer and Reporter for that person.
+
+### Evangelism group membership (`members`)
+
+- `EvangelismGroup.members` is a **ManyToManyField** to `people.Person` (`related_name="evangelism_groups"` on `Person`), mirroring `Cluster.members`: a person may belong to **multiple** evangelism groups at once.
+- Enrollment is managed via the **group** API: include `members` as a list of Person primary keys on `POST/PATCH/PUT` to `EvangelismGroup`, or use `POST /api/evangelism/groups/{id}/enroll/` with `{ "person_ids": [1, 2, 3] }` to add people without replacing the full list.
+- Writers exclude `ADMIN` and `VISITOR` Persons from the queryset (same rule as before for enroll).
+
+### EvangelismSession Model
+
+- `apps.evangelism.models.EvangelismSession` represents a group session with:
+  - `evangelism_group` (ForeignKey to EvangelismGroup, CASCADE delete) – the group this session is for
+  - `event` (OneToOneField to `events.Event`, SET_NULL, nullable) – linked calendar event for attendance tracking
+  - `session_date` (DateField) – date of the session
+  - `session_time` (TimeField, nullable) – time of the session
+  - `topic` (string, max 200 chars, blank) – Bible study topic
+  - `notes` (text field, blank) – additional session notes
+  - `is_recurring_instance` (BooleanField, default False) – whether this session was created as part of a recurring series
+  - `recurring_group_id` (string, max 100 chars, blank) – identifier for grouping recurring sessions
+  - `created_at`, `updated_at` (DateTimeFields)
+- Default ordering: by `-session_date`, then `-session_time`
+- **Event Integration**: When a session is created, it automatically creates a corresponding `Event`:
+  - Type: `CLUSTER_BS_EVANGELISM` if `evangelism_group.cluster` exists
+  - Type: `BIBLE_STUDY` if `evangelism_group.cluster` is null
+
+### EvangelismWeeklyReport Model
+
+- `apps.evangelism.models.EvangelismWeeklyReport` tracks group meeting reports with:
+  - `evangelism_group` (ForeignKey to EvangelismGroup, CASCADE delete) – the group this report is for
+  - `year` (IntegerField) – ISO year derived from `meeting_date` (tally/filter bucket)
+  - `week_number` (IntegerField) – ISO week number (1-53) derived from `meeting_date`
+  - `meeting_date` (DateField) – actual date the meeting was held (unique with group)
+  - `members_attended` (ManyToMany to `people.Person`, filtered to role="MEMBER") – members who attended
+  - `visitors_attended` (ManyToMany to `people.Person`, filtered to role="VISITOR") – visitors who attended
+  - `prospects_invited` (ManyToMany to `evangelism.Prospect`, blank, `related_name="evangelism_reports_invited_to"`) – invited visitors recorded on this report who have **not** attended yet (no Person required)
+  - `gathering_type` (CharField, choices: PHYSICAL, ONLINE, HYBRID) – how the meeting was conducted
+  - `topic` (string, max 200 chars, blank) – Bible study topic
+  - `activities_held` (TextField, blank) – activities/events during the meeting
+  - `prayer_requests` (TextField, blank) – prayer requests shared
+  - `testimonies` (TextField, blank) – testimonies shared
+  - `new_prospects` (IntegerField, default 0) – derived count of `prospects_invited` (kept for tally `SUM`; not user-editable)
+  - `conversions_this_week` (IntegerField, default 0) – legacy field (UI always submits 0)
+  - `notes` (TextField, blank) – additional notes
+  - `submitted_by` (ForeignKey to `people.Person`, nullable) – person who submitted the report
+  - `submitted_at` (DateTimeField, auto_now_add) – when the report was submitted
+  - `updated_at` (DateTimeField, auto_now) – when the report was last updated
+- Default ordering: by `-year`, then `-week_number`
+- Unique constraint: `(evangelism_group, meeting_date)` – one report per meeting date; two meetings in the same ISO week with different dates are allowed
+- Serializer always overwrites `year` / `week_number` from `meeting_date`; a duplicate date returns **409** (`duplicate_meeting_report`)
+- **Report Submission Notes**:
+  - Visitors selected from prospects (`prospect:{id}`) are marked as ATTENDED via client `markAttended` before the report is saved
+  - The report stores Person IDs for attendees and Prospect IDs for `prospects_invited`
+  - Form helper copy lives on the UI only (not Django `help_text`)
+
+### Prospect Model
+
+- `apps.evangelism.models.Prospect` represents a visitor/prospect being evangelized with:
+  - `first_name`, `last_name` (CharFields, max 150) – required name parts (aligned with `Person`)
+  - `middle_name`, `suffix` (CharFields, max 150, blank) – optional name parts
+  - `gender` (CharField, choices: MALE, FEMALE, blank) – optional; matches `Person`
+  - `contact_info` (string, max 200 chars, blank) – phone/email
+  - `invited_by` (ForeignKey to `people.Person`) – member who invited them
+  - `inviter_cluster` (ForeignKey to `clusters.Cluster`, nullable) – cluster this visitor was recorded against (cluster weekly report). **Not** copied from the inviter’s cluster membership
+  - `evangelism_group` (ForeignKey to EvangelismGroup, nullable) – associated bible study group
+  - `endorsed_cluster` (ForeignKey to `clusters.Cluster`, nullable) – cluster this visitor is endorsed to (if different from inviter's cluster; UI no longer exposes endorse)
+  - `person` (ForeignKey to `people.Person`, nullable) – linked Person record (created when they first attend, or linked if already exists as VISITOR)
+  - `pipeline_stage` (CharField, choices: INVITED, ATTENDED, BAPTIZED, RECEIVED_HG, CONVERTED) – current stage in pipeline
+  - `date_first_invited` (DateField, nullable) – date they were first invited (UI defaults to today when creating)
+  - `last_activity_date` (DateField, nullable) – last date of any activity (attendance, contact, etc.)
+  - `is_attending_cluster` (BooleanField, default False) – whether visitor is attending a cluster
+  - `is_dropped_off` (BooleanField, default False) – whether visitor has dropped off
+  - `drop_off_date` (DateField, nullable) – when they dropped off
+  - `drop_off_stage` (CharField, choices: same as pipeline_stage, nullable) – stage where they dropped off
+  - `drop_off_reason` (TextField, blank) – reason for drop-off if known
+  - `has_finished_lessons` (BooleanField, default False) – whether they completed required lessons
+  - `commitment_form_signed` (BooleanField, default False) – whether commitment form was signed
+  - `notes` (TextField, blank) – invitation / follow-up notes (see Journey note behavior below)
+  - `facebook_name` (string, max 200 chars, blank) – optional Facebook name
+  - `created_at`, `updated_at` (DateTimeFields)
+  - Read-only `display_name` (property) – concatenated name for lists and reports
+- Default ordering: by `-last_activity_date`, then `last_name`, `first_name`
+- **Person Creation Logic**:
+  - Invited visitors use structured name fields before a `Person` exists
+  - Prospects represent invited visitors only
+  - When prospect first attends: auto-create Person record (or link if Person with VISITOR role exists) using name, gender, facebook, and `date_first_invited` where applicable
+  - Set `Person.inviter = prospect.invited_by` when Person is created
+  - Auto-update `last_activity_date` on attendance or status change
+  - Cluster weekly reports force `inviter_cluster` to the **report’s cluster**. Direct Prospect API create (`POST /api/evangelism/prospects/`, including evangelism-group invited visitors) does **not** copy the inviter’s cluster
+  - If prospect has `facebook_name` and Person does not, Person is updated
+  - Prospect `notes`: when a linked `Person` is created or when an existing visitor is marked attended without a prior sync, notes are written to a Journey `NOTE` titled **Invitation note** dated `date_first_invited` (or today if unset)
+- **Cluster weekly report integration**:
+  - Prospects may be created nested on `POST/PATCH /api/clusters/cluster-weekly-reports/` via `new_prospects` (report permissions; no EVANGELISM write required)
+  - Soft dedupe (`find_duplicate_invited_prospects`) blocks creating a similar INVITED prospect for the same cluster
+  - Attending a prospect from a cluster report uses `prospects_attended` → `mark_prospect_attended` (same Person + monthly tracking path as `POST /prospects/{id}/mark_attended/`)
+  - After attend, the prospect leaves INVITED pickers (has a linked Person / stage ATTENDED); Prospect row is retained for history
+- **Evangelism weekly report integration**:
+  - Named invites use `prospects_invited` (existing Prospect IDs for this group, INVITED or a linked visitor, not dropped off)
+  - Nested creates use write-only `new_invited_prospects` (not `new_prospects` — that integer is the derived tally count). Creates INVITED Prospects with `evangelism_group` set to the report’s group; does **not** copy inviter cluster
+  - Soft dedupe (`find_duplicate_invited_prospects_for_group`) blocks creating a similar INVITED prospect for the same group
+  - Dual-list validation rejects an invited prospect whose linked `person` is also in `visitors_attended`
+  - Attending a prospect from an evangelism report still uses client `markAttended` (reporters have EVANGELISM write)
+  - After save, `new_prospects` is set to `prospects_invited.count()`
+- **Future: walk-in visitors** — v1 requires `invited_by`. Walk-ins with no inviter are deferred; see Clusters module docs. Do not invent a fake inviter.
+
+### FollowUpTask Model
+
+- `apps.evangelism.models.FollowUpTask` represents a follow-up task for a prospect with:
+  - `prospect` (ForeignKey to Prospect, CASCADE delete) – visitor to follow up with
+  - `assigned_to` (ForeignKey to `people.Person`) – person responsible for follow-up
+  - `task_type` (CharField, choices: PHONE_CALL, TEXT_MESSAGE, VISIT, EMAIL, PRAYER, OTHER) – type of follow-up
+  - `due_date` (DateField) – when follow-up should be completed
+  - `completed_date` (DateField, nullable) – when follow-up was completed
+  - `status` (CharField, choices: PENDING, IN_PROGRESS, COMPLETED, CANCELLED) – task status
+  - `notes` (TextField, blank) – additional notes
+  - `priority` (CharField, choices: LOW, MEDIUM, HIGH, URGENT, default MEDIUM) – task priority
+  - `created_by` (ForeignKey to `people.Person`, nullable) – person who created the task
+  - `created_at`, `updated_at` (DateTimeFields)
+- Default ordering: by `due_date`, then `priority`
+- Auto-create tasks when visitor becomes inactive (configurable threshold)
+
+### DropOff Model
+
+- `apps.evangelism.models.DropOff` represents a dropped off visitor with:
+  - `prospect` (OneToOneField to Prospect) – the visitor who dropped off
+  - `drop_off_date` (DateField) – when they dropped off
+  - `drop_off_stage` (CharField, choices: INVITED, ATTENDED, BAPTIZED, RECEIVED_HG) – stage where they dropped off
+  - `days_inactive` (IntegerField) – days inactive before drop-off
+  - `reason` (CharField, choices: NO_CONTACT, NO_SHOW, LOST_INTEREST, MOVED, OTHER, blank=True) – reason for drop-off
+  - `reason_details` (TextField, blank) – additional details
+  - `recovery_attempted` (BooleanField, default False) – whether recovery was attempted
+  - `recovery_date` (DateField, nullable) – date of recovery attempt
+  - `recovered` (BooleanField, default False) – whether visitor was recovered
+  - `recovered_date` (DateField, nullable) – when they were recovered
+  - `created_at`, `updated_at` (DateTimeFields)
+- Default ordering: by `-drop_off_date`
+- **Drop-off Detection**: Automatic detection based on inactivity period (default 30 days, configurable - note in docs for future admin configuration)
+
+### Conversion Model (deprecated for product writes)
+
+- `apps.evangelism.models.Conversion` remains for **historical rows** only.
+- **Product path:** nurture progress is edited on **Person** (evangelism Person progress form / People API). Prospect `pipeline_stage`, monthly tracking, and Each1Reach1 counts sync via `sync_person_evangelism_pipeline` on Person save.
+- **API:** `POST` / `PUT` / `PATCH` on `/api/evangelism/conversions/` return **410 Gone**. `GET` / `DELETE` may still work for admin/history until a follow-up migration drops the table.
+- Metrics that formerly counted `Conversion.is_complete` now use Person “reached” milestones (`person_meets_all_reached_milestones` / inviter attribution). Group `conversions_count` is the count of non-dropped group prospects with `pipeline_stage=REACHED`.
+
+### MonthlyConversionTracking Model
+
+- `apps.evangelism.models.MonthlyConversionTracking` tracks monthly conversion statistics per person per stage:
+  - `cluster` (ForeignKey to `clusters.Cluster`) – cluster this tracking belongs to
+  - `prospect` (ForeignKey to Prospect) – the visitor being tracked
+  - `person` (ForeignKey to `people.Person`, nullable) – linked Person (if prospect has been converted to Person)
+  - `year` (IntegerField) – year (e.g., 2025)
+  - `month` (IntegerField) – month (1-12)
+  - `stage` (CharField, choices: INVITED, ATTENDED, BAPTIZED, RECEIVED_HG) – stage reached in this month
+  - `count` (IntegerField, default 1) – always 1 (for aggregation purposes)
+  - `first_date_in_stage` (DateField) – first date this person reached this stage in this month
+  - `created_at`, `updated_at` (DateTimeFields)
+- Unique constraint: `(cluster, prospect, year, month, stage)` – allows multiple stages per person per month (e.g., BAPTIZED and RECEIVED_HG in same month)
+- Index on `(cluster, year, month, stage)` for efficient queries
+- **Monthly Counting Logic**:
+  - **INVITED**: Count unique persons invited that month (only if they haven't attended yet)
+  - **ATTENDED**: Count unique persons who attended that month (replaces INVITED count if in same month)
+  - **BAPTIZED**: Count baptism events that month (journey count, can be separate from RECEIVED_HG)
+  - **RECEIVED_HG**: Count Holy Ghost reception events that month (journey count, can be separate from BAPTIZED)
+  - **CONVERTED**: Count unique persons who completed both BAPTIZED and RECEIVED_HG by end of month (within same year). Counted in the month they first complete both. Only counted once per person per year.
+
+### Each1Reach1Goal Model
+
+- `apps.evangelism.models.Each1Reach1Goal` tracks cluster-based conversion goals with:
+  - `cluster` (ForeignKey to `clusters.Cluster`) – cluster with the goal (cluster-level tracking)
+  - `year` (IntegerField) – year for the goal
+  - `target_conversions` (IntegerField) – target conversions for the cluster (defaults to `2 ×` non-admin cluster members whose status is Active, Semi-active, or Inactive)
+  - `achieved_conversions` (IntegerField, default 0) – actual conversions this year for cluster members
+  - `status` (CharField, choices: IN_PROGRESS, COMPLETED, NOT_STARTED) – goal status
+  - `created_at`, `updated_at` (DateTimeFields)
+- Unique constraint: `(cluster, year)` – one goal per cluster per year
+- Default ordering: by `-year`, then `cluster__name`
+- Auto-update `achieved_conversions` when conversions are completed by cluster members
+
+### Cross-App References
+
+All ForeignKey relationships use string references to avoid circular imports:
+
+- `leader = models.ForeignKey('people.Person', ...)`
+- `cluster = models.ForeignKey('clusters.Cluster', ...)`
+- `person = models.ForeignKey(settings.AUTH_USER_MODEL, ...)`
+- `event = models.OneToOneField("events.Event", ...)`
+
+### Migrations
+
+- `apps.evangelism.migrations.0001_initial` – Creates all Evangelism tables with relationships
+- `apps.evangelism.migrations.0004_recalculate_each1reach1_targets` – Recalculates Each 1 Reach 1 targets; adds `prospects_invited` M2M on `EvangelismWeeklyReport`
+
+## API Surface
+
+All routes live under `/api/evangelism/` (namespaced in `core.urls`):
+
+### Groups
+
+- `/api/evangelism/groups/` – EvangelismGroupViewSet CRUD
+  - Permissions: list/retrieve = member+ (scoped); create/update/enroll = Evangelism Coordinator+ (`HasEvangelismGroupWrite`); approve/reject = Admin, Pastor, or Evangelism Senior; destroy = admin
+  - Non-senior coordinators list **approved** groups in their branch plus their own pending/rejected drafts. Create sets `approval_status=pending` unless the creator is Admin, Pastor, or Evangelism Senior (those create as `approved`). Reports, sessions, enroll, and due reminders require `approved`.
+  - `GET` – List all groups
+    - Query params: `?cluster={cluster_id}` – filter by cluster
+    - Query params: `?branch={branch_id}` – filter to groups whose assigned cluster belongs to that branch
+    - Query params: `?is_active=true` – filter by active status
+    - Query params: `?approval_status=pending|approved|rejected`
+    - Query params: `?search={term}` – search by name or description
+  - `POST` – Create a new group (requires `name`, optional `coordinator_id`, `cluster_id`, `location`, `meeting_time`, `meeting_day`). Omitting `coordinator_id` defaults to the creator.
+  - `GET /{id}/` – Retrieve a specific group with nested members and cluster
+  - `PUT /{id}/` – Update a group (full update)
+  - `PATCH /{id}/` – Partial update (managed groups, or creator of a pending/rejected draft)
+  - `DELETE /{id}/` – Delete a group (cascades to members, sessions, prospects)
+  - `POST /{id}/approve/` – Approve a pending group (senior+)
+  - `POST /{id}/reject/` – Reject a pending group (senior+); optional `{ "review_note": "..." }`
+  - `POST /{id}/enroll/` – Append members by person id (VISITORs rejected; group must be approved)
+    - Payload: `{ "person_ids": [1, 2, 3] }`
+  - `GET /{id}/sessions/` – List sessions for a group
+    - Query params: `?start_date={date}`, `?end_date={date}` – filter by date range
+  - `GET /{id}/conversions/` – List conversions for a group
+  - `GET /{id}/visitors/` – List visitors associated with this group's cluster
+  - `GET /{id}/summary/` – Group statistics
+  - `GET /bible_sharers_coverage/` – Bible Sharers people directory plus cluster coverage
+    - Query: `?branch=` (same meaning as the group list; omit for all branches)
+    - Counts unique people with **group-scoped** `BIBLE_SHARER` assignments on **active** groups. Module-wide roster grants do not cover a cluster
+    - HQ roster members (and grant-only people) are included when the filter is HQ or all branches; a satellite branch omits the idle HQ roster
+    - Inactive groups do not count as assigned
+    - Response includes:
+      - `people`: directory rows (`id`, `name`, `on_hq_roster`, `roster_active`, `has_module_wide_grant`, `assigned`, `groups[]` with id/name/cluster, `group_count`)
+      - `coverage`: cluster items with `bible_sharers` (people and groups), group list, unique counts; a **No cluster** row (`cluster.id` null) when in-scope unclustered groups have sharers
+      - `summary`: unique people, assigned/unassigned counts, total clusters, clusters with/without Bible Sharers, groups that have assigned sharers, `bible_sharers_ministry_id`, `can_manage_roster`
+
+### Group membership (API)
+
+- Membership is not a separate `/members/` resource. Use **`/api/evangelism/groups/`** with a `members` write field (list of Person PKs) or:
+  - `POST /api/evangelism/groups/{id}/enroll/` – body `{ "person_ids": [...] }` to append memberships (existing members kept)
+
+### Sessions
+
+- `/api/evangelism/sessions/` – EvangelismSessionViewSet CRUD
+  - `GET` – List all sessions
+    - Query params: `?group={group_id}` – filter by group
+    - Query params: `?start_date={date}`, `?end_date={date}` – filter by date range
+  - `POST` – Create a new session (requires `evangelism_group_id`, `session_date`, optional `session_time`, `topic`, `notes`)
+    - **Automatic Event Creation**: When a session is created, it automatically creates a corresponding `Event`:
+      - Type: `CLUSTER_BS_EVANGELISM` if `evangelism_group.cluster` exists
+      - Type: `BIBLE_STUDY` if `evangelism_group.cluster` is null
+  - `GET /{id}/` – Retrieve a specific session with nested group and event information
+  - `PUT /{id}/` – Update a session (full update)
+    - **Event Synchronization**: When a session is updated, the linked event is also updated if it exists
+  - `PATCH /{id}/` – Partial update
+  - `DELETE /{id}/` – Delete a session (sets event to NULL, doesn't delete the event)
+  - `GET /{id}/attendance_report/` – Attendance report for a session
+  - `POST /create_recurring/` – Create recurring sessions
+    - Payload: `{ "evangelism_group_id": 1, "start_date": "2024-01-07", "end_date": "2024-11-03", "session_time": "09:00:00", "topic": "Weekly Study" }`
+
+### Reports
+
+- `/api/evangelism/weekly-reports/` – EvangelismWeeklyReportViewSet CRUD
+  - `GET` – List reports with filtering:
+    - Query params: `?group={group_id}` – filter by group
+    - Query params: `?year={year}` – filter by year
+    - Query params: `?week_number={week}` – filter by week number
+    - Query params: `?gathering_type={type}` – filter by gathering type
+  - `POST` – Create a new report (requires `evangelism_group`, `meeting_date`, `gathering_type`; `year` / `week_number` are optional and overwritten from `meeting_date`)
+    - Duplicate `(group, meeting_date)` returns **409** `duplicate_meeting_report`
+    - **Members attended** may include active group members, the group’s **coordinator** (even if not enrolled as a group member), but not arbitrary people (validated server-side)
+    - `prospects_invited` – existing Prospect IDs to link to this report’s invite list (must belong to the report’s group)
+    - `new_invited_prospects` – write-only nested creates (`first_name`, `last_name`, required `invited_by_id`, optional contact/facebook/notes/`date_first_invited`); appends created Prospects to `prospects_invited`
+    - `new_prospects` is **read-only**; persisted as the length of `prospects_invited` after create/update
+    - Dual-list: a prospect cannot be both invited and attended on the same report
+  - `GET /{id}/` – Retrieve a specific report
+  - `PUT /{id}/` – Update a report (full update)
+  - `PATCH /{id}/` – Partial update
+  - `DELETE /{id}/` – Delete a report
+  - `GET /tally/` – Unified weekly tally (EvangelismWeeklyReport + ClusterWeeklyReport)
+    - Query params: `?year={year}`, `?cluster={cluster_id}`
+    - Aggregates by cluster, year, week_number with deduped attendees
+    - `gathering_type` can be `MIXED` when different sources report different types in the same week
+  - `GET /people_tally/` – Monthly people tally
+    - Query params: `?year={year}` (optional)
+    - Query params: `?branch={branch_id}` – limit people to that branch
+    - Query params: `?cluster={cluster_id}` – cluster scope (formal `Cluster` membership on `Person`); `cluster=unassigned` (or `null`/`none`) limits to people with no cluster
+    - Query params: `?evangelism_group={group_id}` – evangelism-group scope (union of people in `EvangelismGroup.members` and prospects with a linked `Person` for that group); **do not send `cluster` and `evangelism_group` together**
+    - Query params: `?group_by=month` (default) – 12 month rows for the year (`months` is ignored)
+    - Query params: `?group_by=cluster` – one row per active cluster in the branch, optional Unassigned, then Total. Requires `branch`. Do not send `evangelism_group`. Optional `months=1,2,3` (default all 12). Counts are distinct-person unions across those months, not sums of monthly cells. `row_kind` is `cluster` | `unassigned` | `total`
+    - Counts by month (each stage is independent — a person who hits multiple stages in the same month appears in **each** matching column):
+      - **INVITED**: Visitor (`role=VISITOR`) with `date_joined` in month and no `date_first_attended` yet (date-based; not `Person.status`)
+      - **ATTENDED**: Visitor (`role=VISITOR`) with `date_first_attended` in month (date-based; not `Person.status`)
+      - **NCC** (`students_count`): Distinct people with a `LessonSessionReport.session_date` in that month (same branch/cluster/group scoping). Conversion status / `commitment_form_signed` does **not** exclude them
+      - **BAPTIZED**: `water_baptism_date` in month
+      - **RECEIVED_HG**: `spirit_baptism_date` in month
+      - **REACHED**: Person meets all reached milestones (first invited, first attended, at least one NCC session, water baptism, Holy Ghost); counted in the month of `reached_date` (latest of those milestone dates)
+      - **UNIQUE HC** (`unique_hc_count`): Distinct people who appear in **any** of the columns above for that month (union of person IDs). Someone who progressed through several stages still counts as **1**
+    - Related actions (same query params for `branch`, `cluster`, `evangelism_group` as `/people_tally/`):
+      - `GET /people_tally_years/` – years present in tally-related data for the current scope
+      - `GET /people_tally_detail/` – paginated drill-down for a month window + metric
+        - Required: `metric` ∈ `invited` | `attended` | `students` | `baptized` | `received_hg` | `reached` | `unique_hc`
+        - Required: `month` (single) or `months=1,2,3`
+        - Optional: `cluster={id}` or `cluster=unassigned`
+        - Returns people for that column (Unique HC returns the deduped union). Milestone date chips are included for display; the Unique HC UI highlights chips whose dates fall in the selected months
+
+- `/api/evangelism/prospects/` – ProspectViewSet CRUD
+  - Permissions: list/retrieve = member+; create/update = `HasModuleAccess("EVANGELISM", "write")`; destroy = admin
+  - `GET` – List all prospects
+    - Query params: `?invited_by={person_id}` – filter by inviter
+    - Query params: `?inviter_cluster={cluster_id}` – filter by inviter's cluster
+    - Query params: `?cluster={cluster_id}` – inviter cluster **or** endorsed cluster
+    - Query params: `?branch={branch_id}` – prospects tied to that branch via inviter/endorsed cluster or linked Person
+    - Query params: `?source=cluster|evangelism|both` – cluster-attributed with no group, has evangelism group, or both (cluster attribution is weekly report / endorse, not the inviter’s cluster)
+    - Query params: `?group={group_id}` – filter by group (`evangelism_group`)
+    - Query params: `?pipeline_stage={stage}` – filter by pipeline stage
+    - Query params: `?endorsed_cluster={cluster_id}` – filter by endorsed cluster
+    - Query params: `?is_dropped_off=true` – filter by drop-off status
+    - Query params: `?person_isnull=true` – unlinked prospects only (global search uses this so people with a profile are not duplicated under Prospects)
+  - `POST` – Create a new prospect (requires `first_name`, `last_name`, `invited_by_id`; optional `middle_name`, `suffix`, `gender`, `contact_info`, `evangelism_group_id`, `facebook_name`, `notes`, `date_first_invited`)
+    - Does **not** set `inviter_cluster` from the inviter’s cluster membership; cluster attribution comes from cluster weekly reports
+    - No automatic name/contact dedupe on this endpoint (cluster report nested create does soft dedupe)
+  - `GET /{id}/` – Retrieve a specific prospect
+  - `PUT /{id}/` – Update a prospect (full update)
+  - `PATCH /{id}/` – Partial update
+  - `DELETE /{id}/` – Delete a prospect
+  - `POST /{id}/endorse_to_cluster/` – Endorse visitor to a different cluster (UI no longer exposes this)
+    - Payload: `{ "cluster_id": 1 }`
+  - `POST /{id}/update_progress/` – Update visitor's pipeline stage and last activity
+    - Payload: `{ "pipeline_stage": "ATTENDED", "last_activity_date": "2024-03-15" }`
+    - UI no longer uses this for the Prospects **Update** button (that path is attend-only via `mark_attended`)
+    - When set to ATTENDED, the system creates/links a Person, sets `Person.status=ONGOING`, and updates `date_first_attended`
+  - `POST /{id}/mark_attended/` – Mark prospect as attended (auto-creates/links Person, updates monthly tracking); shared service `mark_prospect_attended`
+    - Optional payload: `{ "last_activity_date": "2024-03-15", "first_activity_attended": "SUNDAY_SERVICE" }`
+    - `first_activity_attended` is an EventType code stored on the linked Person
+    - Codes `CLUSTERING`, `BIBLE_STUDY`, and `BS/CLUSTER_EVANGELISM` are rejected (400); record those on a cluster or evangelism weekly report instead
+    - Weekly report promotion may still call this without `first_activity_attended`
+  - `POST /{id}/create_person/` – Manual action to create Person record from prospect
+    - Payload: `{ "first_name": "John", "last_name": "Doe", ... }` (similar to cluster report attendance form)
+  - `POST /{id}/mark_dropped_off/` – Manually mark visitor as dropped off
+  - `POST /{id}/recover/` – Recover a dropped off visitor
+
+### Follow-up Tasks
+
+- `/api/evangelism/follow-up-tasks/` – FollowUpTaskViewSet CRUD
+  - `GET` – List all tasks
+    - Query params: `?prospect={prospect_id}` – filter by prospect
+    - Query params: `?assigned_to={person_id}` – filter by assignee
+    - Query params: `?status={status}` – filter by status
+    - Query params: `?due_date={date}` – filter by due date
+    - Query params: `?priority={priority}` – filter by priority
+  - `POST` – Create a new task (requires `prospect_id`, `assigned_to_id`, `task_type`, `due_date`)
+  - `GET /{id}/` – Retrieve a specific task
+  - `PUT /{id}/` – Update a task (full update)
+  - `PATCH /{id}/` – Partial update
+  - `DELETE /{id}/` – Delete a task
+  - `POST /{id}/complete/` – Mark task as completed
+  - `GET /overdue/` – List overdue tasks
+
+### Drop-offs
+
+- `/api/evangelism/drop-offs/` – DropOffViewSet CRUD
+  - `GET` – List all drop-offs
+    - Query params: `?drop_off_stage={stage}` – filter by drop-off stage
+    - Query params: `?reason={reason}` – filter by reason
+    - Query params: `?recovered={true/false}` – filter by recovery status
+    - Query params: `?start_date={date}`, `?end_date={date}` – filter by date range
+  - `GET /{id}/` – Retrieve a specific drop-off
+  - `POST /{id}/recover/` – Attempt to recover a dropped off visitor
+  - `GET /analytics/` – Drop-off analytics by stage, reason, time period
+
+### Conversions (deprecated writes)
+
+- `/api/evangelism/conversions/` – ConversionViewSet (historical rows only)
+  - `GET` – List historical conversions (filters: converted_by, cluster, group, year)
+  - `POST` / `PUT` / `PATCH` – **410 Gone**; update Person via `/api/people/people/` instead
+  - `DELETE` – Delete a historical conversion row
+  - Nurture milestones sync Prospect pipeline via `sync_person_evangelism_pipeline` on Person save
+
+### Monthly Conversion Tracking
+
+- `/api/evangelism/monthly-tracking/` – MonthlyConversionTrackingViewSet CRUD
+  - `GET` – List all monthly tracking records
+    - Query params: `?cluster={cluster_id}` – filter by cluster
+    - Query params: `?year={year}` – filter by year
+    - Query params: `?month={month}` – filter by month
+    - Query params: `?stage={stage}` – filter by stage
+  - `GET /statistics/` – Monthly statistics by stage
+    - Query params: `?cluster={cluster_id}`, `?year={year}`, `?month={month}`
+    - Returns: `invited_count`, `attended_count`, `baptized_count`, `received_hg_count`, `converted_count`
+
+### Each 1 Reach 1 Goals
+
+- `/api/evangelism/each1reach1-goals/` – Each1Reach1GoalViewSet CRUD
+  - `GET` – List all goals
+    - Query params: `?cluster={cluster_id}` – filter by cluster
+    - Query params: `?cluster__branch={branch_id}` – filter by cluster branch
+    - Query params: `?year={year}` – filter by year
+    - Query params: `?status={status}` – filter by status
+    - Query params: `?search={term}` – searches cluster name and related evangelism group names on that cluster (DRF `search` param)
+    - Lazy provisioning: ensures each cluster has one goal for requested year (defaults to current year if omitted)
+  - `POST` – Create a new goal (requires `cluster_id`, `year`; `target_conversions` is optional and defaults to `2 ×` non-admin cluster members with status Active, Semi-active, or Inactive)
+  - `GET /default_target/?cluster_id={cluster_id}&year={year}` – Returns computed default target for Create Goal UI prefill
+  - `GET /{id}/` – Retrieve a specific goal
+  - `PUT /{id}/` – Update a goal (full update)
+  - `PATCH /{id}/` – Partial update
+  - `DELETE /{id}/` – Delete a goal
+  - `GET /{id}/progress/` – Cluster progress report
+  - `GET /leaderboard/` – Top converting clusters
+    - Query params: `?year={year}` – filter by year
+  - `GET /{id}/member_progress/` – Individual member progress within cluster
+  - `GET /summary/` – Yearly summary statistics
+    - Query params: `?year={year}` – filter by year
+
+### Serializers
+
+Serializers (`apps.evangelism.serializers`) expose:
+
+- `EvangelismGroupSerializer`:
+  - `coordinator` – nested person summary (read-only); `coordinator_id` for writes
+  - `cluster` – nested cluster object (read-only); `cluster_id` for writes
+  - `members` – nested person summaries on **read**; **write** with list of Person PKs (same pattern as `ClusterSerializer.members`)
+  - `members_count`, `conversions_count` – computed
+  - `meeting_frequency` – WEEKLY (default), BIWEEKLY, MONTHLY, or IRREGULAR
+
+- `EvangelismSessionSerializer`:
+  - `evangelism_group` – nested group object (read-only)
+  - `evangelism_group_id` – write-only field for setting group
+  - `event_id` – read-only event ID if event exists
+  - All session fields
+
+- `EvangelismWeeklyReportSerializer`:
+  - `evangelism_group` – nested group object (read-only)
+  - `members_attended_details` – read-only full person details for members
+  - `visitors_attended_details` – read-only full person details for visitors
+  - `prospects_invited` / `prospects_invited_details` – invited prospects linked to this report (read details include name, stage, inviter)
+  - `new_invited_prospects` – write-only nested creates (see Prospect model evangelism weekly report integration)
+  - `new_prospects` – read-only derived count of `prospects_invited` (tally still `SUM`s this integer)
+  - `submitted_by_details` – read-only full person details for submitter
+  - `year` / `week_number` – derived from `meeting_date` on save
+  - Duplicate `(evangelism_group, meeting_date)` raises 409 `duplicate_meeting_report`
+  - All report fields
+
+- `ProspectSerializer`:
+  - `invited_by` – nested person object (read-only)
+  - `invited_by_id` – write-only field for setting inviter
+  - `inviter_cluster` – nested cluster object (read-only)
+  - `evangelism_group` – nested group object (read-only)
+  - `endorsed_cluster` – nested cluster object (read-only)
+  - `person` – nested person object (read-only, if linked)
+  - `pipeline_stage_display` – human-readable stage name (read-only)
+  - `days_since_last_activity` – computed property (read-only)
+  - All prospect fields
+
+- `FollowUpTaskSerializer`:
+  - `prospect` – nested prospect object (read-only)
+  - `assigned_to` – nested person object (read-only)
+  - `created_by` – nested person object (read-only)
+  - `task_type_display` – human-readable task type (read-only)
+  - `status_display` – human-readable status (read-only)
+  - `priority_display` – human-readable priority (read-only)
+  - All task fields
+
+- `DropOffSerializer`:
+  - `prospect` – nested prospect object (read-only)
+  - `drop_off_stage_display` – human-readable stage (read-only)
+  - `reason_display` – human-readable reason (read-only)
+  - All drop-off fields
+
+- `ConversionSerializer`:
+  - `person` – nested person object (read-only)
+  - `prospect` – nested prospect object (read-only)
+  - `converted_by` – nested person object (read-only)
+  - `evangelism_group` – nested group object (read-only)
+  - `cluster` – nested cluster object (read-only)
+  - `verified_by` – nested person object (read-only)
+  - `baptized_by` / `hg_witnessed_by` – nested person objects from the member's BAPTISM / SPIRIT journeys (read-only)
+  - `baptized_by_id` / `hg_witnessed_by_id` – write-only Person IDs; optional (`null` = unknown baptizer/witness)
+  - `baptized_by_first_name` / `baptized_by_last_name` / `hg_witnessed_by_first_name` / `hg_witnessed_by_last_name` – optional former names when the baptizer/witness is not in the directory
+  - `lesson_start_date` – writable on create; ignored on update
+  - All conversion fields
+
+- `MonthlyConversionTrackingSerializer`:
+  - `cluster` – nested cluster object (read-only)
+  - `prospect` – nested prospect object (read-only)
+  - `person` – nested person object (read-only, if linked)
+  - `stage_display` – human-readable stage (read-only)
+  - All tracking fields
+
+- `MonthlyStatisticsSerializer`:
+  - `year` – year
+  - `month` – month
+  - `cluster_id` – cluster ID
+  - `cluster_name` – cluster name
+  - `invited_count` – unique persons invited that month
+  - `attended_count` – unique persons who attended that month
+  - `baptized_count` – baptism events that month
+  - `received_hg_count` – Holy Ghost reception events that month
+  - `converted_count` – unique persons who completed both (counted once in month they first complete both, within same year)
+
+- `Each1Reach1GoalSerializer`:
+  - `cluster` – nested cluster object (read-only)
+  - `cluster_id` – write-only field for setting cluster
+  - `progress_percentage` – computed progress percentage (read-only)
+  - All goal fields
+
+## Frontend Behavior
+
+The Evangelism hub lives at `frontend/src/app/evangelism/page.tsx` and provides comprehensive management of groups, prospects, conversions, and reporting.
+
+### Main Page Features
+
+The main page includes tabs for different views:
+
+- **Groups Tab**: Manage evangelism groups (see [Groups tab listing](#groups-tab-listing) below)
+- **Prospects Tab**: Browse invited visitors (senior cluster/evangelism coordinators, pastors, admins). Default filter is Invited / not dropped off. Filters: branch, cluster, stage, source (**Cluster** = recorded on a cluster weekly report or endorsed; **Evangelism** = linked to an evangelism group; not copied from the inviter’s cluster). **Update** on Invited rows opens a **Mark attended** modal (activity date + first activity). Clustering / Bible Study / BS-Cluster Evangelism must be recorded on the matching weekly report instead. Rows show pipeline chips and a People profile link after attendance. Global search uses `?tab=prospects&open={id}` and omits prospects that already have a People profile (`?person_isnull=true`).
+- **Each 1 Reach 1 Tab**: Track conversion goals and progress
+- **Tally Tab**: People tally (Invited, Attended, NCC, Baptized, Received HG, Reached, Unique HC). Default **By cluster** compares clusters in the selected branch for All / YTD / quarter / custom months; **By month** is the year grid. Click a count to open the drill-down modal; click a cluster name to open By month for that cluster
+- **Reports Tab**: Weekly unified tally (evangelism + cluster weekly reports)
+- **Bible Sharers Tab**: People directory of Bible Sharers (roster vs assigned vs grant-only) plus cluster coverage
+
+#### Groups tab listing
+
+The Groups tab toolbar mirrors the clusters page layout:
+
+- **Left**: debounced search (`EvangelismToolbarSearch`), branch filter (server-side via `?branch=` on group list API), **Table / Cards** view toggle
+- **Right**: **Select** (bulk selection mode), **Bulk Actions** (when rows are selected), active filter chips, **Sort**, **Filter**
+
+**Default list scope:** `useEvangelismGroups` loads only **active** groups (`is_active: true`) unless filters change that. Inactive groups disappear from the default list after bulk mark-inactive or manual deactivation.
+
+**View modes:**
+
+- **Table** (`EvangelismGroupTable`): columns for group name, cluster, branch, coordinator, schedule, member/visitor counts, status, Bible Sharers badge, row actions (View, Edit, Delete). Supports header checkbox select-all in selection mode.
+- **Cards** (`EvangelismGroupCard`): responsive grid; card click opens group detail unless selection mode is on (then toggles selection). Select-all checkbox shown above the grid in selection mode.
+
+**Search & branch filter (server-side):**
+
+- Search debounces and passes `?search=` to the groups API (name or description).
+- Branch select passes `?branch=` so only groups whose assigned cluster belongs to that branch are returned.
+
+**Client-side filter & sort** (`evangelismGroupListUtils.ts`):
+
+- **Filter** opens `EvangelismGroupFilterDropdown` → `ClusterFilterCard` for the chosen field. Supported fields: group name, description, coordinator, cluster code, location, meeting schedule, member count, visitor count, status (active/inactive), Bible Sharers (yes/no). Multiple filters combine with AND logic; chips show active filters with per-chip remove and **Clear All**.
+- **Sort** opens `EvangelismGroupSortDropdown`: group name, member count, visitor count, cluster code, created date (asc/desc).
+
+**Bulk selection & actions:**
+
+- **Select** toggles selection mode; selected count appears on the Bulk Actions button.
+- **Bulk Actions** (`BulkActionsMenu`, evangelism-only extensions):
+  - Export selected to Excel, PDF, or CSV
+  - **Mark as inactive** (optional prop `onBulkMarkInactive`; not shown on People or Clusters pages) — opens `ConfirmationModal` (`variant="warning"`), then `PATCH` each selected group with `{ is_active: false }` via `updateGroup`, refreshes the list, clears selection, exits selection mode
+  - **Delete Selected** — opens `ConfirmationModal` (`variant="danger"`), then deletes each selected group
+- Single-group delete also uses `ConfirmationModal` (not `window.confirm`).
+
+**Gathering type badges (evangelism UI):** Weekly report and tally surfaces use filled tonal chips via `evangelismGatheringTypeStyles.ts` — PHYSICAL (green), ONLINE (blue), HYBRID (purple), MIXED (amber when aggregated weeks differ), UNKNOWN/default (slate). No outlined badge style in the evangelism module.
+
+**Each 1 Reach 1 status chips:** Goal status badges (e.g. IN PROGRESS, COMPLETED) use filled tonal styling via `each1Reach1ProgressStyles.ts`, consistent with other status chips on the dashboard.
+
+### Components Overview
+
+#### Group Management
+
+- **`EvangelismGroupView`**: Mobile-first group detail layout (custom header, scrollable sections, sticky footer) used in the view modal
+- **`EvangelismGroupTable`**: Tabular groups list with bulk checkboxes, branch/cluster chips, status badges, and row action menu
+- **`EvangelismGroupCard`**: Card layout for groups; supports bulk selection and view highlight when detail modal is open
+- **`EvangelismToolbarSearch`**: Icon-prefixed search input shared by the Groups tab toolbar (matches clusters styling)
+- **`EvangelismGroupFilterDropdown`** / **`EvangelismGroupSortDropdown`**: Field picker and sort picker anchored to toolbar buttons
+- **`evangelismGroupDisplay.ts`**: Shared helpers for coordinator name, member count, schedule text, cluster/branch metadata
+- **`evangelismGroupListUtils.ts`**: Client-side `applyEvangelismGroupFilters` and `sortEvangelismGroups`
+- **`evangelismGatheringTypeStyles.ts`**: Filled tonal chip classes for gathering types in evangelism reports/tallies
+- **`EvangelismGroupForm`**: Form for creating/editing groups
+  - Leader selection
+  - Cluster selection (optional)
+  - Location, meeting time, meeting day inputs
+  - Bible Sharer and Reporter pickers (must be members; coordinator cannot hold those roles). On HQ groups, Bible Sharers must also be on the headquarters Bible Sharers ministry roster.
+- **`GroupMembersSection`**: Section displaying and managing group members
+  - Table of enrolled members with role, join date, status
+  - Add member button
+  - Bulk enroll button
+  - Remove member functionality
+- **`GroupReportsSection`**: Section displaying and managing weekly reports
+  - Table of reports with week, meeting date, gathering type, members/visitors counts
+  - Submit Report button
+  - Edit action per report
+- **`GroupProspectsSection`**: Section displaying and managing prospects (Visitors)
+  - Table of visitors with pipeline stage, last activity, cluster
+  - Add visitor button
+  - Update (INVITED only) opens Mark attended: activity date + first activity; Clustering / evangelism-group activities must go through the weekly report
+- **`GroupPeopleProgressSection`**: Section displaying group-linked visitors with Person profiles
+  - Table of people with invite/attend/baptism/HG dates and Update action
+  - Opens `EvangelismPersonProgressForm` (contact + photo + nurture fields → People API PATCH)
+- **`EvangelismPersonProgressForm`**: Group-scoped Person progress editor (replaces Conversion form)
+  - Contact (phone, email, facebook), photo upload/remove, invite/attend, baptism/HG + verifiers, notes
+  - Saves via `peopleApi`; Prospect pipeline syncs on the backend
+
+#### Reports
+
+- **`EvangelismWeeklyReportForm`**: Form for submitting/editing reports
+  - Meeting date (required); year and week are read-only, filled from the meeting date for tallies
+  - **Section order**: Members Attended → Visitors Attended (+ Add New Visitor) → **Prospects Invited** (+ Add Prospect)
+  - **Visitors Attended helper copy**: People who came this week; search returning visitors or invited prospects first; Add New Visitor only if they came and are not in the list
+  - **Prospects Invited helper copy**: Invited visitors only — not yet attended / not in People until they attend
+  - **Visitors Attended grouping** (`groupByVisitorKind` on `AttendanceSelector`): list/search/chips split returning visitors, invited prospects (first visit), new walk-ins added this report, and other visitors. Empty search points to Add New Visitor vs Prospects Invited
+  - **Visitors Attended search** includes group-scoped INVITED prospects (no Person yet) as `prospect:{id}`; selecting them promotes via client `markAttended` on submit
+  - **Dual-list blocking**: the same prospect cannot be on Prospects Invited and Visitors Attended together
+  - Named invite count replaces the numeric New Visitors input; `new_prospects` is derived from the list
+  - Submit builds payload in `frontend/src/lib/evangelismWeeklyReportSubmit.ts` (`prospects_invited` + `new_invited_prospects`; no user-entered integer)
+- **`ViewEvangelismWeeklyReportModal`**: Shows Prospects Invited separately from Visitors Attended (names, inviter, stage); attendance totals stay members + visitors only; prospects invited count uses the derived list length
+
+#### Prospects
+
+- **`ProspectForm`**: Form for creating invited visitors (name parts, gender, date first invited, contact, Facebook, inviter, optional group, notes—aligned with Person before a `Person` exists)
+  - Name input
+  - Contact info input
+  - Inviter selection
+  - Group selection (optional)
+  - Facebook name input
+  - Notes field (used for Journey NOTE when attendee is created)
+- **`ProspectList`**: List prospects with pipeline stage and progress
+  - Table with columns: Name, Stage, Last Activity, Cluster, Actions
+  - Filter by stage, cluster, drop-off status
+- **`ProspectPipelineView`**: Visual pipeline view showing prospects at each stage
+  - Kanban-style board with columns for each stage
+  - Drag-and-drop to move prospects between stages
+- **`ProspectDetail`**: Detailed view with progress history, follow-ups, and activities
+  - Prospect information
+  - Pipeline stage history
+  - Follow-up tasks
+  - Conversion journeys
+  - Drop-off information (if applicable)
+- **`UpdateProgressModal`**: Modal to update visitor's pipeline stage
+  - Stage selection (INVITED or ATTENDED)
+  - Default selection: ATTENDED
+  - Activity date input (used as last activity / date first attended)
+  - Prompts for first/last name if the prospect name is incomplete and no Person exists
+- **`CreatePersonFromProspectModal`**: Modal to create Person record from prospect
+  - Similar to cluster report attendance form
+  - Name fields, contact info, demographics
+  - Auto-fills from prospect data
+- **`MarkAttendedButton`**: Quick action to mark prospect as attended (auto-creates Person)
+
+#### Follow-up & Drop-offs
+
+- **`FollowUpTaskList`**: List of follow-up tasks with filters
+  - Table with columns: Prospect, Assigned To, Type, Due Date, Status, Priority
+  - Filter by status, assignee, priority, overdue
+- **`FollowUpTaskForm`**: Form for creating/editing follow-up tasks
+  - Prospect selection
+  - Assignee selection
+  - Task type selection
+  - Due date picker
+  - Priority selection
+  - Notes textarea
+- **`FollowUpTaskCard`**: Individual task card with status
+  - Task details
+  - Status badge
+  - Priority indicator
+  - Complete button
+- **`DropOffList`**: List of dropped off visitors
+  - Table with columns: Name, Drop-off Stage, Date, Reason, Recovery Status
+  - Filter by stage, reason, recovery status
+- **`DropOffAnalytics`**: Analytics on drop-off patterns
+  - Charts showing drop-offs by stage, reason, time period
+  - Recovery rate statistics
+- **`RecoveryModal`**: Modal to attempt recovery of dropped off visitor
+  - Recovery attempt date
+  - Notes input
+  - Create follow-up task option
+
+#### Each 1 Reach 1
+
+- **`Each1Reach1Dashboard`**: Main dashboard
+  - Create Goal modal (cluster, year, target conversions)
+  - Target is auto-prefilled from backend default rule (`2 ×` non-admin cluster members with status Active, Semi-active, or Inactive), but remains editable before save
+  - Search box filters goals by cluster name **or evangelism group name tied to that cluster** (placeholder “Search group…” with debounced querying)
+  - Cluster cards with progress indicators
+  - Overall statistics
+  - Year selector
+- **`MemberProgressCard`**: Individual progress card
+  - Member name
+  - Conversions this year
+  - Progress toward goal
+- **`Leaderboard`**: Top converting clusters
+  - Table with columns: Cluster, Conversions, Progress, Status
+  - Sortable columns
+- **`YearlySummary`**: Year statistics
+  - Total conversions by cluster
+  - Monthly breakdown
+  - Charts and graphs
+
+#### Reports
+
+- **`EvangelismSummary`**: Summary statistics
+  - Cards for total groups, prospects, conversions
+  - People tally snapshot (by cluster or by month)
+  - Conversion rates
+- **`GroupReport`**: Group-level report
+  - Group statistics
+  - Member list
+  - Session history
+  - Conversion history
+- **`ConversionReport`**: Conversion analytics
+  - Conversions by month, cluster, group
+  - Conversion rate trends
+  - Charts and graphs
+- **`Each1Reach1Report`**: Goal progress report
+  - Cluster goals and achievements
+  - Student progress
+  - Yearly summary
+- **`VisitorProgressReport`**: Visitor progress through pipeline
+  - Pipeline stage distribution
+  - Stage transition rates
+  - Time in each stage
+- **`DropOffReport`**: Drop-off analysis report
+  - Drop-offs by stage, reason, time period
+  - Recovery statistics
+  - Recommendations
+- **`PeopleTallyReport`**: People tally (also used on Analytics **E1R1**)
+  - Layout: **By cluster** (default; cluster rows, month window filter) and **By month** (12-month grid, cluster/group filter)
+  - Columns: Cluster or Month, Invited, Attended, NCC, Baptized, Received HG, Reached, **UNIQUE HC**
+  - Multi-column counting: one person can appear in every stage column they achieved in the window; Unique HC counts them once (union across selected months, not a sum of monthly Unique HC)
+  - Clicking a non-zero count opens `TallyDrilldownModal`; for Unique HC, milestone chips (Invited, Attended, Lessons Finished, Baptism, Holy Ghost, Reached) whose dates fall in the selected months are emphasized
+  - Filters: year (dynamic options), branch, months (cluster mode: All / YTD / Q1–Q4 / custom), and a searchable combined **cluster or evangelism group** selector in month mode (shows **Cluster** vs **Group** badges); group list respects the selected branch server-side where applicable
+- **`TallyReport`**: Weekly unified tally
+  - Combines evangelism weekly reports with cluster weekly reports
+  - Week format: `YYYY W#`
+  - Gathering type badges
+- **`BibleSharersCoverage`**: Bible Sharers people directory plus cluster coverage
+  - Toolbar: search, branch filter (locked to assignment like Groups), status filter (All / Assigned / Unassigned / Roster only / Grant only), Table / Cards
+  - Summary cards: unique Bible Sharers, assigned, unassigned, clusters uncovered
+  - People directory (primary): name (People profile link), status chips (Assigned/Unassigned, HQ roster, Inactive on roster, Evangelism access vs Roster only), group chips (`?tab=groups&openGroup=`), cluster code badges
+  - Includes HQ roster members with no group, grant-only people, and assignments on groups with no cluster
+  - Roster managers see a Ministries deep link to manage the HQ roster (editing stays in Ministries)
+  - Cluster coverage table: Covered / Not covered, people names, uncovered-cluster alert, cluster code click-through, **No cluster** row when needed
+
+### Group Detail Modal
+
+When viewing a group, a modal displays group details and related sections. Layout follows the same mobile patterns as cluster detail (`ClusterView`):
+
+**View mode**
+
+- `Modal` uses `hideHeader`; [`EvangelismGroupView`](frontend/src/components/evangelism/EvangelismGroupView.tsx) renders its own header with truncated group name, status chips (Active/Inactive, Bible Sharers), and a 44px close control
+- Full-screen on mobile (`Modal` shell); scrollable body for info grid and sections; **footer** with Mark Inactive, optional hard-delete, and Edit (stacked full-width buttons on mobile; row layout on `sm+`)
+- **Group Information**: Coordinator, cluster, branch code, location, meeting time, meeting frequency, description
+- **Members Section**: List of enrolled members with management options
+- **Reports Section**: Evangelism reports (table with horizontal scroll on small screens)
+- **Visitors Section**: Prospects list (table with horizontal scroll on small screens)
+- **Conversions Section**: Conversions list (`Table` mobile cards)
+
+**Edit mode**
+
+- Standard `Modal` header with title **Edit Group** (no long name in header)
+- [`EvangelismGroupForm`](frontend/src/components/evangelism/EvangelismGroupForm.tsx) with responsive stacked fields and full-width submit/cancel on mobile
+
+### Data Loading & Updates
+
+- On mount, the page fetches groups, prospects, conversions, summary, and monthly statistics in parallel
+- Successful form submissions refresh relevant data
+- Bulk delete and bulk mark-inactive call `fetchGroups()` after API success so the list matches server filters (inactive groups drop off the default active list)
+- Errors surface via error messages
+- Loading states are managed per data type
+- Debounced search prevents excessive API calls
+- Optimistic UI updates where appropriate
+
+## Integration with Other Modules
+
+### Events Module
+
+- Sessions auto-create Events:
+  - Type: `CLUSTER_BS_EVANGELISM` if `evangelism_group.cluster` exists
+  - Type: `BIBLE_STUDY` if `evangelism_group.cluster` is null
+- Event synchronization when sessions are updated
+- Attendance tracking through Events module
+
+### Attendance Module
+
+- Use existing AttendanceRecord for session attendance
+- Auto-update prospect's `last_activity_date` when they attend a session
+- Link prospects to attendance records when Person is created
+
+### People Module
+
+- Auto-update `water_baptism_date` and `spirit_baptism_date` when conversion is recorded
+- Link `inviter` field to `converted_by` in conversions
+- Track visitor role and status changes (`Person.status` for visitors: ONGOING | NO_RESPONSE | DECEASED — not Prospect pipeline INVITED/ATTENDED)
+- Auto-create Person when prospect first attends (or link if Person with VISITOR role exists); new/attended visitor Person status is **ONGOING**
+- Set `Person.inviter = prospect.invited_by` when Person is created
+
+### Clusters Module
+
+- Track visitors per cluster (inviter's cluster or endorsed cluster)
+- Cluster-based Each 1 Reach 1 goals
+- Weekly reports similar to ClusterWeeklyReport
+- Cluster statistics and analytics
+
+### Lessons Module
+
+- Track lesson completion for prospects
+- Validate lesson completion before baptism.
+- Track commitment form signing
+- Fast-track reasons: GOING_ABROAD, HEALTH_ISSUES, OTHER
+
+### Journeys Module
+
+- Optionally create journeys for conversions
+- Create journeys for pipeline stage progress
+- Link journeys to conversion records
+
+## Django Admin
+
+All Evangelism models are registered in Django admin (`apps.evangelism.admin`):
+
+- **EvangelismGroupAdmin**:
+  - List display: name, coordinator, cluster, location, meeting_time, meeting_frequency, is_active
+  - `filter_horizontal` for **members** (M2M widget)
+  - Filterable by cluster, is_active, meeting_frequency
+
+- **EvangelismSessionAdmin**:
+  - List display: evangelism_group, session_date, session_time, topic, event
+  - Filterable by group, session_date
+  - Searchable by group name, topic
+
+- **EvangelismWeeklyReportAdmin**:
+  - List display: evangelism_group, year, week_number, meeting_date, gathering_type
+  - Filterable by group, year, week_number, gathering_type
+  - Searchable by group name
+  - Filter horizontal for members_attended, visitors_attended, and prospects_invited
+
+- **ProspectAdmin**:
+  - List display: name, invited_by, pipeline_stage, last_activity_date, is_dropped_off
+  - Filterable by pipeline_stage, inviter_cluster, group, is_dropped_off
+  - Searchable by name, contact_info
+
+- **FollowUpTaskAdmin**:
+  - List display: prospect, assigned_to, task_type, due_date, status, priority
+  - Filterable by status, priority, assigned_to
+  - Searchable by prospect name, assignee name
+
+- **DropOffAdmin**:
+  - List display: prospect, drop_off_date, drop_off_stage, reason, recovered
+  - Filterable by drop_off_stage, reason, recovered
+  - Searchable by prospect name
+
+- **ConversionAdmin**:
+  - List display: person, converted_by, conversion_date, water_baptism_date, spirit_baptism_date, is_complete
+  - Filterable by cluster, group, year, is_complete
+  - Searchable by person name, converter name
+
+- **MonthlyConversionTrackingAdmin**:
+  - List display: cluster, prospect, year, month, stage, first_date_in_stage
+  - Filterable by cluster, year, month, stage
+  - Searchable by prospect name
+
+- **Each1Reach1GoalAdmin**:
+  - List display: cluster, year, target_conversions, achieved_conversions, status
+  - Filterable by cluster, year, status
+  - Searchable by cluster name
+
+## Testing
+
+- `apps.evangelism.tests` should include coverage for:
+  - Group CRUD operations with cluster affiliation
+  - Member enrollment
+  - Session creation and event linking (correct type based on cluster affiliation)
+  - Prospect pipeline stage transitions
+  - Visitor progress tracking and last_activity_date updates
+  - Person creation from prospect
+  - Follow-up task creation and completion
+  - Drop-off detection logic (inactivity period)
+  - Drop-off recovery process
+  - Conversion recording and Person model sync
+  - Monthly tracking with proper unique person counting
+  - CONVERTED count logic (both journeys within same year)
+  - Each1Reach1Goal auto-updates (cluster-based)
+  - Each 1 Reach 1 default target (`2 ×` non-admin Active / Semi-active / Inactive members)
+  - Cluster visitor tracking (inviter cluster vs endorsed cluster)
+  - Weekly report submission
+  - Reporting calculations
+  - Recurring session creation
+  - Lesson completion validation
+  - Fast-track logic
+
+Run tests with SQLite settings to avoid Postgres permissions:
+
+```bash
+cd backend
+source venv/bin/activate
+python manage.py test apps.evangelism --settings=core.settings_test
+```
+
+## Future Enhancements
+
+### 1. Drop-off Threshold Configuration
+
+**Status**: Planned
+
+- Make drop-off inactivity threshold configurable by admins (currently 30 days default)
+- Per-cluster or per-group configuration options
+- Admin interface for threshold management
+
+### 2. Notification System
+
+- Notify on overdue follow-up tasks
+- Notify on new drop-offs
+- Notify on conversion journeys
+- Email/SMS integration for follow-up reminders
+
+### 3. Advanced Analytics
+
+- Predictive analytics for drop-off risk
+- Conversion funnel analysis
+- Time-to-conversion metrics
+- Recovery success rate tracking
+
+### 4. Bulk Operations
+
+**Implemented (Groups tab):**
+
+- Bulk export (Excel, PDF, CSV) for selected groups
+- Bulk mark as inactive (with confirmation modal)
+- Bulk delete (with confirmation modal)
+
+**Planned:**
+
+- Bulk invite prospects
+- Bulk update pipeline stages
+- Bulk endorse to cluster
+- Bulk create follow-up tasks
+- Bulk mark as active (when viewing inactive groups)
+
+### 5. Export/Reporting Enhancements
+
+- Export monthly statistics to Excel/CSV
+- Export drop-off reports
+- Print-friendly reports
+- Scheduled report generation
+
+### 6. Mobile App Integration
+
+- Mobile app for follow-up task management
+- Quick prospect updates on-the-go
+- Photo uploads for prospects
+- Location-based features
+
+### 7. Integration Enhancements
+
+- Deep integration with Lessons module
+- Finance module integration (track evangelism expenses)
+- Enhanced calendar integration
+- Social media integration for outreach
+
+## Notes
+
+- **Drop-off Threshold**: Currently set to 30 days default. This will be configurable by admins in the future (see Future Enhancements).
+- **Lessons Integration**: Visitors must complete lessons before baptism.
+- **Monthly Counting**: CONVERTED counts unique persons who completed both BAPTIZED and RECEIVED_HG within the same year. Counted in the month they first complete both, only once per person per year.
+- **Person Creation**: Prospects can be just names until they attend. When they first attend, a Person record is auto-created (or linked if Person with VISITOR role already exists).

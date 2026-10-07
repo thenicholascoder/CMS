@@ -1,0 +1,153 @@
+"use client";
+
+import { useState } from "react";
+import Button from "@/src/components/ui/Button";
+import Table from "@/src/components/ui/Table";
+import { EvangelismWeeklyReport } from "@/src/types/evangelism";
+import { getEvangelismGatheringTypeChipClass } from "@/src/lib/evangelismGatheringTypeStyles";
+import { formatLocaleDate } from "@/src/lib/date";
+
+interface GroupReportsSectionProps {
+  reports: EvangelismWeeklyReport[];
+  onAddReport: () => void;
+  onViewReport: (report: EvangelismWeeklyReport) => void;
+  onEditReport: (report: EvangelismWeeklyReport) => void;
+  loading?: boolean;
+  canSubmit?: boolean;
+}
+
+export default function GroupReportsSection({
+  reports,
+  onAddReport,
+  onViewReport,
+  onEditReport,
+  loading = false,
+  canSubmit = true,
+}: GroupReportsSectionProps) {
+  const [showAll, setShowAll] = useState(false);
+  const DEFAULT_LIMIT = 5;
+
+  const displayedReports = showAll ? reports : reports.slice(0, DEFAULT_LIMIT);
+  const hasMoreReports = reports.length > DEFAULT_LIMIT;
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3">
+        <h3 className="text-base font-semibold text-gray-900 md:text-lg">
+          Reports
+        </h3>
+        {canSubmit && (
+          <Button
+            onClick={onAddReport}
+            variant="secondary"
+            className="w-full sm:w-auto min-h-[44px]"
+          >
+            Submit Report
+          </Button>
+        )}
+      </div>
+
+      {loading ? (
+        <div className="text-center py-8 text-gray-500">Loading...</div>
+      ) : reports.length === 0 ? (
+        <div className="text-center py-8 text-gray-500">
+          No reports submitted
+        </div>
+      ) : (
+        <>
+          <Table
+            columns={[
+              {
+                header: "Week",
+                accessor: "week_number" as keyof EvangelismWeeklyReport,
+                render: (value, row) => (
+                  <button
+                    type="button"
+                    onClick={() => onViewReport(row)}
+                    className="text-sm text-left text-primary hover:text-primary hover:underline cursor-pointer transition-colors duration-150 p-0 m-0 bg-transparent border-0 font-medium"
+                    title="Click to view report details"
+                  >
+                    {row.year} W{value}
+                  </button>
+                ),
+              },
+              {
+                header: "Meeting Date",
+                accessor: "meeting_date" as keyof EvangelismWeeklyReport,
+                render: (value, row) => (
+                  <button
+                    type="button"
+                    onClick={() => onViewReport(row)}
+                    className="text-sm text-left text-primary hover:text-primary hover:underline cursor-pointer transition-colors duration-150 p-0 m-0 bg-transparent border-0 font-medium"
+                    title="Click to view report details"
+                  >
+                    {value ? formatLocaleDate(value as string) : "N/A"}
+                  </button>
+                ),
+              },
+              {
+                header: "Gathering",
+                accessor: "gathering_type" as keyof EvangelismWeeklyReport,
+                render: (value) => (
+                  <span
+                    className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getEvangelismGatheringTypeChipClass(
+                      value as string,
+                    )}`}
+                  >
+                    {(value as string) || "N/A"}
+                  </span>
+                ),
+              },
+              {
+                header: "Members",
+                accessor: "members_attended" as keyof EvangelismWeeklyReport,
+                render: (_value, row) => (
+                  <span className="text-sm text-gray-700">
+                    {row.members_attended?.length || 0}
+                  </span>
+                ),
+              },
+              {
+                header: "Visitors",
+                accessor: "visitors_attended" as keyof EvangelismWeeklyReport,
+                render: (_value, row) => (
+                  <span className="text-sm text-gray-700">
+                    {row.visitors_attended?.length || 0}
+                  </span>
+                ),
+              },
+              {
+                header: "Actions",
+                accessor: "id" as keyof EvangelismWeeklyReport,
+                render: (_value, row) => (
+                  <Button
+                    variant="secondary"
+                    onClick={() => onEditReport(row)}
+                    className="min-h-[44px] border border-primary/20 bg-white px-2 py-1 text-xs !text-primary hover:border-primary/30 hover:bg-primary/10 md:min-h-0"
+                  >
+                    Edit
+                  </Button>
+                ),
+              },
+            ]}
+            data={displayedReports}
+            mobileCardView={false}
+          />
+          {hasMoreReports && (
+            <div className="flex justify-center pt-2">
+              <Button
+                variant="tertiary"
+                onClick={() => setShowAll(!showAll)}
+                className="text-sm"
+              >
+                {showAll
+                  ? "Show Less"
+                  : `Show More (${reports.length - DEFAULT_LIMIT} more)`}
+              </Button>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}

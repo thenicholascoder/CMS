@@ -1,0 +1,2587 @@
+import React, { useState, useEffect, useMemo, useRef } from "react";
+import Button from "@/src/components/ui/Button";
+import {
+  ClusterWeeklyReport,
+  ClusterWeeklyReportInput,
+  Cluster,
+  ClusterAnalytics,
+} from "@/src/types/cluster";
+import {
+  clusterReportsApi,
+  PaginatedResponse,
+  branchesApi,
+} from "@/src/lib/api";
+import { formatPersonName } from "@/src/lib/name";
+import { TABLE_ENTITY_LINK_CLASS } from "@/src/lib/tableEntityLink";
+import { getEvangelismGatheringTypeChipClass } from "@/src/lib/evangelismGatheringTypeStyles";
+import ClusterWeeklyReportForm from "./ClusterWeeklyReportForm";
+import ViewWeeklyReportModal from "./ViewWeeklyReportModal";
+import Modal from "@/src/components/ui/Modal";
+import ModalOverlay from "@/src/components/ui/ModalOverlay";
+import ConfirmationModal from "@/src/components/ui/ConfirmationModal";
+import ScalableSelect from "@/src/components/ui/ScalableSelect";
+import {
+  HintTooltip,
+  LockedControlTooltip,
+} from "@/src/components/ui/LockedControlTooltip";
+import Pagination from "@/src/components/ui/Pagination";
+import {
+  ChevronUpIcon,
+  ChevronDownIcon,
+  DocumentArrowDownIcon,
+  InformationCircleIcon,
+  Squares2X2Icon,
+  TableCellsIcon,
+} from "@heroicons/react/24/outline";
+import * as XLSX from "xlsx";
+import { jsPDF } from "jspdf";
+import autoTable from "jspdf-autotable";
+import {
+  LineChart,
+  Line,
+  BarChart,
+  Bar,
+  PieChart,
+  Pie,
+  Cell,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  Legend,
+  ResponsiveContainer,
+} from "recharts";
+import { useAuth } from "@/src/contexts/AuthContext";
+import { canHardDelete } from "@/src/lib/canHardDelete";
+import {
+  userCanAttemptClusterWeeklyReportMutation,
+  userCanExportClusterData,
+} from "@/src/lib/clusterPermissions";
+import { formatLocaleDate } from "@/src/lib/date";
+
+const MEMBER_RATE_TOOLTIP =
+  "Percent of the cluster roster who attended this meeting. Counts only Active, Semi-active, and Inactive members. Other statuses (Dormant, Fall Away, Deceased, etc.) are excluded.";
+
+const STAT_CARDS_GRID =
+  "grid grid-cols-1 tablet:grid-cols-2 xl:grid-cols-4 gap-4";
+
+function MemberRateHelpButton({
+  label,
+  iconClassName = "h-4 w-4",
+  onClick,
+}: {
+  label: string;
+  iconClassName?: string;
+  onClick?: (event: React.MouseEvent<HTMLButtonElement>) => void;
+}) {
+  return (
+    <HintTooltip label={label}>
+      <button
+        type="button"
+        className="inline-flex shrink-0 rounded-full text-gray-400 hover:text-gray-600 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        aria-label="How Member Rate is calculated"
+        onClick={onClick}
+        onMouseDown={onClick}
+      >
+        <InformationCircleIcon className={iconClassName} />
+      </button>
+    </HintTooltip>
+  );
+}
+
+interface ClusterReportsDashboardProps {
+  clusters: Cluster[];
+  /** Clusters shown in the weekly report form picker; defaults to `clusters` when omitted */
+  clustersForReportForm?: Cluster[];
+  externalShowForm?: boolean;
+  externalSelectedCluster?: Cluster | null;
+  externalEditingReport?: ClusterWeeklyReport | null;
+  onFormClose?: () => void;
+  onSubmitReport?: (data: ClusterWeeklyReportInput) => Promise<void>;
+  onEditReport?: (report: ClusterWeeklyReport) => void;
+  onSetReportSelectedCluster?: (cluster: Cluster | null) => void;
+  refreshTrigger?: number; // Increment this to trigger a refresh
+}
+
+export default function ClusterReportsDashboard({
+  clusters,
+  clustersForReportForm,
+  externalShowForm,
+  externalSelectedCluster,
+  externalEditingReport,
+  onFormClose,
+  onSubmitReport: externalOnSubmitReport,
+  onEditReport: externalOnEditReport,
+  onSetReportSelectedCluster: externalOnSetReportSelectedCluster,
+  refreshTrigger,
+}: ClusterReportsDashboardProps) {
+  const [reports, setReports] = useState<ClusterWeeklyReport[]>([]);
+  const [totalCount, setTotalCount] = useState(0);
+  const [analytics, setAnalytics] = useState<ClusterAnalytics | null>(null);
+  const [analyticsLoading, setAnalyticsLoading] = useState(false);
+  const [lastAnalyticsUpdatedAt, setLastAnalyticsUpdatedAt] =
+    useState<Date | null>(null);
+  const [analyticsHighlightFlash, setAnalyticsHighlightFlash] = useState(false);
+  const analyticsHighlightTimerRef = useRef<ReturnType<
+    typeof setTimeout
+  > | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [showForm, setShowForm] = useState(false);
+  const [selectedCluster, setSelectedCluster] = useState<Cluster | null>(null);
+  const [editingReport, setEditingReport] =
+    useState<ClusterWeeklyReport | null>(null);
+
+  // Use external props if provided, otherwise use internal state
+  const isFormOpen =
+    externalShowForm !== undefined ? externalShowForm : showForm;
+  const formSelectedCluster =
+    externalSelectedCluster !== undefined
+      ? externalSelectedCluster
+      : selectedCluster;
+  const formEditingReport =
+    externalEditingReport !== undefined ? externalEditingReport : editingReport;
+  const [viewingReport, setViewingReport] =
+    useState<ClusterWeeklyReport | null>(null);
+  const [showViewModal, setShowViewModal] = useState(false);
+  const [deleteConfirmation, setDeleteConfirmation] = useState<{
+    isOpen: boolean;
+    report: ClusterWeeklyReport | null;
+    loading: boolean;
+  }>({
+    isOpen: false,
+    report: null,
+    loading: false,
+  });
+
+  const { user, isSeniorCoordinator, isModuleCoordinator } = useAuth();
+
+  // Filters
+  const [selectedClusterFilter, setSelectedClusterFilter] =
+    useState<string>("");
+  const [selectedMonth, setSelectedMonth] = useState<string>(
+    String(new Date().getMonth() + 1).padStart(2, "0"),
+  );
+  const [selectedYear, setSelectedYear] = useState<number>(
+    new Date().getFullYear(),
+  );
+  const [availableYears, setAvailableYears] = useState<number[]>([]);
+  const [yearsLoading, setYearsLoading] = useState(false);
+  const [selectedGatheringType, setSelectedGatheringType] =
+    useState<string>("");
+  const [selectedBranchId, setSelectedBranchId] = useState<string>("");
+  const [branchPickerOptions, setBranchPickerOptions] = useState<
+    { value: string; label: string }[]
+  >([]);
+  const [branchesLoading, setBranchesLoading] = useState(false);
+  const prevUserIdRef = useRef<number | undefined>(undefined);
+
+  // ISO weekday Mon=1 … Sun=7 (local calendar)
+  const toIsoWeekday = (dayJsSundayZero: number) =>
+    dayJsSundayZero === 0 ? 7 : dayJsSundayZero;
+
+  /** ISO week number for local date (matches local Monday/Sunday boundaries). */
+  const getLocalISOWeekNumber = (date: Date): number => {
+    const d = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+    d.setHours(0, 0, 0, 0);
+    const isoDow = toIsoWeekday(d.getDay());
+    const mondayThisWeek = new Date(d);
+    mondayThisWeek.setDate(d.getDate() - (isoDow - 1));
+
+    const thursday = new Date(d);
+    thursday.setDate(d.getDate() + 4 - isoDow);
+    const isoYear = thursday.getFullYear();
+
+    const jan4 = new Date(isoYear, 0, 4);
+    const week1Monday = new Date(jan4);
+    week1Monday.setDate(jan4.getDate() - (toIsoWeekday(jan4.getDay()) - 1));
+
+    const diffDays = Math.round(
+      (mondayThisWeek.getTime() - week1Monday.getTime()) / 86400000,
+    );
+    return Math.floor(diffDays / 7) + 1;
+  };
+
+  const getWeekDateRange = (
+    year: number,
+    weekNumber: number,
+  ): { start: Date; end: Date } => {
+    const jan4 = new Date(year, 0, 4);
+    const week1Monday = new Date(jan4);
+    week1Monday.setDate(jan4.getDate() - (toIsoWeekday(jan4.getDay()) - 1));
+
+    const weekStart = new Date(week1Monday);
+    weekStart.setDate(week1Monday.getDate() + (weekNumber - 1) * 7);
+
+    const weekEnd = new Date(weekStart);
+    weekEnd.setDate(weekStart.getDate() + 6);
+
+    return { start: weekStart, end: weekEnd };
+  };
+
+  // Helper function to format date range
+  const formatWeekDateRange = (year: number, weekNumber: number): string => {
+    const { start, end } = getWeekDateRange(year, weekNumber);
+    const startMonth = start.toLocaleDateString("en-US", { month: "short" });
+    const startDay = start.getDate();
+    const endMonth = end.toLocaleDateString("en-US", { month: "short" });
+    const endDay = end.getDate();
+
+    if (startMonth === endMonth) {
+      return `${startMonth} ${startDay}-${endDay}`;
+    } else {
+      return `${startMonth} ${startDay}-${endMonth} ${endDay}`;
+    }
+  };
+
+  const [selectedWeek, setSelectedWeek] = useState<string>(() => {
+    const currentWeek = getLocalISOWeekNumber(new Date());
+    return currentWeek.toString();
+  });
+
+  // Pagination
+  const [currentPage, setCurrentPage] = useState(1);
+  const [itemsPerPage, setItemsPerPage] = useState(50);
+
+  // Sorting
+  const [sortField, setSortField] = useState<string>("");
+  const [sortDirection, setSortDirection] = useState<"asc" | "desc">("asc");
+
+  // Column selection
+  const [showColumnsModal, setShowColumnsModal] = useState(false);
+  const [showExportDropdown, setShowExportDropdown] = useState(false);
+  const exportButtonRef = useRef<HTMLButtonElement>(null);
+  const exportDropdownRef = useRef<HTMLDivElement>(null);
+
+  // Charts visibility
+  const [showCharts, setShowCharts] = useState(false);
+
+  // View mode toggle - Initialize based on screen size (cards for mobile, table for desktop)
+  const [viewMode, setViewMode] = useState<"table" | "cards">(() => {
+    if (typeof window !== "undefined") {
+      return window.innerWidth < 768 ? "cards" : "table";
+    }
+    return "table";
+  });
+
+  const availableColumns = [
+    { key: "cluster", label: "Cluster", default: true },
+    { key: "week", label: "Week", default: true },
+    { key: "meeting_date", label: "Meeting Date", default: true },
+    { key: "attendance", label: "Attendance", default: true },
+    {
+      key: "member_attendance_rate",
+      label: "Member Rate",
+      default: true,
+    },
+    { key: "type", label: "Type", default: true },
+    { key: "offerings", label: "Offerings", default: false },
+    { key: "submitted_by", label: "Submitted By", default: false },
+  ];
+  const [visibleColumns, setVisibleColumns] = useState<Set<string>>(
+    new Set(
+      availableColumns.filter((col) => col.default).map((col) => col.key),
+    ),
+  );
+
+  const canChangeBranchFilter = useMemo(() => {
+    if (!user) return false;
+    if (user.role === "ADMIN" || user.role === "PASTOR") return true;
+    return isSeniorCoordinator("CLUSTER");
+  }, [user, isSeniorCoordinator]);
+
+  useEffect(() => {
+    if (!user) {
+      setSelectedBranchId("");
+      prevUserIdRef.current = undefined;
+      return;
+    }
+    if (prevUserIdRef.current !== user.id) {
+      prevUserIdRef.current = user.id;
+      setSelectedBranchId(
+        user.branch != null && user.branch !== undefined
+          ? String(user.branch)
+          : "",
+      );
+      return;
+    }
+    if (user.branch != null && user.branch !== undefined) {
+      setSelectedBranchId((prev) => (prev === "" ? String(user.branch) : prev));
+    }
+  }, [user]);
+
+  useEffect(() => {
+    if (!canChangeBranchFilter) {
+      setBranchPickerOptions([]);
+      return;
+    }
+    let cancelled = false;
+    setBranchesLoading(true);
+    branchesApi
+      .getAll({ is_active: true })
+      .then((res) => {
+        if (cancelled) return;
+        const rows = Array.isArray(res.data) ? res.data : [];
+        setBranchPickerOptions(
+          rows.map((b) => ({ value: String(b.id), label: b.name })),
+        );
+      })
+      .catch((err) => {
+        console.error("Error loading branches:", err);
+        if (!cancelled) setBranchPickerOptions([]);
+      })
+      .finally(() => {
+        if (!cancelled) setBranchesLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [canChangeBranchFilter]);
+
+  const editableBranchSelectOptions = useMemo(
+    () => [{ value: "", label: "All branches" }, ...branchPickerOptions],
+    [branchPickerOptions],
+  );
+
+  const branchFilterLabel = useMemo(() => {
+    if (!selectedBranchId) return "No branch";
+    if (
+      user?.branch_name &&
+      user.branch != null &&
+      String(user.branch) === selectedBranchId
+    ) {
+      return user.branch_name;
+    }
+    const opt = branchPickerOptions.find((o) => o.value === selectedBranchId);
+    return opt?.label ?? `Branch #${selectedBranchId}`;
+  }, [selectedBranchId, user?.branch, user?.branch_name, branchPickerOptions]);
+
+  const readonlyBranchSelectOptions = useMemo(() => {
+    if (selectedBranchId) {
+      return [{ value: selectedBranchId, label: branchFilterLabel }];
+    }
+    return [{ value: "", label: "No branch assigned" }];
+  }, [selectedBranchId, branchFilterLabel]);
+
+  const reportsBranchSelectInteractive =
+    canChangeBranchFilter && !branchesLoading;
+
+  const reportsBranchHoverHint = useMemo(() => {
+    if (reportsBranchSelectInteractive) return "";
+    if (branchesLoading && canChangeBranchFilter) {
+      return "Loading branches…";
+    }
+    return "Branch is limited to your assignment.";
+  }, [reportsBranchSelectInteractive, branchesLoading, canChangeBranchFilter]);
+
+  const clustersForFilters = useMemo(() => {
+    if (!selectedBranchId) return clusters;
+    const bid = Number(selectedBranchId);
+    if (Number.isNaN(bid)) return clusters;
+    return clusters.filter((c) => c.branch != null && Number(c.branch) === bid);
+  }, [clusters, selectedBranchId]);
+
+  useEffect(() => {
+    setSelectedClusterFilter((prev) => {
+      if (!prev) return prev;
+      const ok = clustersForFilters.some((c) => String(c.id) === prev);
+      return ok ? prev : "";
+    });
+  }, [clustersForFilters, selectedBranchId]);
+
+  const canMutateWeeklyReports = useMemo(
+    () =>
+      userCanAttemptClusterWeeklyReportMutation(clustersForFilters, {
+        userId: user?.id,
+        role: user?.role,
+        isSeniorCoordinator,
+        isModuleCoordinator,
+      }),
+    [
+      clustersForFilters,
+      user?.id,
+      user?.role,
+      isSeniorCoordinator,
+      isModuleCoordinator,
+    ],
+  );
+  const userCanHardDeleteReports = canHardDelete(user);
+  const canExportReports = userCanExportClusterData({
+    role: user?.role,
+    isSeniorCoordinator,
+  });
+
+  // Handle sorting
+  const handleSort = (field: string) => {
+    if (sortField === field) {
+      setSortDirection(sortDirection === "asc" ? "desc" : "asc");
+    } else {
+      setSortField(field);
+      setSortDirection("asc");
+    }
+  };
+
+  // Fetch reports with pagination and filters
+  const fetchReports = async () => {
+    try {
+      setLoading(true);
+      const params: any = {
+        page: currentPage,
+        page_size: itemsPerPage,
+      };
+
+      if (selectedClusterFilter) params.cluster = selectedClusterFilter;
+      if (selectedBranchId) params.branch_id = selectedBranchId;
+      if (selectedYear) params.year = selectedYear;
+      if (selectedGatheringType) params.gathering_type = selectedGatheringType;
+      if (selectedMonth) params.month = selectedMonth;
+      if (selectedWeek) params.week_number = selectedWeek;
+
+      const response = await clusterReportsApi.getAll(params);
+      const data = response.data as PaginatedResponse<ClusterWeeklyReport>;
+
+      setReports(data.results);
+      setTotalCount(data.count);
+    } catch (error) {
+      console.error("Error fetching reports:", error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Fetch analytics
+  const fetchAnalytics = async () => {
+    try {
+      setAnalyticsLoading(true);
+      const params: any = {};
+      if (selectedClusterFilter) params.cluster = selectedClusterFilter;
+      if (selectedBranchId) params.branch_id = selectedBranchId;
+      if (selectedYear) params.year = selectedYear;
+      if (selectedMonth) params.month = selectedMonth;
+      if (selectedGatheringType) params.gathering_type = selectedGatheringType;
+      if (selectedWeek) params.week_number = selectedWeek;
+
+      const response = await clusterReportsApi.analytics(params);
+      setAnalytics(response.data);
+      setLastAnalyticsUpdatedAt(new Date());
+      if (analyticsHighlightTimerRef.current) {
+        clearTimeout(analyticsHighlightTimerRef.current);
+      }
+      setAnalyticsHighlightFlash(true);
+      analyticsHighlightTimerRef.current = setTimeout(() => {
+        setAnalyticsHighlightFlash(false);
+        analyticsHighlightTimerRef.current = null;
+      }, 1500);
+    } catch (error) {
+      console.error("Error fetching analytics:", error);
+    } finally {
+      setAnalyticsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    setYearsLoading(true);
+    const params: {
+      branch_id?: string;
+      cluster?: string;
+      gathering_type?: string;
+    } = {};
+    if (selectedBranchId) params.branch_id = selectedBranchId;
+    if (selectedClusterFilter) params.cluster = selectedClusterFilter;
+    if (selectedGatheringType) params.gathering_type = selectedGatheringType;
+
+    clusterReportsApi
+      .distinctYears(params)
+      .then((res) => {
+        if (!cancelled) setAvailableYears(res.data.years ?? []);
+      })
+      .catch((err) => {
+        console.error("Error fetching distinct years:", err);
+        if (!cancelled) setAvailableYears([]);
+      })
+      .finally(() => {
+        if (!cancelled) setYearsLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    selectedBranchId,
+    selectedClusterFilter,
+    selectedGatheringType,
+    refreshTrigger,
+  ]);
+
+  useEffect(() => {
+    if (availableYears.length === 0) return;
+    setSelectedYear((y) =>
+      availableYears.includes(y) ? y : availableYears[0],
+    );
+  }, [availableYears]);
+
+  useEffect(() => {
+    fetchReports();
+  }, [
+    currentPage,
+    itemsPerPage,
+    selectedClusterFilter,
+    selectedBranchId,
+    selectedMonth,
+    selectedYear,
+    selectedGatheringType,
+    selectedWeek,
+    refreshTrigger, // Refresh when trigger changes
+  ]);
+
+  useEffect(() => {
+    fetchAnalytics();
+  }, [
+    selectedClusterFilter,
+    selectedBranchId,
+    selectedMonth,
+    selectedYear,
+    selectedGatheringType,
+    selectedWeek,
+    refreshTrigger, // Refresh analytics when trigger changes
+  ]);
+
+  useEffect(() => {
+    return () => {
+      if (analyticsHighlightTimerRef.current) {
+        clearTimeout(analyticsHighlightTimerRef.current);
+      }
+    };
+  }, []);
+
+  // Reset to first page when filters change
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [
+    selectedClusterFilter,
+    selectedBranchId,
+    selectedMonth,
+    selectedYear,
+    selectedGatheringType,
+    selectedWeek,
+  ]);
+
+  // Handle click outside export dropdown
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (
+        exportButtonRef.current &&
+        exportDropdownRef.current &&
+        !exportButtonRef.current.contains(event.target as Node) &&
+        !exportDropdownRef.current.contains(event.target as Node) &&
+        showExportDropdown
+      ) {
+        setShowExportDropdown(false);
+      }
+    };
+
+    if (showExportDropdown) {
+      document.addEventListener("mousedown", handleClickOutside);
+    }
+
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+    };
+  }, [showExportDropdown]);
+
+  // Sort reports (client-side sorting on current page)
+  const sortedReports = useMemo(() => {
+    if (!sortField) return reports;
+
+    const sorted = [...reports];
+    sorted.sort((a, b) => {
+      let aValue: any;
+      let bValue: any;
+
+      switch (sortField) {
+        case "cluster":
+          aValue = a.cluster_name || "";
+          bValue = b.cluster_name || "";
+          break;
+        case "week":
+          aValue = `${a.year}-${a.week_number}`;
+          bValue = `${b.year}-${b.week_number}`;
+          break;
+        case "meeting_date":
+          aValue = new Date(a.meeting_date).getTime();
+          bValue = new Date(b.meeting_date).getTime();
+          break;
+        case "attendance":
+          aValue = a.members_present + a.visitors_present;
+          bValue = b.members_present + b.visitors_present;
+          break;
+        case "member_attendance_rate":
+          aValue = a.member_attendance_rate ?? 0;
+          bValue = b.member_attendance_rate ?? 0;
+          break;
+        case "type":
+          aValue = a.gathering_type;
+          bValue = b.gathering_type;
+          break;
+        case "offerings":
+          aValue =
+            typeof a.offerings === "string"
+              ? parseFloat(a.offerings)
+              : a.offerings;
+          bValue =
+            typeof b.offerings === "string"
+              ? parseFloat(b.offerings)
+              : b.offerings;
+          break;
+        case "submitted_by":
+          aValue = a.submitted_by_details
+            ? formatPersonName(a.submitted_by_details)
+            : "";
+          bValue = b.submitted_by_details
+            ? formatPersonName(b.submitted_by_details)
+            : "";
+          break;
+        default:
+          aValue = "";
+          bValue = "";
+      }
+
+      if (aValue < bValue) return sortDirection === "asc" ? -1 : 1;
+      if (aValue > bValue) return sortDirection === "asc" ? 1 : -1;
+      return 0;
+    });
+
+    return sorted;
+  }, [reports, sortField, sortDirection]);
+
+  // SortIcon component - only shows arrow for active field
+  const SortIcon = ({ field }: { field: string }) => {
+    if (field !== sortField) return null;
+    return sortDirection === "asc" ? (
+      <ChevronUpIcon className="w-4 h-4 inline-block" />
+    ) : (
+      <ChevronDownIcon className="w-4 h-4 inline-block" />
+    );
+  };
+
+  // Memoized cluster options for scalable select
+  const clusterOptions = useMemo(
+    () => [
+      { value: "", label: "All Clusters" },
+      ...clustersForFilters.map((cluster) => ({
+        value: String(cluster.id),
+        label: cluster.name || "Unnamed Cluster",
+        clusterCode: cluster.code || undefined,
+        clusterBranchId: cluster.branch != null ? Number(cluster.branch) : null,
+      })),
+    ],
+    [clustersForFilters],
+  );
+
+  const chartMonthlyAttendance = useMemo(() => {
+    const apiMonthly = analytics?.chart_series?.monthly_attendance;
+    if (apiMonthly?.length) {
+      return apiMonthly.map((m) => ({
+        month: m.month_label,
+        members: m.members,
+        visitors: m.visitors,
+      }));
+    }
+    const monthlyData: Record<
+      string,
+      { month: string; members: number; visitors: number }
+    > = {};
+    reports.forEach((report) => {
+      const date = new Date(report.meeting_date);
+      const monthKey = `${date.getFullYear()}-${String(
+        date.getMonth() + 1,
+      ).padStart(2, "0")}`;
+      const monthLabel = date.toLocaleDateString("en-US", {
+        month: "short",
+        year: "numeric",
+      });
+      if (!monthlyData[monthKey]) {
+        monthlyData[monthKey] = {
+          month: monthLabel,
+          members: 0,
+          visitors: 0,
+        };
+      }
+      monthlyData[monthKey].members += report.members_attended?.length || 0;
+      monthlyData[monthKey].visitors += report.visitors_attended?.length || 0;
+    });
+    return Object.values(monthlyData).sort((a, b) => {
+      const dateA = new Date(a.month);
+      const dateB = new Date(b.month);
+      return dateA.getTime() - dateB.getTime();
+    });
+  }, [analytics?.chart_series?.monthly_attendance, reports]);
+
+  const chartClusterComparison = useMemo(() => {
+    const rows = analytics?.chart_series?.cluster_comparison;
+    if (rows?.length) {
+      return rows
+        .map((row) => {
+          const cluster = clustersForFilters.find(
+            (c) => c.id === row.cluster_id,
+          );
+          const rc = row.report_count;
+          const sum = row.sum_members_attended;
+          const attendanceRate =
+            typeof row.attendance_rate === "number"
+              ? Math.min(100, Math.round(row.attendance_rate))
+              : 0;
+          return {
+            cluster:
+              cluster?.code ||
+              (row.cluster_label.includes(" - ")
+                ? row.cluster_label.split(" - ")[0]
+                : row.cluster_label),
+            attendanceRate,
+            avgAttendance: rc > 0 ? Math.round(sum / rc) : 0,
+          };
+        })
+        .sort((a, b) => b.attendanceRate - a.attendanceRate)
+        .slice(0, 10);
+    }
+    const clusterData: Record<
+      string,
+      { cluster: string; attendanceRate: number; avgAttendance: number }
+    > = {};
+    reports.forEach((report) => {
+      const clusterId = report.cluster?.toString() || "";
+      const cluster = clustersForFilters.find(
+        (c) => c.id.toString() === clusterId,
+      );
+      const clusterLabel =
+        cluster?.code || cluster?.name || `Cluster ${clusterId}`;
+      if (!clusterData[clusterId]) {
+        clusterData[clusterId] = {
+          cluster: clusterLabel,
+          attendanceRate: 0,
+          avgAttendance: 0,
+        };
+      }
+      const memberCount = report.members_attended?.length || 0;
+      clusterData[clusterId].avgAttendance += memberCount;
+    });
+    Object.keys(clusterData).forEach((clusterId) => {
+      const clusterReports = reports.filter(
+        (r) => r.cluster?.toString() === clusterId,
+      );
+      if (clusterReports.length > 0) {
+        clusterData[clusterId].avgAttendance = Math.round(
+          clusterData[clusterId].avgAttendance / clusterReports.length,
+        );
+        const rates = clusterReports
+          .map((r) => r.member_attendance_rate)
+          .filter((rate): rate is number => typeof rate === "number");
+        clusterData[clusterId].attendanceRate =
+          rates.length > 0
+            ? Math.min(
+                100,
+                Math.round(
+                  rates.reduce((sum, rate) => sum + rate, 0) / rates.length,
+                ),
+              )
+            : 0;
+      }
+    });
+    return Object.values(clusterData)
+      .sort((a, b) => b.attendanceRate - a.attendanceRate)
+      .slice(0, 10);
+  }, [
+    analytics?.chart_series?.cluster_comparison,
+    clustersForFilters,
+    reports,
+  ]);
+
+  const chartGatheringPieData = useMemo(() => {
+    const dist = analytics?.gathering_type_distribution;
+    if (dist?.length) {
+      return dist.map((d) => ({
+        name: d.gathering_type || "UNKNOWN",
+        value: d.count,
+      }));
+    }
+    const typeCounts: Record<string, number> = {};
+    reports.forEach((report) => {
+      const type = report.gathering_type || "UNKNOWN";
+      typeCounts[type] = (typeCounts[type] || 0) + 1;
+    });
+    return Object.entries(typeCounts).map(([name, value]) => ({
+      name,
+      value,
+    }));
+  }, [analytics?.gathering_type_distribution, reports]);
+
+  const handleCreateReport = (cluster: Cluster) => {
+    if (externalSelectedCluster !== undefined) {
+      // Controlled from parent
+      if (onFormClose) {
+        // Parent will handle opening
+        return;
+      }
+    }
+    setSelectedCluster(cluster);
+    setEditingReport(null);
+    setShowForm(true);
+  };
+
+  const handleEditReport = (report: ClusterWeeklyReport) => {
+    const cluster =
+      clustersForFilters.find((c) => c.id === report.cluster) ??
+      clusters.find((c) => c.id === report.cluster);
+    if (cluster) {
+      // Use external handler if provided
+      if (externalOnEditReport) {
+        externalOnEditReport(report);
+        if (externalOnSetReportSelectedCluster) {
+          externalOnSetReportSelectedCluster(cluster);
+        }
+      } else {
+        // Otherwise use internal state
+        setSelectedCluster(cluster);
+        setEditingReport(report);
+        setShowForm(true);
+      }
+    }
+  };
+
+  const handleSubmitReport = async (data: ClusterWeeklyReportInput) => {
+    try {
+      // Use external handler if provided
+      if (externalOnSubmitReport) {
+        await externalOnSubmitReport(data);
+        // Refresh reports after external submission
+        await fetchReports();
+        await fetchAnalytics();
+        if (onFormClose) {
+          onFormClose();
+        }
+        return;
+      }
+
+      // Otherwise use internal handler
+      if (formEditingReport) {
+        await clusterReportsApi.update(formEditingReport.id.toString(), data);
+      } else {
+        await clusterReportsApi.create(data);
+        // Reset to first page when adding new report
+        setCurrentPage(1);
+      }
+      await fetchReports();
+      await fetchAnalytics();
+      setShowForm(false);
+      setSelectedCluster(null);
+      setEditingReport(null);
+    } catch (error) {
+      console.error("Error submitting report:", error);
+      throw error;
+    }
+  };
+
+  const handleDeleteReport = async (report: ClusterWeeklyReport) => {
+    setDeleteConfirmation({
+      isOpen: true,
+      report: report,
+      loading: false,
+    });
+  };
+
+  const confirmDeleteReport = async () => {
+    if (deleteConfirmation.report) {
+      setDeleteConfirmation((prev) => ({ ...prev, loading: true }));
+      try {
+        await clusterReportsApi.delete(deleteConfirmation.report.id.toString());
+        await fetchReports();
+        await fetchAnalytics();
+        setDeleteConfirmation({
+          isOpen: false,
+          report: null,
+          loading: false,
+        });
+        // Close view modal if it's open
+        if (viewingReport?.id === deleteConfirmation.report.id) {
+          setShowViewModal(false);
+          setViewingReport(null);
+        }
+      } catch (error) {
+        console.error("Error deleting report:", error);
+        setDeleteConfirmation((prev) => ({ ...prev, loading: false }));
+      }
+    }
+  };
+
+  const closeDeleteConfirmation = () => {
+    setDeleteConfirmation({
+      isOpen: false,
+      report: null,
+      loading: false,
+    });
+  };
+
+  const handleViewReport = (report: ClusterWeeklyReport) => {
+    setViewingReport(report);
+    setShowViewModal(true);
+  };
+
+  const formatCurrency = (amount: number) => {
+    return new Intl.NumberFormat("en-PH", {
+      style: "currency",
+      currency: "PHP",
+    }).format(amount);
+  };
+
+  // Export functions
+  const exportToExcel = () => {
+    const worksheet = XLSX.utils.json_to_sheet(
+      sortedReports.map((report) => ({
+        Cluster: report.cluster_name || report.cluster_code || "",
+        "Cluster Code": report.cluster_code || "",
+        Week: `${report.year} W${report.week_number}`,
+        Year: report.year,
+        "Week Number": report.week_number,
+        "Meeting Date": formatLocaleDate(report.meeting_date),
+        "Members Present": report.members_present,
+        "Visitors Present": report.visitors_present,
+        "Prospects Invited":
+          report.prospects_invited_count ??
+          report.prospects_invited?.length ??
+          0,
+        "Member Attendance Rate": report.member_attendance_rate
+          ? `${report.member_attendance_rate.toFixed(1)}%`
+          : "N/A",
+        "Gathering Type": report.gathering_type,
+        Offerings: report.offerings,
+        "Submitted By": report.submitted_by_details
+          ? formatPersonName(report.submitted_by_details as any)
+          : "Unknown",
+        "Submitted At": new Date(report.submitted_at).toLocaleDateString(),
+      })),
+    );
+
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, "Weekly Reports");
+    XLSX.writeFile(workbook, "weekly_reports.xlsx");
+  };
+
+  const exportToPDF = () => {
+    const doc = new jsPDF();
+
+    const tableColumn = [
+      "Cluster",
+      "Week",
+      "Meeting Date",
+      "Members",
+      "Visitors",
+      "Rate",
+      "Type",
+      "Offerings",
+      "Submitted By",
+    ];
+
+    const tableRows = sortedReports.map((report) => [
+      report.cluster_name || report.cluster_code || "",
+      `${report.year} W${report.week_number}`,
+      formatLocaleDate(report.meeting_date),
+      report.members_present.toString(),
+      report.visitors_present.toString(),
+      report.member_attendance_rate
+        ? `${report.member_attendance_rate.toFixed(1)}%`
+        : "N/A",
+      report.gathering_type,
+      formatCurrency(
+        typeof report.offerings === "number"
+          ? report.offerings
+          : parseFloat(String(report.offerings)) || 0,
+      ),
+      report.submitted_by_details
+        ? formatPersonName(report.submitted_by_details as any)
+        : "Unknown",
+    ]);
+
+    autoTable(doc, {
+      head: [tableColumn],
+      body: tableRows,
+      startY: 20,
+      theme: "grid",
+      styles: { fontSize: 8 },
+    });
+
+    doc.save("weekly_reports.pdf");
+  };
+
+  const exportToCSV = () => {
+    const csvContent = sortedReports
+      .map((report) =>
+        [
+          report.cluster_name || report.cluster_code || "",
+          `${report.year} W${report.week_number}`,
+          formatLocaleDate(report.meeting_date),
+          report.members_present,
+          report.visitors_present,
+          report.member_attendance_rate
+            ? `${report.member_attendance_rate.toFixed(1)}%`
+            : "N/A",
+          report.gathering_type,
+          report.offerings,
+          report.submitted_by_details
+            ? formatPersonName(report.submitted_by_details as any)
+            : "Unknown",
+        ].join(","),
+      )
+      .join("\n");
+
+    const blob = new Blob(
+      [
+        `Cluster,Week,Meeting Date,Members,Visitors,Attendance Rate,Type,Offerings,Submitted By\n${csvContent}`,
+      ],
+      {
+        type: "text/csv;charset=utf-8;",
+      },
+    );
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = "weekly_reports.csv";
+    link.click();
+  };
+
+  const handleExport = (format: "excel" | "pdf" | "csv") => {
+    if (!canExportReports) return;
+    switch (format) {
+      case "excel":
+        exportToExcel();
+        break;
+      case "pdf":
+        exportToPDF();
+        break;
+      case "csv":
+        exportToCSV();
+        break;
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-8">
+        <div className="flex items-center gap-2 text-gray-500">
+          <svg className="animate-spin h-5 w-5" fill="none" viewBox="0 0 24 24">
+            <circle
+              className="opacity-25"
+              cx="12"
+              cy="12"
+              r="10"
+              stroke="currentColor"
+              strokeWidth="4"
+            ></circle>
+            <path
+              className="opacity-75"
+              fill="currentColor"
+              d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+            ></path>
+          </svg>
+          <span>Loading reports...</span>
+        </div>
+      </div>
+    );
+  }
+
+  const reportsBranchFilterSelect = (
+    <ScalableSelect
+      options={
+        canChangeBranchFilter
+          ? editableBranchSelectOptions
+          : readonlyBranchSelectOptions
+      }
+      value={selectedBranchId}
+      onChange={setSelectedBranchId}
+      placeholder="Branch"
+      searchPlaceholder="Search branches..."
+      className="w-full"
+      disabled={false}
+      interactionBlocked={!reportsBranchSelectInteractive}
+      loading={
+        reportsBranchSelectInteractive &&
+        canChangeBranchFilter &&
+        branchesLoading
+      }
+      showSearch={reportsBranchSelectInteractive && canChangeBranchFilter}
+      maxHeight={220}
+      emptyMessage="No branches found"
+      virtualizeThreshold={50}
+    />
+  );
+
+  return (
+    <div className="space-y-6">
+      {/* Header */}
+      {/* <div className="flex items-center justify-between">
+        <h1 className="text-2xl font-bold text-foreground">
+          Cluster Weekly Reports
+        </h1>
+        <div className="flex gap-3">
+          <Button
+            onClick={() => {
+              if (externalSelectedCluster !== undefined && onFormClose) {
+                // Controlled from parent - let parent handle it
+                return;
+              }
+              setSelectedCluster(null);
+              setEditingReport(null);
+              setShowForm(true);
+            }}
+          >
+            Submit Report
+          </Button>
+        </div>
+      </div> */}
+
+      {/* Analytics Cards */}
+      <div className="space-y-2">
+        <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
+          <p className="text-sm text-gray-500 max-w-3xl">
+            These totals include every report that matches the filters below.
+          </p>
+          <p
+            className="text-xs text-gray-500 shrink-0 tabular-nums"
+            aria-live="polite"
+            aria-atomic="true"
+          >
+            {analyticsLoading
+              ? "Updating statistics…"
+              : lastAnalyticsUpdatedAt
+                ? `Statistics updated ${lastAnalyticsUpdatedAt.toLocaleTimeString(
+                    undefined,
+                    {
+                      hour: "numeric",
+                      minute: "2-digit",
+                    },
+                  )}`
+                : null}
+          </p>
+        </div>
+
+        {analyticsLoading && !analytics ? (
+          <div
+            className={STAT_CARDS_GRID}
+            aria-busy="true"
+            aria-label="Loading statistics"
+          >
+            {[1, 2, 3, 4].map((i) => (
+              <div
+                key={i}
+                className="bg-white p-6 py-4 rounded-lg border border-gray-200 shadow-sm animate-pulse"
+              >
+                <div className="flex items-center">
+                  <div className="h-10 w-10 bg-gray-200 rounded-lg shrink-0" />
+                  <div className="ml-4 flex-1 space-y-2">
+                    <div className="h-4 bg-gray-200 rounded w-24" />
+                    <div className="h-7 bg-gray-200 rounded w-16" />
+                    <div className="h-3 bg-gray-100 rounded w-32" />
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : null}
+
+        {analytics &&
+          (() => {
+            const reportFrequency = selectedMonth
+              ? analytics.total_reports
+              : Math.round((analytics.total_reports / 12) * 10) / 10;
+
+            const memberAttendanceRate = Math.min(
+              100,
+              typeof analytics.average_member_attendance_rate === "number"
+                ? Math.round(analytics.average_member_attendance_rate * 10) / 10
+                : 0,
+            );
+
+            const visitorCountPerMonth = selectedMonth
+              ? analytics.total_attendance.visitors
+              : Math.round((analytics.total_attendance.visitors / 12) * 10) /
+                10;
+
+            const avgMemberAttendance =
+              Math.round(analytics.average_attendance.avg_members * 10) / 10;
+
+            return (
+              <div
+                className={`${STAT_CARDS_GRID} transition-shadow duration-300 rounded-lg p-0.5 -m-0.5 ${
+                  analyticsHighlightFlash
+                    ? "ring-2 ring-primary/30 ring-offset-2 ring-offset-gray-50"
+                    : ""
+                } ${analyticsLoading ? "opacity-60" : ""}`}
+                role="region"
+                aria-label="Report statistics"
+                aria-busy={analyticsLoading}
+              >
+                {/* Report Frequency Card */}
+                <div
+                  className="bg-white p-6 py-4 rounded-lg border border-gray-200 shadow-sm"
+                  role="region"
+                  aria-label="Report Frequency"
+                >
+                  <div className="flex items-center min-w-0">
+                    <div
+                      className="p-1.5 chip-primary-surface rounded-lg shrink-0"
+                      aria-hidden="true"
+                    >
+                      <svg
+                        className="w-5 h-5 text-primary"
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={2}
+                          d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"
+                        />
+                      </svg>
+                    </div>
+                    <div className="ml-4 min-w-0">
+                      <p
+                        className="text-sm font-medium text-gray-600"
+                        aria-label="Metric label"
+                      >
+                        Report Frequency
+                      </p>
+                      <p
+                        className="text-2xl font-semibold text-gray-900"
+                        aria-label="Report frequency value"
+                      >
+                        {reportFrequency}
+                      </p>
+                      <p
+                        className="text-xs text-gray-500 mt-1"
+                        aria-label="Metric description"
+                      >
+                        {selectedMonth
+                          ? "Reports this month"
+                          : "Average reports per month"}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Member Attendance Rate Card */}
+                <div
+                  className="bg-white p-6 py-4 rounded-lg border border-gray-200 shadow-sm"
+                  role="region"
+                  aria-label="Member Attendance Rate"
+                >
+                  <div className="flex items-center min-w-0">
+                    <div
+                      className="p-1.5 chip-green-surface rounded-lg shrink-0"
+                      aria-hidden="true"
+                    >
+                      <svg
+                        className="w-5 h-5 text-green-600"
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={2}
+                          d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"
+                        />
+                      </svg>
+                    </div>
+                    <div className="ml-4 min-w-0">
+                      <p
+                        className="text-sm font-medium text-gray-600"
+                        aria-label="Metric label"
+                      >
+                        Member Attendance Rate
+                      </p>
+                      <p
+                        className="text-2xl font-semibold text-gray-900"
+                        aria-label="Member attendance rate value"
+                      >
+                        {memberAttendanceRate}%
+                      </p>
+                      <p
+                        className="text-xs text-gray-500 mt-1"
+                        aria-label="Metric description"
+                      >
+                        % of members attending
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Visitor Count per Month Card */}
+                <div
+                  className="bg-white p-6 py-4 rounded-lg border border-gray-200 shadow-sm"
+                  role="region"
+                  aria-label="Visitor Count per Month"
+                >
+                  <div className="flex items-center min-w-0">
+                    <div
+                      className="p-1.5 chip-yellow-surface rounded-lg shrink-0"
+                      aria-hidden="true"
+                    >
+                      <svg
+                        className="w-5 h-5 text-yellow-600"
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={2}
+                          d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"
+                        />
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"
+                        />
+                      </svg>
+                    </div>
+                    <div className="ml-4 min-w-0">
+                      <p
+                        className="text-sm font-medium text-gray-600"
+                        aria-label="Metric label"
+                      >
+                        Visitor Count
+                      </p>
+                      <p
+                        className="text-2xl font-semibold text-gray-900"
+                        aria-label="Visitor count per month value"
+                      >
+                        {visitorCountPerMonth}
+                      </p>
+                      <p
+                        className="text-xs text-gray-500 mt-1"
+                        aria-label="Metric description"
+                      >
+                        {selectedMonth
+                          ? "Visitors this month"
+                          : "Average visitors per month"}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Average Member Attendance Card */}
+                <div
+                  className="bg-white p-6 py-4 rounded-lg border border-gray-200 shadow-sm"
+                  role="region"
+                  aria-label="Average Member Attendance"
+                >
+                  <div className="flex items-center min-w-0">
+                    <div
+                      className="p-1.5 chip-purple-surface rounded-lg shrink-0"
+                      aria-hidden="true"
+                    >
+                      <svg
+                        className="w-5 h-5 text-purple-600"
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={2}
+                          d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"
+                        />
+                      </svg>
+                    </div>
+                    <div className="ml-4 min-w-0">
+                      <p
+                        className="text-sm font-medium text-gray-600"
+                        aria-label="Metric label"
+                      >
+                        Avg Member Attendance
+                      </p>
+                      <p
+                        className="text-2xl font-semibold text-gray-900"
+                        aria-label="Average member attendance value"
+                      >
+                        {avgMemberAttendance}
+                      </p>
+                      <p
+                        className="text-xs text-gray-500 mt-1"
+                        aria-label="Metric description"
+                      >
+                        Average members per report
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
+      </div>
+
+      {/* Charts Section */}
+      {analytics && analytics.total_reports > 0 && (
+        <div className="mt-6">
+          <p className="text-sm text-gray-500 mb-3">
+            Charts include every report that matches the filters below—not only
+            this page.
+          </p>
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-lg font-semibold text-gray-900">
+              Analytics Charts
+            </h2>
+            <button
+              onClick={() => setShowCharts(!showCharts)}
+              className="flex items-center gap-2 px-3 py-1.5 min-h-[44px] text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-ring"
+            >
+              {showCharts ? (
+                <>
+                  <svg
+                    className="w-4 h-4"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21"
+                    />
+                  </svg>
+                  Hide Charts
+                </>
+              ) : (
+                <>
+                  <svg
+                    className="w-4 h-4"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"
+                    />
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"
+                    />
+                  </svg>
+                  Show Charts
+                </>
+              )}
+            </button>
+          </div>
+          {showCharts && (
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              {/* Chart 1: Attendance Trend Over Time */}
+              <div className="bg-white p-6 rounded-lg border border-gray-200 shadow-sm">
+                <h3 className="text-lg font-semibold text-gray-900 mb-4">
+                  Attendance Trend
+                </h3>
+                <div className="h-[300px] w-full">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={chartMonthlyAttendance}>
+                      <CartesianGrid strokeDasharray="3 3" />
+                      <XAxis dataKey="month" />
+                      <YAxis />
+                      <Tooltip />
+                      <Legend />
+                      <Line
+                        type="monotone"
+                        dataKey="members"
+                        stroke="primary"
+                        strokeWidth={2}
+                        name="Members"
+                      />
+                      <Line
+                        type="monotone"
+                        dataKey="visitors"
+                        stroke="#F59E0B"
+                        strokeWidth={2}
+                        name="Visitors"
+                      />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+
+              {/* Chart 2: Cluster Comparison */}
+              <div className="bg-white p-6 rounded-lg border border-gray-200 shadow-sm">
+                <h3 className="text-lg font-semibold text-gray-900 mb-4">
+                  Cluster Comparison
+                </h3>
+                <div className="h-[300px] w-full">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={chartClusterComparison}>
+                      <CartesianGrid strokeDasharray="3 3" />
+                      <XAxis
+                        dataKey="cluster"
+                        angle={-45}
+                        textAnchor="end"
+                        height={100}
+                      />
+                      <YAxis />
+                      <Tooltip />
+                      <Legend />
+                      <Bar
+                        dataKey="attendanceRate"
+                        fill="primary"
+                        name="Attendance Rate (%)"
+                      />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+
+              {/* Chart 3: Gathering Type Distribution */}
+              <div className="bg-white p-6 rounded-lg border border-gray-200 shadow-sm">
+                <h3 className="text-lg font-semibold text-gray-900 mb-4">
+                  Gathering Type Distribution
+                </h3>
+                <div className="h-[300px] w-full">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <PieChart>
+                      <Pie
+                        data={chartGatheringPieData}
+                        cx="50%"
+                        cy="50%"
+                        labelLine={false}
+                        label={({ name, percent }) =>
+                          `${name}: ${(percent * 100).toFixed(0)}%`
+                        }
+                        outerRadius={80}
+                        fill="#8884d8"
+                        dataKey="value"
+                      >
+                        {(() => {
+                          const COLORS = ["primary", "#F59E0B", "#10B981"];
+                          return chartGatheringPieData.map((_, index) => (
+                            <Cell
+                              key={`cell-${index}`}
+                              fill={COLORS[index % COLORS.length]}
+                            />
+                          ));
+                        })()}
+                      </Pie>
+                      <Tooltip />
+                      <Legend />
+                    </PieChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+
+              {/* Chart 4: Attendance by Month */}
+              <div className="bg-white p-6 rounded-lg border border-gray-200 shadow-sm">
+                <h3 className="text-lg font-semibold text-gray-900 mb-4">
+                  Attendance by Month
+                </h3>
+                <div className="h-[300px] w-full">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={chartMonthlyAttendance}>
+                      <CartesianGrid strokeDasharray="3 3" />
+                      <XAxis dataKey="month" />
+                      <YAxis />
+                      <Tooltip />
+                      <Legend />
+                      <Bar dataKey="members" fill="primary" name="Members" />
+                      <Bar dataKey="visitors" fill="#F59E0B" name="Visitors" />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Filters */}
+      <div className="bg-white p-4 rounded-lg border border-gray-200 shadow-sm">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 lg:flex lg:flex-nowrap">
+          <div className="lg:w-36 lg:shrink-0">
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Branch
+            </label>
+            {reportsBranchSelectInteractive ? (
+              reportsBranchFilterSelect
+            ) : (
+              <LockedControlTooltip
+                label={reportsBranchHoverHint}
+                wrapperClassName="block w-full cursor-default"
+              >
+                {reportsBranchFilterSelect}
+              </LockedControlTooltip>
+            )}
+          </div>
+
+          <div className="min-w-0 lg:flex-1">
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Cluster
+            </label>
+            <ScalableSelect
+              options={clusterOptions}
+              value={selectedClusterFilter ? String(selectedClusterFilter) : ""}
+              onChange={setSelectedClusterFilter}
+              placeholder="Select a cluster"
+              searchPlaceholder="Search clusters..."
+              className="w-full"
+              showSearch={true}
+              maxHeight={200}
+              emptyMessage="No clusters found"
+              virtualizeThreshold={50}
+            />
+          </div>
+
+          <div className="lg:w-40 lg:shrink-0">
+            <div className="flex items-center justify-between mb-1">
+              <label className="text-sm font-medium text-gray-700">Month</label>
+              <button
+                type="button"
+                onClick={() => {
+                  const currentMonth = new Date().getMonth() + 1;
+                  if (selectedMonth === "") {
+                    setSelectedMonth(String(currentMonth).padStart(2, "0"));
+                  } else {
+                    setSelectedMonth("");
+                  }
+                }}
+                className="flex items-center gap-1.5 text-xs font-medium text-primary hover:text-primary hover:underline transition-colors"
+                title={
+                  selectedMonth === ""
+                    ? "Show Current Month"
+                    : "Show All Months"
+                }
+              >
+                {selectedMonth === "" ? (
+                  <>
+                    <svg
+                      className="w-3.5 h-3.5"
+                      fill="none"
+                      stroke="currentColor"
+                      viewBox="0 0 24 24"
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth={2}
+                        d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"
+                      />
+                    </svg>
+                    Current Month
+                  </>
+                ) : (
+                  <>
+                    <svg
+                      className="w-3.5 h-3.5"
+                      fill="none"
+                      stroke="currentColor"
+                      viewBox="0 0 24 24"
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth={2}
+                        d="M4 6h16M4 12h16M4 18h16"
+                      />
+                    </svg>
+                    All Months
+                  </>
+                )}
+              </button>
+            </div>
+            <select
+              value={selectedMonth}
+              onChange={(e) => setSelectedMonth(e.target.value)}
+              className="w-full px-2 py-2 min-h-[44px] border border-gray-300 rounded-md text-sm focus:ring-2 focus:ring-ring focus:border-transparent"
+            >
+              <option value="">All Months</option>
+              {[
+                "January",
+                "February",
+                "March",
+                "April",
+                "May",
+                "June",
+                "July",
+                "August",
+                "September",
+                "October",
+                "November",
+                "December",
+              ].map((label, idx) => {
+                const monthNum = idx + 1;
+                const value = String(monthNum).padStart(2, "0");
+                return (
+                  <option key={value} value={value}>
+                    {label}
+                  </option>
+                );
+              })}
+            </select>
+          </div>
+
+          <div className="lg:w-52 lg:shrink-0">
+            <div className="flex items-center justify-between mb-1">
+              <label className="text-sm font-medium text-gray-700">Week</label>
+              <button
+                type="button"
+                onClick={() => {
+                  const currentWeek = getLocalISOWeekNumber(new Date());
+                  if (selectedWeek === "") {
+                    // Switch to current week
+                    setSelectedWeek(currentWeek.toString());
+                  } else {
+                    // Switch to all weeks
+                    setSelectedWeek("");
+                  }
+                }}
+                className="flex items-center gap-1.5 text-xs font-medium text-primary hover:text-primary hover:underline transition-colors"
+                title={
+                  selectedWeek === "" ? "Show Current Week" : "Show All Weeks"
+                }
+              >
+                {selectedWeek === "" ? (
+                  <>
+                    <svg
+                      className="w-3.5 h-3.5"
+                      fill="none"
+                      stroke="currentColor"
+                      viewBox="0 0 24 24"
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth={2}
+                        d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"
+                      />
+                    </svg>
+                    Current Week
+                  </>
+                ) : (
+                  <>
+                    <svg
+                      className="w-3.5 h-3.5"
+                      fill="none"
+                      stroke="currentColor"
+                      viewBox="0 0 24 24"
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth={2}
+                        d="M4 6h16M4 12h16M4 18h16"
+                      />
+                    </svg>
+                    All Weeks
+                  </>
+                )}
+              </button>
+            </div>
+            <select
+              value={selectedWeek}
+              onChange={(e) => setSelectedWeek(e.target.value)}
+              className="w-full px-2 py-2 min-h-[44px] border border-gray-300 rounded-md text-sm focus:ring-2 focus:ring-ring focus:border-transparent"
+            >
+              <option value="">All Weeks</option>
+              {Array.from({ length: 53 }, (_, i) => {
+                const weekNum = i + 1;
+                const dateRange = formatWeekDateRange(selectedYear, weekNum);
+                return (
+                  <option key={weekNum} value={weekNum.toString()}>
+                    W{weekNum} ({dateRange})
+                  </option>
+                );
+              })}
+            </select>
+          </div>
+
+          <div className="lg:w-24 lg:shrink-0">
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Year
+            </label>
+            <select
+              disabled={yearsLoading || availableYears.length === 0}
+              value={
+                yearsLoading || availableYears.length === 0
+                  ? ""
+                  : availableYears.includes(selectedYear)
+                    ? selectedYear
+                    : availableYears[0]
+              }
+              onChange={(e) => setSelectedYear(parseInt(e.target.value, 10))}
+              className="w-full px-2 py-2 min-h-[44px] border border-gray-300 rounded-md text-sm focus:ring-2 focus:ring-ring focus:border-transparent disabled:bg-gray-100 disabled:text-gray-500"
+            >
+              {yearsLoading ? (
+                <option value="">Loading…</option>
+              ) : availableYears.length === 0 ? (
+                <option value="">No reports yet</option>
+              ) : (
+                availableYears.map((year) => (
+                  <option key={year} value={year}>
+                    {year}
+                  </option>
+                ))
+              )}
+            </select>
+          </div>
+
+          <div className="lg:w-32 lg:shrink-0">
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Gathering Type
+            </label>
+            <select
+              value={selectedGatheringType}
+              onChange={(e) => setSelectedGatheringType(e.target.value)}
+              className="w-full px-2 py-2 min-h-[44px] border border-gray-300 rounded-md text-sm focus:ring-2 focus:ring-ring focus:border-transparent"
+            >
+              <option value="">All Types</option>
+              <option value="PHYSICAL">Physical</option>
+              <option value="ONLINE">Online</option>
+              <option value="HYBRID">Hybrid</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      {/* Reports Table */}
+      <div className="bg-white rounded-lg border border-gray-200 shadow-sm overflow-hidden">
+        <div className="px-4 sm:px-6 py-4 border-b border-gray-200">
+          <div className="flex items-center justify-between gap-2 md:justify-end">
+            <div className="flex min-w-0 items-center gap-2">
+              {/* View Toggle - Mobile Only */}
+              <div className="md:hidden flex shrink-0 items-center border border-gray-300 rounded-lg overflow-hidden">
+                <button
+                  onClick={() => setViewMode("cards")}
+                  className={`px-2.5 sm:px-3 py-2 min-h-[44px] flex items-center justify-center transition-colors ${
+                    viewMode === "cards"
+                      ? "bg-primary/100 text-white"
+                      : "bg-white text-gray-700 hover:bg-gray-50"
+                  }`}
+                  title="Card View"
+                >
+                  <Squares2X2Icon className="w-5 h-5" />
+                </button>
+                <button
+                  onClick={() => setViewMode("table")}
+                  className={`px-2.5 sm:px-3 py-2 min-h-[44px] flex items-center justify-center transition-colors ${
+                    viewMode === "table"
+                      ? "bg-primary/100 text-white"
+                      : "bg-white text-gray-700 hover:bg-gray-50"
+                  }`}
+                  title="Table View"
+                >
+                  <TableCellsIcon className="w-5 h-5" />
+                </button>
+              </div>
+              <button
+                onClick={() => setShowColumnsModal(true)}
+                className="inline-flex shrink-0 items-center px-3 sm:px-4 py-2 min-h-[44px] border border-gray-300 shadow-sm text-sm font-medium rounded-lg text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-ring"
+              >
+                <svg
+                  className="w-4 h-4 mr-2 shrink-0"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={2}
+                    d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4"
+                  />
+                </svg>
+                Columns
+              </button>
+            </div>
+            {canExportReports && (
+              <div className="relative shrink-0">
+                <button
+                  ref={exportButtonRef}
+                  onClick={() => setShowExportDropdown(!showExportDropdown)}
+                  className="inline-flex items-center px-3 sm:px-4 py-2 min-h-[44px] border border-gray-300 shadow-sm text-sm font-medium rounded-lg text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-ring"
+                >
+                  <DocumentArrowDownIcon className="w-4 h-4 mr-2 shrink-0" />
+                  Export
+                </button>
+              {showExportDropdown && (
+                <div
+                  ref={exportDropdownRef}
+                  className="absolute right-0 mt-2 w-48 bg-white rounded-md shadow-lg ring-1 ring-black ring-opacity-5 z-10"
+                >
+                  <div className="py-1">
+                    <button
+                      onClick={() => {
+                        handleExport("excel");
+                        setShowExportDropdown(false);
+                      }}
+                      className="flex items-center w-full px-4 py-2 min-h-[44px] text-sm text-gray-700 hover:bg-gray-100"
+                    >
+                      <svg
+                        className="w-4 h-4 mr-2 text-green-600"
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={2}
+                          d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
+                        />
+                      </svg>
+                      Export to Excel
+                    </button>
+                    <button
+                      onClick={() => {
+                        handleExport("pdf");
+                        setShowExportDropdown(false);
+                      }}
+                      className="flex items-center w-full px-4 py-2 min-h-[44px] text-sm text-gray-700 hover:bg-gray-100"
+                    >
+                      <svg
+                        className="w-4 h-4 mr-2 text-red-600"
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={2}
+                          d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z"
+                        />
+                      </svg>
+                      Export to PDF
+                    </button>
+                    <button
+                      onClick={() => {
+                        handleExport("csv");
+                        setShowExportDropdown(false);
+                      }}
+                      className="flex items-center w-full px-4 py-2 min-h-[44px] text-sm text-gray-700 hover:bg-gray-100"
+                    >
+                      <svg
+                        className="w-4 h-4 mr-2 text-primary"
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={2}
+                          d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
+                        />
+                      </svg>
+                      Export to CSV
+                    </button>
+                  </div>
+                </div>
+              )}
+              </div>
+            )}
+          </div>
+        </div>
+        {sortedReports.length === 0 ? (
+          <div className="text-center py-8">
+            <svg
+              className="mx-auto h-12 w-12 text-gray-400"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth={2}
+                d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
+              />
+            </svg>
+            <h3 className="mt-2 text-sm font-medium text-gray-900">
+              No reports found
+            </h3>
+            <p className="mt-1 text-sm text-gray-500">
+              Get started by submitting a weekly report.
+            </p>
+          </div>
+        ) : (
+          <>
+            {/* Card View - Mobile Only */}
+            {viewMode === "cards" && (
+              <div className="md:hidden space-y-4 p-4">
+                {sortedReports.map((report) => (
+                  <div
+                    key={report.id}
+                    className="bg-white border border-gray-200 rounded-lg p-4 shadow-sm"
+                  >
+                    <div className="space-y-3">
+                      {/* Cluster Name - Full Width */}
+                      <div>
+                        <button
+                          onClick={() => handleViewReport(report)}
+                          className="text-primary hover:text-primary hover:underline font-medium text-base"
+                        >
+                          {report.cluster_code
+                            ? `${report.cluster_code} - ${report.cluster_name}`
+                            : report.cluster_name}
+                        </button>
+                      </div>
+                      {/* Fields in Two Columns */}
+                      <div className="grid grid-cols-2 gap-3">
+                        {visibleColumns.has("week") && (
+                          <div>
+                            <span className="text-xs text-gray-500">Week</span>
+                            <p className="text-sm text-gray-900">
+                              {report.year} W{report.week_number}
+                            </p>
+                          </div>
+                        )}
+                        {visibleColumns.has("meeting_date") && (
+                          <div>
+                            <span className="text-xs text-gray-500">
+                              Meeting Date
+                            </span>
+                            <p className="text-sm text-gray-900">
+                              {formatLocaleDate(report.meeting_date)}
+                            </p>
+                          </div>
+                        )}
+                        {visibleColumns.has("attendance") && (
+                          <div>
+                            <span className="text-xs text-gray-500">
+                              Attendance
+                            </span>
+                            <p className="text-sm text-gray-900">
+                              {report.members_present}M /{" "}
+                              <span
+                                className={
+                                  report.visitors_present === 0
+                                    ? "text-red-600"
+                                    : ""
+                                }
+                              >
+                                {report.visitors_present}V
+                              </span>
+                              {(report.prospects_invited_count ??
+                                report.prospects_invited?.length ??
+                                0) > 0 && (
+                                <span className="text-gray-500">
+                                  {" "}
+                                  /{" "}
+                                  {report.prospects_invited_count ??
+                                    report.prospects_invited?.length}{" "}
+                                  P
+                                </span>
+                              )}
+                            </p>
+                          </div>
+                        )}
+                        {visibleColumns.has("member_attendance_rate") && (
+                          <div>
+                            <span className="text-xs text-gray-500 inline-flex items-center gap-1">
+                              Member Rate
+                              <MemberRateHelpButton
+                                label={MEMBER_RATE_TOOLTIP}
+                                iconClassName="h-3.5 w-3.5"
+                              />
+                            </span>
+                            <p className="text-sm text-gray-900">
+                              {report.member_attendance_rate !== undefined
+                                ? `${report.member_attendance_rate.toFixed(1)}%`
+                                : "N/A"}
+                            </p>
+                          </div>
+                        )}
+                        {visibleColumns.has("type") && (
+                          <div>
+                            <span className="text-xs text-gray-500 block mb-1">
+                              Type
+                            </span>
+                            <span
+                              className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getEvangelismGatheringTypeChipClass(
+                                report.gathering_type,
+                              )}`}
+                            >
+                              {report.gathering_type}
+                            </span>
+                          </div>
+                        )}
+                        {visibleColumns.has("offerings") && (
+                          <div>
+                            <span className="text-xs text-gray-500">
+                              Offerings
+                            </span>
+                            <p className="text-sm text-gray-900">
+                              {formatCurrency(
+                                typeof report.offerings === "number"
+                                  ? report.offerings
+                                  : parseFloat(String(report.offerings)) || 0,
+                              )}
+                            </p>
+                          </div>
+                        )}
+                        {visibleColumns.has("submitted_by") && (
+                          <div className="col-span-2">
+                            <span className="text-xs text-gray-500">
+                              Submitted By
+                            </span>
+                            <p className="text-sm text-gray-900">
+                              {report.submitted_by_details
+                                ? formatPersonName(report.submitted_by_details)
+                                : "Unknown"}
+                            </p>
+                          </div>
+                        )}
+                      </div>
+                      <div className="flex gap-2 pt-2 border-t border-gray-200">
+                        <button
+                          onClick={() => handleViewReport(report)}
+                          className="flex-1 text-indigo-600 hover:text-indigo-900 py-2 px-3 rounded border border-indigo-200 hover:bg-indigo-50 text-sm font-medium"
+                        >
+                          View
+                        </button>
+                        {canMutateWeeklyReports && (
+                          <>
+                            <button
+                              onClick={() => handleEditReport(report)}
+                              className="flex-1 text-primary hover:text-primary py-2 px-3 rounded border border-primary/20 hover:bg-primary/10 text-sm font-medium"
+                            >
+                              Edit
+                            </button>
+                            {userCanHardDeleteReports && (
+                              <button
+                                onClick={() => handleDeleteReport(report)}
+                                className="flex-1 text-red-600 hover:text-red-900 py-2 px-3 rounded border border-red-200 hover:bg-red-50 text-sm font-medium"
+                              >
+                                Delete
+                              </button>
+                            )}
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+            {/* Table View - Mobile when table selected, always on desktop */}
+            <div
+              className={`overflow-x-auto ${
+                viewMode === "cards" ? "hidden md:block" : ""
+              }`}
+            >
+              <table className="min-w-full divide-y divide-gray-200">
+                <thead className="bg-gray-50">
+                  <tr>
+                    {availableColumns.map((col) => {
+                      if (!visibleColumns.has(col.key)) return null;
+                      return (
+                        <th
+                          key={col.key}
+                          className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100 transition-colors"
+                          onClick={() => handleSort(col.key)}
+                        >
+                          <div className="flex items-center space-x-1">
+                            <span>{col.label}</span>
+                            {col.key === "member_attendance_rate" && (
+                              <MemberRateHelpButton
+                                label={MEMBER_RATE_TOOLTIP}
+                                onClick={(event) => event.stopPropagation()}
+                              />
+                            )}
+                            <SortIcon field={col.key} />
+                          </div>
+                        </th>
+                      );
+                    })}
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      Actions
+                    </th>
+                  </tr>
+                </thead>
+                <tbody className="bg-white divide-y divide-gray-200">
+                  {sortedReports.map((report) => (
+                    <tr
+                      key={report.id}
+                      className="hover:bg-gray-50 transition-colors duration-150"
+                    >
+                      {availableColumns.map((col) => {
+                        if (!visibleColumns.has(col.key)) return null;
+                        let cellContent;
+                        switch (col.key) {
+                          case "cluster":
+                            cellContent = (
+                              <button
+                                onClick={() => handleViewReport(report)}
+                                className={`${TABLE_ENTITY_LINK_CLASS} cursor-pointer transition-colors duration-150`}
+                                title="Click to view report details"
+                              >
+                                {report.cluster_code
+                                  ? `${report.cluster_code} - ${report.cluster_name}`
+                                  : report.cluster_name}
+                              </button>
+                            );
+                            break;
+                          case "week":
+                            cellContent = (
+                              <span className="text-sm text-gray-900">
+                                {report.year} W{report.week_number}
+                              </span>
+                            );
+                            break;
+                          case "meeting_date":
+                            cellContent = (
+                              <span className="text-sm text-gray-900">
+                                {formatLocaleDate(report.meeting_date)}
+                              </span>
+                            );
+                            break;
+                          case "attendance":
+                            cellContent = (
+                              <span className="text-sm text-gray-900">
+                                {report.members_present}M /{" "}
+                                <span
+                                  className={
+                                    report.visitors_present === 0
+                                      ? "text-red-600"
+                                      : ""
+                                  }
+                                >
+                                  {report.visitors_present}V
+                                </span>
+                                {(report.prospects_invited_count ??
+                                  report.prospects_invited?.length ??
+                                  0) > 0 && (
+                                  <span className="text-gray-500">
+                                    {" "}
+                                    /{" "}
+                                    {report.prospects_invited_count ??
+                                      report.prospects_invited?.length}{" "}
+                                    P
+                                  </span>
+                                )}
+                              </span>
+                            );
+                            break;
+                          case "member_attendance_rate":
+                            const rate = report.member_attendance_rate ?? 0;
+                            const isLowAttendance = rate < 50;
+                            cellContent = (
+                              <span
+                                className={`text-sm ${
+                                  isLowAttendance
+                                    ? "text-red-600 font-medium"
+                                    : "text-gray-900"
+                                }`}
+                              >
+                                {report.member_attendance_rate !== undefined
+                                  ? `${report.member_attendance_rate.toFixed(
+                                      1,
+                                    )}%`
+                                  : "N/A"}
+                              </span>
+                            );
+                            break;
+                          case "type":
+                            cellContent = (
+                              <span
+                                className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getEvangelismGatheringTypeChipClass(
+                                  report.gathering_type,
+                                )}`}
+                              >
+                                {report.gathering_type}
+                              </span>
+                            );
+                            break;
+                          case "offerings":
+                            cellContent = (
+                              <span className="text-sm text-gray-900">
+                                {formatCurrency(
+                                  typeof report.offerings === "number"
+                                    ? report.offerings
+                                    : parseFloat(String(report.offerings)) || 0,
+                                )}
+                              </span>
+                            );
+                            break;
+                          case "submitted_by":
+                            cellContent = (
+                              <span className="text-sm text-gray-900">
+                                {report.submitted_by_details
+                                  ? formatPersonName(
+                                      report.submitted_by_details,
+                                    )
+                                  : "Unknown"}
+                              </span>
+                            );
+                            break;
+                          default:
+                            cellContent = null;
+                        }
+                        return (
+                          <td
+                            key={col.key}
+                            className={`px-6 py-4 whitespace-nowrap ${
+                              col.key === "cluster"
+                                ? "text-sm font-medium text-gray-900"
+                                : ""
+                            }`}
+                          >
+                            {cellContent}
+                          </td>
+                        );
+                      })}
+                      <td className="px-6 py-4 whitespace-nowrap text-sm font-medium">
+                        <div className="flex space-x-2">
+                          <button
+                            onClick={() => handleViewReport(report)}
+                            className="text-indigo-600 hover:text-indigo-900 p-1 rounded hover:bg-indigo-50 min-h-[44px] min-w-[44px] flex items-center justify-center"
+                            title="View Report"
+                          >
+                            <svg
+                              className="w-4 h-4"
+                              fill="none"
+                              stroke="currentColor"
+                              viewBox="0 0 24 24"
+                              xmlns="http://www.w3.org/2000/svg"
+                            >
+                              <path
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                strokeWidth={2}
+                                d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"
+                              />
+                              <path
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                strokeWidth={2}
+                                d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"
+                              />
+                            </svg>
+                          </button>
+                          {canMutateWeeklyReports && (
+                            <>
+                              <button
+                                onClick={() => handleEditReport(report)}
+                                className="text-primary hover:text-primary p-1 rounded hover:bg-primary/10 min-h-[44px] min-w-[44px] flex items-center justify-center"
+                                title="Edit Report"
+                              >
+                                <svg
+                                  className="w-4 h-4"
+                                  fill="none"
+                                  stroke="currentColor"
+                                  viewBox="0 0 24 24"
+                                  xmlns="http://www.w3.org/2000/svg"
+                                >
+                                  <path
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                    strokeWidth={2}
+                                    d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"
+                                  />
+                                </svg>
+                              </button>
+                              {userCanHardDeleteReports && (
+                                <button
+                                  onClick={() => handleDeleteReport(report)}
+                                  className="text-red-600 hover:text-red-900 p-1 rounded hover:bg-red-50 min-h-[44px] min-w-[44px] flex items-center justify-center"
+                                  title="Delete Report"
+                                >
+                                  <svg
+                                    className="w-4 h-4"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    viewBox="0 0 24 24"
+                                    xmlns="http://www.w3.org/2000/svg"
+                                  >
+                                    <path
+                                      strokeLinecap="round"
+                                      strokeLinejoin="round"
+                                      strokeWidth={2}
+                                      d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"
+                                    />
+                                  </svg>
+                                </button>
+                              )}
+                            </>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Pagination */}
+            {totalCount > 0 && (
+              <Pagination
+                currentPage={currentPage}
+                totalPages={Math.ceil(totalCount / itemsPerPage)}
+                onPageChange={setCurrentPage}
+                itemsPerPage={itemsPerPage}
+                totalItems={totalCount}
+                onItemsPerPageChange={(newPageSize) => {
+                  setItemsPerPage(newPageSize);
+                  setCurrentPage(1);
+                }}
+              />
+            )}
+          </>
+        )}
+      </div>
+
+      {/* Report Form Modal */}
+      <Modal
+        isOpen={isFormOpen}
+        onClose={() => {
+          if (onFormClose) {
+            onFormClose();
+          } else {
+            setShowForm(false);
+            setSelectedCluster(null);
+            setEditingReport(null);
+          }
+        }}
+        title={
+          formEditingReport ? "Edit Weekly Report" : "Submit Weekly Report"
+        }
+        className="!mt-0"
+        closeOnOutsideClick={false}
+      >
+        <ClusterWeeklyReportForm
+          cluster={formSelectedCluster as any}
+          clusters={(clustersForReportForm ?? clustersForFilters) as any}
+          isOpen={isFormOpen}
+          onClose={() => {
+            if (onFormClose) {
+              onFormClose();
+            } else {
+              setShowForm(false);
+              setSelectedCluster(null);
+              setEditingReport(null);
+            }
+          }}
+          onSubmit={handleSubmitReport as any}
+          initialData={(formEditingReport as any) || undefined}
+        />
+      </Modal>
+
+      {/* View Report Modal */}
+      {viewingReport && (
+        <ViewWeeklyReportModal
+          report={viewingReport}
+          isOpen={showViewModal}
+          canMutateReports={canMutateWeeklyReports}
+          onClose={() => {
+            setShowViewModal(false);
+            setViewingReport(null);
+          }}
+          onEdit={() => {
+            setShowViewModal(false);
+            handleEditReport(viewingReport);
+          }}
+          onDelete={
+            userCanHardDeleteReports
+              ? () => {
+                  handleDeleteReport(viewingReport);
+                }
+              : undefined
+          }
+        />
+      )}
+
+      {/* Delete Confirmation Modal */}
+      <ConfirmationModal
+        isOpen={deleteConfirmation.isOpen}
+        onClose={closeDeleteConfirmation}
+        onConfirm={confirmDeleteReport}
+        title="Delete Weekly Report"
+        message={
+          deleteConfirmation.report
+            ? `Are you sure you want to delete the weekly report for ${deleteConfirmation.report.cluster_name} - ${deleteConfirmation.report.year} Week ${deleteConfirmation.report.week_number}? This action cannot be undone.`
+            : "Are you sure you want to delete this report?"
+        }
+        confirmText="Delete Report"
+        cancelText="Cancel"
+        variant="danger"
+        loading={deleteConfirmation.loading}
+      />
+
+      {/* Columns Configuration Modal */}
+      <ModalOverlay
+        isOpen={showColumnsModal}
+        onClose={() => setShowColumnsModal(false)}
+        panelClassName="relative w-full max-w-md"
+      >
+        <div className="flex max-h-[90vh] flex-col overflow-hidden rounded-lg bg-white shadow-xl">
+          <div className="px-6 py-4 border-b border-gray-200">
+            <h3 className="text-lg font-semibold text-gray-900">
+              Configure Columns
+            </h3>
+            <p className="text-sm text-gray-500 mt-1">
+              Select which columns to display in the table
+            </p>
+          </div>
+          <div className="px-6 py-4 flex-1 overflow-y-auto">
+            <div className="space-y-2">
+              {availableColumns.map((col) => (
+                <label
+                  key={col.key}
+                  className="flex items-center space-x-3 cursor-pointer hover:bg-gray-50 p-2 rounded"
+                >
+                  <input
+                    type="checkbox"
+                    checked={visibleColumns.has(col.key)}
+                    onChange={(e) => {
+                      const newVisible = new Set(visibleColumns);
+                      if (e.target.checked) {
+                        newVisible.add(col.key);
+                      } else {
+                        newVisible.delete(col.key);
+                      }
+                      setVisibleColumns(newVisible);
+                    }}
+                    className="rounded border-gray-300 text-primary focus:ring-ring"
+                  />
+                  <span className="text-sm text-gray-700">{col.label}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+          <div className="px-6 py-4 border-t border-gray-200 flex flex-col sm:flex-row justify-end gap-3">
+            <button
+              onClick={() => {
+                setVisibleColumns(
+                  new Set(
+                    availableColumns
+                      .filter((col) => col.default)
+                      .map((col) => col.key),
+                  ),
+                );
+              }}
+              className="px-4 py-2 min-h-[44px] text-sm font-medium text-gray-700 hover:text-gray-900"
+            >
+              Reset to Default
+            </button>
+            <button
+              onClick={() => setShowColumnsModal(false)}
+              className="px-4 py-2 min-h-[44px] text-sm font-medium text-white bg-primary rounded-lg hover:bg-lighthouse-navy focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-ring"
+            >
+              Done
+            </button>
+          </div>
+        </div>
+      </ModalOverlay>
+    </div>
+  );
+}

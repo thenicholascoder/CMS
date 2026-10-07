@@ -1,0 +1,579 @@
+"use client";
+
+import {
+  ChangeEvent,
+  FormEvent,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import Button from "@/src/components/ui/Button";
+import ConfirmationModal from "@/src/components/ui/ConfirmationModal";
+import SearchableSelect from "@/src/components/ui/SearchableSelect";
+import type { Prospect, EvangelismGroup } from "@/src/types/evangelism";
+import type { Person } from "@/src/types/person";
+import { formatPersonName } from "@/src/lib/name";
+import {
+  describeDuplicateProspect,
+  findEncodedVisitorNameMatches,
+  findPossibleProspectNameDuplicates,
+} from "@/src/lib/prospectDuplicates";
+
+/** Match cluster weekly report `AddVisitorModal` inputs / selects. */
+const CLUSTER_VISITOR_CONTROL =
+  "w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-ring focus:border-transparent";
+
+function todayISO(): string {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function groupDisplayLabel(g: EvangelismGroup): string {
+  const cluster = g.cluster;
+  const clusterBit = cluster
+    ? [cluster.code, cluster.name].filter(Boolean).join(" ")
+    : "";
+  if (clusterBit) return `${g.name} — ${clusterBit}`;
+  return g.name;
+}
+
+function groupMatchesSearch(g: EvangelismGroup, q: string): boolean {
+  if (!q.trim()) return true;
+  const hay = [
+    g.name,
+    g.description,
+    g.location,
+    g.cluster?.code,
+    g.cluster?.name,
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+  return hay.includes(q.trim().toLowerCase());
+}
+
+export interface ProspectFormValues {
+  first_name: string;
+  middle_name: string;
+  last_name: string;
+  suffix: string;
+  gender: string;
+  date_first_invited: string;
+  contact_info: string;
+  facebook_name: string;
+  invited_by_id: string;
+  evangelism_group_id?: string;
+  notes: string;
+}
+
+interface ProspectFormProps {
+  inviters?: Person[];
+  groups?: EvangelismGroup[];
+  /** Existing prospects used for soft duplicate warnings. */
+  prospectOptions?: Prospect[];
+  /** Encoded visitors used to warn if the typed name already has a record. */
+  encodedVisitors?: Person[];
+  /** When set (e.g. group modal context), selects this bible study group and ensures it appears in options. */
+  selectedBibleStudyGroup?: EvangelismGroup | null;
+  onSubmit: (values: ProspectFormValues) => Promise<void>;
+  onCancel: () => void;
+  isSubmitting: boolean;
+  error?: string | null;
+  submitLabel?: string;
+  initialData?: Prospect;
+  defaultGroupId?: string;
+}
+
+const DEFAULT_VALUES: ProspectFormValues = {
+  first_name: "",
+  middle_name: "",
+  last_name: "",
+  suffix: "",
+  gender: "",
+  date_first_invited: todayISO(),
+  contact_info: "",
+  facebook_name: "",
+  invited_by_id: "",
+  evangelism_group_id: "",
+  notes: "",
+};
+
+export default function ProspectForm({
+  inviters = [],
+  groups = [],
+  prospectOptions = [],
+  onSubmit,
+  onCancel,
+  isSubmitting,
+  error,
+  submitLabel = "Record invitation",
+  initialData,
+  selectedBibleStudyGroup,
+  defaultGroupId,
+  encodedVisitors = [],
+}: ProspectFormProps) {
+  const contextGroupId = useMemo(() => {
+    if (defaultGroupId) return defaultGroupId;
+    const id = selectedBibleStudyGroup?.id;
+    return id != null && id !== "" ? String(id) : "";
+  }, [defaultGroupId, selectedBibleStudyGroup?.id]);
+
+  const groupChoices = useMemo(() => {
+    const byId = new Map<string, EvangelismGroup>();
+    const add = (g: EvangelismGroup | null | undefined) => {
+      if (g?.id != null && String(g.id) !== "") {
+        byId.set(String(g.id), g);
+      }
+    };
+    add(selectedBibleStudyGroup);
+    add(initialData?.evangelism_group);
+    for (const g of groups) {
+      add(g);
+    }
+    return Array.from(byId.values());
+  }, [groups, selectedBibleStudyGroup, initialData?.evangelism_group]);
+
+  const [values, setValues] = useState<ProspectFormValues>(
+    initialData
+      ? {
+          first_name: initialData.first_name,
+          middle_name: initialData.middle_name || "",
+          last_name: initialData.last_name,
+          suffix: initialData.suffix || "",
+          gender: initialData.gender || "",
+          date_first_invited:
+            initialData.date_first_invited?.slice(0, 10) || todayISO(),
+          contact_info: initialData.contact_info || "",
+          facebook_name: initialData.facebook_name || "",
+          invited_by_id: initialData.invited_by?.id || "",
+          evangelism_group_id: initialData.evangelism_group?.id || "",
+          notes: initialData.notes || "",
+        }
+      : {
+          ...DEFAULT_VALUES,
+          evangelism_group_id: contextGroupId || "",
+          date_first_invited: todayISO(),
+        },
+  );
+
+  const [groupSearch, setGroupSearch] = useState("");
+  const [showGroupDropdown, setShowGroupDropdown] = useState(false);
+  const groupDropdownRef = useRef<HTMLDivElement>(null);
+
+  const [validationError, setValidationError] = useState<string | null>(null);
+  const [duplicateNameConfirm, setDuplicateNameConfirm] = useState<{
+    isOpen: boolean;
+    matches: Prospect[];
+  }>({ isOpen: false, matches: [] });
+  const [encodedNameWarning, setEncodedNameWarning] = useState<{
+    isOpen: boolean;
+    names: string[];
+  }>({ isOpen: false, names: [] });
+
+  useEffect(() => {
+    if (initialData) return;
+    if (contextGroupId) {
+      setValues((prev) => ({
+        ...prev,
+        evangelism_group_id: contextGroupId,
+      }));
+    }
+  }, [initialData, contextGroupId]);
+
+  const inviterCandidates = useMemo(
+    () =>
+      [...inviters].sort((a, b) =>
+        formatPersonName(a).localeCompare(formatPersonName(b)),
+      ),
+    [inviters],
+  );
+
+  const groupCandidates = useMemo(
+    () =>
+      [...groupChoices].sort((a, b) =>
+        (a.name || "").localeCompare(b.name || ""),
+      ),
+    [groupChoices],
+  );
+
+  const selectedGroup = groupCandidates.find(
+    (g) => String(g.id) === (values.evangelism_group_id || ""),
+  );
+
+  const filteredGroups = groupCandidates.filter((g) =>
+    groupMatchesSearch(g, groupSearch),
+  );
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      const target = event.target as Node;
+      if (
+        groupDropdownRef.current &&
+        !groupDropdownRef.current.contains(target)
+      ) {
+        setShowGroupDropdown(false);
+      }
+    };
+    if (showGroupDropdown) {
+      document.addEventListener("mousedown", handleClickOutside);
+    }
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [showGroupDropdown]);
+
+  useEffect(() => {
+    setValidationError(null);
+  }, [values.invited_by_id, values.first_name, values.last_name]);
+
+  useEffect(() => {
+    setValidationError(null);
+  }, [error]);
+
+  const handleChange =
+    (field: keyof ProspectFormValues) =>
+    (
+      event: ChangeEvent<
+        HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement
+      >,
+    ) => {
+      setValues((prev) => ({
+        ...prev,
+        [field]: event.target.value,
+      }));
+    };
+
+  const handleGroupSelect = (groupId: string) => {
+    setValues((prev) => ({
+      ...prev,
+      evangelism_group_id: groupId || "",
+    }));
+    setShowGroupDropdown(false);
+    setGroupSearch("");
+  };
+
+  const handleSubmit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!values.first_name.trim() || !values.last_name.trim()) {
+      setValidationError("First name and last name are required.");
+      return;
+    }
+    if (!values.invited_by_id) {
+      setValidationError("Inviter is required.");
+      return;
+    }
+
+    const encodedMatches = findEncodedVisitorNameMatches(
+      encodedVisitors,
+      prospectOptions,
+      {
+        firstName: values.first_name,
+        lastName: values.last_name,
+      },
+    );
+    if (encodedMatches.length > 0) {
+      setEncodedNameWarning({ isOpen: true, names: encodedMatches });
+      return;
+    }
+
+    if (prospectOptions.length > 0) {
+      const nameMatches = findPossibleProspectNameDuplicates(prospectOptions, {
+        firstName: values.first_name,
+        lastName: values.last_name,
+        evangelismGroupId: values.evangelism_group_id || contextGroupId || null,
+        excludeId: initialData?.id,
+      }).filter((prospect) => !prospect.person);
+      if (nameMatches.length > 0) {
+        setDuplicateNameConfirm({ isOpen: true, matches: nameMatches });
+        return;
+      }
+    }
+
+    await onSubmit(values);
+  };
+
+  const shownError = validationError || error || null;
+
+  return (
+    <>
+      <form className="space-y-4" onSubmit={handleSubmit}>
+        {shownError && (
+          <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg text-sm">
+            {shownError}
+          </div>
+        )}
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              First Name *
+            </label>
+            <input
+              type="text"
+              value={values.first_name}
+              onChange={handleChange("first_name")}
+              className={CLUSTER_VISITOR_CONTROL}
+              required
+              autoComplete="given-name"
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Middle Name
+            </label>
+            <input
+              type="text"
+              value={values.middle_name}
+              onChange={handleChange("middle_name")}
+              className={CLUSTER_VISITOR_CONTROL}
+              autoComplete="additional-name"
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Last Name *
+            </label>
+            <input
+              type="text"
+              value={values.last_name}
+              onChange={handleChange("last_name")}
+              className={CLUSTER_VISITOR_CONTROL}
+              required
+              autoComplete="family-name"
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Suffix
+            </label>
+            <input
+              type="text"
+              value={values.suffix}
+              onChange={handleChange("suffix")}
+              placeholder="Jr., Sr., III, etc."
+              className={CLUSTER_VISITOR_CONTROL}
+            />
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Facebook Name
+            </label>
+            <input
+              type="text"
+              value={values.facebook_name}
+              onChange={handleChange("facebook_name")}
+              className={CLUSTER_VISITOR_CONTROL}
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Gender
+            </label>
+            <select
+              value={values.gender}
+              onChange={handleChange("gender")}
+              className={CLUSTER_VISITOR_CONTROL}
+            >
+              <option value="">Select...</option>
+              <option value="MALE">Male</option>
+              <option value="FEMALE">Female</option>
+            </select>
+          </div>
+        </div>
+
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-1">
+            Notes
+          </label>
+          <textarea
+            value={values.notes}
+            onChange={handleChange("notes")}
+            rows={3}
+            placeholder="Invitation notes (shown on the timeline once they are encoded)…"
+            className={CLUSTER_VISITOR_CONTROL}
+          />
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Date First Invited *
+            </label>
+            <input
+              type="date"
+              value={values.date_first_invited}
+              onChange={handleChange("date_first_invited")}
+              className={CLUSTER_VISITOR_CONTROL}
+              required
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Contact Info
+            </label>
+            <input
+              type="text"
+              value={values.contact_info}
+              onChange={handleChange("contact_info")}
+              placeholder="Phone number"
+              className={CLUSTER_VISITOR_CONTROL}
+            />
+          </div>
+        </div>
+
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-1">
+            Bible Study Group
+          </label>
+          <div className="relative" ref={groupDropdownRef}>
+            <input
+              type="text"
+              role="combobox"
+              aria-expanded={showGroupDropdown}
+              aria-autocomplete="list"
+              value={
+                groupSearch ||
+                (selectedGroup ? groupDisplayLabel(selectedGroup) : "")
+              }
+              onChange={(e) => {
+                setGroupSearch(e.target.value);
+                setShowGroupDropdown(true);
+              }}
+              onFocus={() => setShowGroupDropdown(true)}
+              placeholder="Search bible study groups..."
+              className={CLUSTER_VISITOR_CONTROL}
+            />
+            {showGroupDropdown && (
+              <div className="absolute z-10 w-full mt-1 bg-white border border-gray-300 rounded-lg shadow-lg max-h-60 overflow-y-auto">
+                <button
+                  type="button"
+                  onClick={() => handleGroupSelect("")}
+                  className="w-full px-3 py-2 text-left text-gray-600 hover:bg-gray-100 focus:bg-gray-100 focus:outline-none border-b border-gray-100"
+                >
+                  Not set
+                </button>
+                {filteredGroups.length > 0 ? (
+                  filteredGroups.map((g) => (
+                    <button
+                      key={g.id}
+                      type="button"
+                      onClick={() => handleGroupSelect(String(g.id))}
+                      className="w-full px-3 py-2 text-left hover:bg-gray-100 focus:bg-gray-100 focus:outline-none"
+                    >
+                      <div className="font-medium text-gray-900">
+                        {groupDisplayLabel(g)}
+                      </div>
+                    </button>
+                  ))
+                ) : (
+                  <div className="px-3 py-2 text-sm text-gray-500">
+                    {groupCandidates.length === 0
+                      ? "No bible study groups available"
+                      : "No groups match your search"}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-1">
+            Inviter *
+          </label>
+          <SearchableSelect
+            value={values.invited_by_id ? String(values.invited_by_id) : ""}
+            onChange={(value) =>
+              setValues((prev) => ({ ...prev, invited_by_id: value }))
+            }
+            options={inviterCandidates.map((p) => ({
+              ...p,
+              id: p.id,
+              username: p.username || p.email || String(p.id),
+            }))}
+            placeholder="Search for inviter..."
+            emptyMessage="No inviter found"
+            showEmptyOption={false}
+          />
+        </div>
+
+        <div className="flex flex-col-reverse sm:flex-row gap-3 pt-4">
+          <Button
+            variant="tertiary"
+            className="flex-1 min-h-[44px] sm:min-h-0"
+            onClick={onCancel}
+            disabled={isSubmitting}
+            type="button"
+          >
+            Cancel
+          </Button>
+          <Button
+            className="flex-1 min-h-[44px] sm:min-h-0"
+            disabled={isSubmitting}
+            type="submit"
+          >
+            {isSubmitting ? "Saving..." : submitLabel}
+          </Button>
+        </div>
+      </form>
+
+      <ConfirmationModal
+        isOpen={duplicateNameConfirm.isOpen}
+        onClose={() => setDuplicateNameConfirm({ isOpen: false, matches: [] })}
+        onConfirm={() => {
+          setDuplicateNameConfirm({ isOpen: false, matches: [] });
+          void onSubmit(values);
+        }}
+        title="Possible duplicate"
+        message={
+          <div className="space-y-2">
+            <p>
+              An invited visitor with the same first and last name already
+              exists. Continue anyway only if this is a different person.
+            </p>
+            <ul className="list-disc pl-5 space-y-1 text-sm text-gray-700 max-h-40 overflow-y-auto">
+              {duplicateNameConfirm.matches.slice(0, 8).map((prospect) => (
+                <li key={prospect.id}>{describeDuplicateProspect(prospect)}</li>
+              ))}
+              {duplicateNameConfirm.matches.length > 8 && (
+                <li>…and {duplicateNameConfirm.matches.length - 8} more</li>
+              )}
+            </ul>
+          </div>
+        }
+        confirmText={initialData ? "Update anyway" : "Create anyway"}
+        cancelText="Go back"
+        variant="warning"
+        zIndex={80}
+      />
+
+      <ConfirmationModal
+        isOpen={encodedNameWarning.isOpen}
+        onClose={() => setEncodedNameWarning({ isOpen: false, names: [] })}
+        onConfirm={() => setEncodedNameWarning({ isOpen: false, names: [] })}
+        title="Already encoded"
+        message={
+          <div className="space-y-2">
+            {encodedNameWarning.names.slice(0, 8).map((name) => (
+              <p key={name}>
+                {name} is already encoded. Use Add returning visitors.
+              </p>
+            ))}
+            {encodedNameWarning.names.length > 8 && (
+              <p>…and {encodedNameWarning.names.length - 8} more</p>
+            )}
+          </div>
+        }
+        confirmText="Go back"
+        cancelText="Cancel"
+        variant="info"
+        zIndex={80}
+      />
+    </>
+  );
+}

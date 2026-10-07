@@ -1,0 +1,537 @@
+import React, { useState, useRef, useEffect, useMemo } from "react";
+import { createPortal } from "react-dom";
+import {
+  ChevronDownIcon,
+  MagnifyingGlassIcon,
+  XMarkIcon,
+} from "@heroicons/react/24/outline";
+import { getClusterCodeBadgeStyle } from "@/src/lib/branchChipColor";
+import BibleSharersChip from "@/src/components/evangelism/BibleSharersChip";
+
+interface SelectOption {
+  value: string;
+  label: string;
+  disabled?: boolean;
+  statusLabel?: string | null;
+  statusClassName?: string | null;
+  roleLabel?: string | null;
+  roleClassName?: string | null;
+  clusterCode?: string | null;
+  /** Colors the cluster chip from the person's branch. */
+  clusterBranchId?: number | null;
+  /** Shown on the right (e.g. for national ministry pickers). */
+  branchCode?: string | null;
+  memberId?: string | null;
+  nickname?: string | null;
+  /** Legal first name — kept searchable when the label shows nickname. */
+  firstName?: string | null;
+  /** When set, renders a small Cluster vs Group badge (distinct styling). */
+  typeLabel?: "cluster" | "group";
+  /** Compact Bible Sharers marker (icon-only chip). */
+  hasBibleSharers?: boolean;
+}
+
+function ClusterCodeChip({ option }: { option: SelectOption }) {
+  if (!option.clusterCode) return null;
+  if (option.clusterCode === "NO CLUSTER") {
+    return (
+      <span className="chip-red-sm shrink-0">NO CLUSTER</span>
+    );
+  }
+  return (
+    <span
+      className="inline-flex shrink-0 items-center rounded-full px-2 py-0.5 text-[10px] font-semibold"
+      style={getClusterCodeBadgeStyle(option.clusterBranchId)}
+    >
+      {option.clusterCode}
+    </span>
+  );
+}
+
+interface ScalableSelectProps {
+  options: SelectOption[];
+  value?: string;
+  onChange?: (value: string) => void;
+  placeholder?: string;
+  searchPlaceholder?: string;
+  className?: string;
+  disabled?: boolean;
+  maxHeight?: number;
+  showSearch?: boolean;
+  emptyMessage?: string;
+  loading?: boolean;
+  virtualizeThreshold?: number; // Start virtualizing when options exceed this number
+  /** Block opening/changing without grey disabled styling (use with outer tooltip). */
+  interactionBlocked?: boolean;
+  /** Called when user commits a choice (click option, or Enter with one enabled match). */
+  onConfirm?: (value: string) => void;
+  /** Keep the menu open and toggle several values instead of picking one. */
+  multiple?: boolean;
+  values?: string[];
+  onValuesChange?: (values: string[]) => void;
+}
+
+export default function ScalableSelect({
+  options,
+  value = "",
+  onChange,
+  placeholder = "Select an option",
+  searchPlaceholder = "Search...",
+  className = "",
+  disabled = false,
+  maxHeight = 200,
+  showSearch = true,
+  emptyMessage = "No options found",
+  loading = false,
+  virtualizeThreshold = 100,
+  interactionBlocked = false,
+  onConfirm,
+  multiple = false,
+  values = [],
+  onValuesChange,
+}: ScalableSelectProps) {
+  const [isOpen, setIsOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [dropdownPosition, setDropdownPosition] = useState({
+    top: 0,
+    left: 0,
+    width: 0,
+  });
+  const dropdownRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const optionsContainerRef = useRef<HTMLDivElement>(null);
+
+  // Filter options based on search query
+  const filteredOptions = useMemo(() => {
+    if (!searchQuery.trim()) return options;
+
+    const tokens = searchQuery
+      .toLowerCase()
+      .split(/\s+/)
+      .filter(Boolean);
+    return options.filter((option) => {
+      const haystack = [
+        option.label,
+        String(option.value),
+        option.memberId,
+        option.nickname,
+        option.firstName,
+        option.clusterCode,
+        option.branchCode,
+        option.roleLabel,
+        option.statusLabel,
+      ]
+        .filter((part) => part != null && String(part).trim() !== "")
+        .join(" ")
+        .toLowerCase();
+      return tokens.every((token) => haystack.includes(token));
+    });
+  }, [options, searchQuery]);
+
+  // Determine if we should use virtualization
+  const shouldVirtualize = filteredOptions.length > virtualizeThreshold;
+
+  const selectedValues = useMemo(
+    () => (multiple ? values.map(String) : []),
+    [multiple, values]
+  );
+
+  const selectedOption = multiple
+    ? undefined
+    : options.find((option) => String(option.value) === String(value));
+
+  const selectedOptions = useMemo(() => {
+    if (!multiple) return [];
+    const selected = new Set(selectedValues);
+    return options.filter((option) => selected.has(String(option.value)));
+  }, [multiple, options, selectedValues]);
+
+  const triggerLabel = multiple
+    ? selectedOptions.length === 0
+      ? placeholder
+      : selectedOptions.length === 1
+        ? selectedOptions[0].label
+        : `${selectedOptions.length} selected`
+    : selectedOption
+      ? selectedOption.label
+      : placeholder;
+
+  const hasSelection = multiple
+    ? selectedValues.length > 0
+    : Boolean(value);
+
+  // Handle click outside
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      const target = event.target as Node;
+      if (
+        triggerRef.current &&
+        !triggerRef.current.contains(target) &&
+        dropdownRef.current &&
+        !dropdownRef.current.contains(target)
+      ) {
+        setIsOpen(false);
+        setSearchQuery("");
+      }
+    };
+
+    if (isOpen) {
+      document.addEventListener("mousedown", handleClickOutside);
+    }
+
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+    };
+  }, [isOpen]);
+
+  // Calculate dropdown position when it opens or window resizes/scrolls
+  const updateDropdownPosition = () => {
+    if (triggerRef.current) {
+      const rect = triggerRef.current.getBoundingClientRect();
+      setDropdownPosition({
+        top: rect.bottom + 4, // 4px gap, using fixed positioning so no scroll offset needed
+        left: rect.left,
+        width: rect.width,
+      });
+    }
+  };
+
+  useEffect(() => {
+    if (isOpen) {
+      updateDropdownPosition();
+      window.addEventListener("scroll", updateDropdownPosition, true);
+      window.addEventListener("resize", updateDropdownPosition);
+    }
+
+    return () => {
+      window.removeEventListener("scroll", updateDropdownPosition, true);
+      window.removeEventListener("resize", updateDropdownPosition);
+    };
+  }, [isOpen]);
+
+  // Focus search input when dropdown opens
+  useEffect(() => {
+    if (isOpen && showSearch && searchInputRef.current) {
+      searchInputRef.current.focus();
+    }
+  }, [isOpen, showSearch]);
+
+  const handleOptionClick = (optionValue: string) => {
+    if (multiple) {
+      const next = selectedValues.includes(optionValue)
+        ? selectedValues.filter((item) => item !== optionValue)
+        : [...selectedValues, optionValue];
+      onValuesChange?.(next);
+      return;
+    }
+    onChange?.(optionValue);
+    setIsOpen(false);
+    setSearchQuery("");
+    onConfirm?.(optionValue);
+  };
+
+  const handleSearchKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key !== "Enter") return;
+    if (!multiple && !onConfirm) return;
+
+    const enabledMatches = filteredOptions.filter((option) => !option.disabled);
+    if (enabledMatches.length !== 1) return;
+
+    e.preventDefault();
+    handleOptionClick(enabledMatches[0].value);
+  };
+
+  const handleClear = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (multiple) {
+      onValuesChange?.([]);
+    } else {
+      onChange?.("");
+    }
+    setIsOpen(false);
+    setSearchQuery("");
+  };
+
+  // Handle toggle dropdown
+  const handleToggle = () => {
+    if (disabled || interactionBlocked) return;
+    setIsOpen(!isOpen);
+    if (!isOpen) {
+      setSearchQuery("");
+    }
+  };
+
+  const renderOptionRow = (option: SelectOption) => {
+    const isSelected = multiple
+      ? selectedValues.includes(String(option.value))
+      : String(option.value) === String(value);
+    return (
+      <button
+        key={option.value}
+        type="button"
+        onClick={() => handleOptionClick(option.value)}
+        disabled={option.disabled}
+        role={multiple ? "option" : undefined}
+        aria-selected={isSelected}
+        className={`
+          w-full px-3 py-1.5 text-left text-sm transition-colors
+          ${
+            option.disabled
+              ? "text-gray-400 cursor-not-allowed"
+              : "text-gray-900 hover:bg-gray-100"
+          }
+          ${isSelected ? "bg-primary/10 text-primary" : ""}
+        `}
+      >
+        <div className="flex items-center justify-between gap-2">
+          <span className="flex min-w-0 flex-1 items-center gap-2">
+            {multiple && (
+              <span
+                className={`flex h-4 w-4 shrink-0 items-center justify-center rounded border ${
+                  isSelected
+                    ? "border-primary bg-primary text-white"
+                    : "border-gray-300 bg-white"
+                }`}
+                aria-hidden
+              >
+                {isSelected ? (
+                  <svg className="h-3 w-3" fill="currentColor" viewBox="0 0 20 20">
+                    <path
+                      fillRule="evenodd"
+                      d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z"
+                      clipRule="evenodd"
+                    />
+                  </svg>
+                ) : null}
+              </span>
+            )}
+            <span className="truncate">{option.label}</span>
+            {option.roleLabel && (
+              <span
+                className={`inline-flex shrink-0 items-center rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+                  option.roleClassName ?? "bg-gray-100 text-gray-800"
+                }`}
+              >
+                {option.roleLabel}
+              </span>
+            )}
+            {option.statusLabel && (
+              <span
+                className={`inline-flex shrink-0 items-center rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+                  option.statusClassName ?? "bg-gray-100 text-gray-800"
+                }`}
+              >
+                {option.statusLabel}
+              </span>
+            )}
+            <ClusterCodeChip option={option} />
+            {option.hasBibleSharers ? <BibleSharersChip /> : null}
+            {option.typeLabel === "cluster" && (
+              <span className="chip-primary-sm shrink-0">Cluster</span>
+            )}
+            {option.typeLabel === "group" && (
+              <span className="inline-flex shrink-0 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-semibold text-emerald-800">
+                Group
+              </span>
+            )}
+          </span>
+          <span className="ml-2 flex shrink-0 items-center gap-1.5 text-xs">
+            {option.branchCode && (
+              <span className="font-medium text-gray-500">
+                {option.branchCode}
+              </span>
+            )}
+            {isSelected && !multiple && (
+              <svg
+                className="h-4 w-4 text-primary"
+                fill="currentColor"
+                viewBox="0 0 20 20"
+              >
+                <path
+                  fillRule="evenodd"
+                  d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z"
+                  clipRule="evenodd"
+                />
+              </svg>
+            )}
+          </span>
+        </div>
+      </button>
+    );
+  };
+
+  // Render options with virtualization for large lists
+  const renderOptions = () => {
+    if (loading) {
+      return (
+        <div className="p-3 text-center text-gray-500">
+          <div className="flex items-center justify-center">
+            <svg
+              className="animate-spin h-4 w-4 mr-2"
+              fill="none"
+              viewBox="0 0 24 24"
+            >
+              <circle
+                className="opacity-25"
+                cx="12"
+                cy="12"
+                r="10"
+                stroke="currentColor"
+                strokeWidth="4"
+              ></circle>
+              <path
+                className="opacity-75"
+                fill="currentColor"
+                d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+              ></path>
+            </svg>
+            Loading...
+          </div>
+        </div>
+      );
+    }
+
+    if (filteredOptions.length === 0) {
+      return (
+        <div className="p-3 text-center text-gray-500 text-sm">
+          {emptyMessage}
+        </div>
+      );
+    }
+
+    if (shouldVirtualize) {
+      return (
+        <>
+          <div className="p-2 text-xs text-gray-500 bg-gray-50 border-b">
+            Showing {filteredOptions.length} options. Use search to filter
+            results.
+          </div>
+          <div className="max-h-48 overflow-y-auto">
+            {filteredOptions
+              .slice(0, 50)
+              .map((option) => renderOptionRow(option))}
+            {filteredOptions.length > 50 && (
+              <div className="p-2 text-xs text-gray-500 text-center bg-gray-50">
+                ... and {filteredOptions.length - 50} more. Use search to find
+                specific options.
+              </div>
+            )}
+          </div>
+        </>
+      );
+    }
+
+    return filteredOptions.map((option) => renderOptionRow(option));
+  };
+
+  const renderDropdown = () => {
+    if (!isOpen) return null;
+
+    return createPortal(
+      <div
+        ref={dropdownRef}
+        data-scalable-select-portal="true"
+        className="fixed z-[80] bg-white border border-gray-300 rounded-md shadow-lg"
+        style={{
+          top: `${dropdownPosition.top}px`,
+          left: `${dropdownPosition.left}px`,
+          width: `${dropdownPosition.width}px`,
+        }}
+      >
+        {/* Search Input */}
+        {showSearch && (
+          <div className="p-2 border-b border-gray-200">
+            <div className="relative">
+              <MagnifyingGlassIcon className="absolute left-2.5 top-1/2 transform -translate-y-1/2 w-3.5 h-3.5 text-gray-400" />
+              <input
+                ref={searchInputRef}
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                onKeyDown={handleSearchKeyDown}
+                placeholder={searchPlaceholder}
+                className="w-full pl-8 pr-3 py-1.5 text-sm border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-ring focus:border-transparent"
+              />
+            </div>
+          </div>
+        )}
+
+        {/* Options List */}
+        <div
+          ref={optionsContainerRef}
+          className="overflow-y-auto"
+          style={{ maxHeight: `${maxHeight}px` }}
+        >
+          {renderOptions()}
+        </div>
+      </div>,
+      document.body
+    );
+  };
+
+  return (
+    <div
+      className={`relative ${className} ${
+        interactionBlocked ? "pointer-events-none" : ""
+      }`}
+    >
+      {/* Trigger Button */}
+      <button
+        ref={triggerRef}
+        type="button"
+        onClick={handleToggle}
+        disabled={disabled && !interactionBlocked}
+        aria-disabled={interactionBlocked || disabled}
+        tabIndex={interactionBlocked ? -1 : undefined}
+        className={`
+          flex h-11 w-full shrink-0 items-center px-3 text-left bg-white border border-gray-300 rounded-md shadow-sm text-sm
+          focus:outline-none focus:ring-2 focus:ring-ring focus:border-transparent
+          ${
+            disabled && !interactionBlocked
+              ? "bg-gray-50 text-gray-500 cursor-not-allowed"
+              : interactionBlocked
+                ? "cursor-default text-gray-900"
+                : "hover:border-gray-400"
+          }
+          ${
+            isOpen && !interactionBlocked && !disabled
+              ? "ring-2 ring-ring border-transparent"
+              : ""
+          }
+        `}
+      >
+        <div className="flex w-full min-w-0 items-center justify-between gap-2">
+          <span
+            className={`flex min-w-0 flex-1 items-center gap-2 ${
+              hasSelection ? "text-gray-900" : "text-gray-500"
+            }`}
+          >
+            <span className="min-w-0 truncate">{triggerLabel}</span>
+            {selectedOption ? <ClusterCodeChip option={selectedOption} /> : null}
+            {selectedOption?.hasBibleSharers ? <BibleSharersChip /> : null}
+          </span>
+          <div className="flex shrink-0 items-center space-x-1">
+            {hasSelection && !disabled && !interactionBlocked && (
+              <button
+                type="button"
+                onClick={handleClear}
+                className="text-gray-400 hover:text-gray-600 p-0.5 rounded"
+              >
+                <XMarkIcon className="w-3.5 h-3.5" />
+              </button>
+            )}
+            <ChevronDownIcon
+              className={`w-3.5 h-3.5 text-gray-400 transition-transform duration-200 ${
+                isOpen ? "rotate-180" : ""
+              }`}
+            />
+          </div>
+        </div>
+      </button>
+
+      {/* Dropdown - Rendered via Portal */}
+      {renderDropdown()}
+    </div>
+  );
+}

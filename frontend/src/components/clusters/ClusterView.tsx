@@ -1,0 +1,1242 @@
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+} from "react";
+import { Cluster } from "@/src/types/cluster";
+import { Person, Family, PersonStatus, MemberCareCase } from "@/src/types/person";
+import { formatPersonName } from "@/src/lib/name";
+import Button from "@/src/components/ui/Button";
+import { useBranches } from "@/src/hooks/useBranches";
+import {
+  CLUSTER_BRANCH_CHIP_CLASSNAME,
+  CLUSTER_CODE_BADGE_CLASSNAME,
+  getBranchOutlineBadgeStyle,
+  getClusterCodeBadgeStyle,
+  getBranchDisplayCode,
+} from "@/src/lib/branchChipColor";
+import { getPersonRoleColor } from "@/src/lib/personRole";
+import {
+  formatPersonStatusLabel,
+  getPersonStatusColor,
+} from "@/src/lib/personStatus";
+import PersonAvatar from "@/src/components/people/PersonAvatar";
+import ToolbarSearch from "@/src/components/ui/ToolbarSearch";
+import type {
+  ClusterRosterFamily,
+  ClusterRosterPerson,
+} from "@/src/lib/clusterRoster";
+import ClusterProspectsSection from "@/src/components/clusters/ClusterProspectsSection";
+import ClusterCareRoster from "@/src/components/clusters/ClusterCareRoster";
+import ChangePersonStatusModal from "@/src/components/people/ChangePersonStatusModal";
+import { useAuth } from "@/src/contexts/AuthContext";
+import { userCanAccessMemberCare } from "@/src/lib/clusterPermissions";
+
+type SortField =
+  | "first_name"
+  | "last_name"
+  | "date_first_attended"
+  | "water_baptism_date";
+
+function getSortDropdownStyle(
+  button: HTMLButtonElement | null,
+  align: "left" | "right",
+): CSSProperties {
+  const margin = 16;
+  const menuWidth = 224;
+  if (!button) {
+    return align === "left"
+      ? { top: 0, left: margin }
+      : { top: 0, right: margin };
+  }
+  const rect = button.getBoundingClientRect();
+  const top = rect.bottom + 4;
+  if (align === "left") {
+    const maxWidth = Math.min(menuWidth, window.innerWidth - margin * 2);
+    const left = Math.min(
+      Math.max(rect.left, margin),
+      Math.max(margin, window.innerWidth - margin - maxWidth),
+    );
+    return { top, left };
+  }
+  return {
+    top,
+    right: Math.max(margin, window.innerWidth - rect.right),
+  };
+}
+
+function TrashIcon({ className = "w-4 h-4" }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      fill="none"
+      stroke="currentColor"
+      viewBox="0 0 24 24"
+      aria-hidden
+    >
+      <path
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth={2}
+        d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"
+      />
+    </svg>
+  );
+}
+
+function CoordinatorIcon({ className = "w-3.5 h-3.5" }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      viewBox="0 0 24 24"
+      fill="currentColor"
+      aria-hidden
+    >
+      <path d="M12 2l2.39 4.84 5.34.78-3.87 3.77.91 5.32L12 14.9l-4.77 2.51.91-5.32L4.27 7.62l5.34-.78L12 2z" />
+    </svg>
+  );
+}
+
+function ReporterIcon({ className = "w-3.5 h-3.5" }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      fill="none"
+      stroke="currentColor"
+      viewBox="0 0 24 24"
+      aria-hidden
+    >
+      <path
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth={2}
+        d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
+      />
+    </svg>
+  );
+}
+
+function DeleteClusterButton({
+  onClick,
+  buttonClassName = "h-10 px-4 text-sm font-medium",
+  fullWidth = false,
+}: {
+  onClick: () => void;
+  buttonClassName?: string;
+  fullWidth?: boolean;
+}) {
+  return (
+    <Button
+      onClick={onClick}
+      variant="secondary"
+      aria-label="Delete cluster permanently"
+      title="Delete cluster permanently"
+      className={`!text-red-600 bg-white border border-red-200 hover:bg-red-50 hover:border-red-300 flex items-center justify-center !min-h-0 ${
+        fullWidth ? "w-full" : "shrink-0"
+      } ${buttonClassName}`}
+    >
+      <TrashIcon />
+    </Button>
+  );
+}
+
+interface ClusterViewProps {
+  cluster: Cluster;
+  clusterMembers: ClusterRosterPerson[];
+  clusterFamilies: ClusterRosterFamily[];
+  coordinator?: Person;
+  onEdit: () => void;
+  onDelete: () => void;
+  onHardDelete?: () => void;
+  onClose: () => void;
+  onAssignMembers: () => void;
+  onSubmitReport: () => void;
+  onViewPerson?: (person: Person) => void;
+  onViewFamily?: (family: Family) => void;
+  onEditCareCase?: (row: MemberCareCase) => void;
+  selectedCareCaseId?: number | null;
+  showTopHeader?: boolean;
+  /** When false, hides the Members-section Submit Report action (e.g. module-wide users use Reports tab). Default true. */
+  showSubmitReportButton?: boolean;
+  /** When false, hides Edit, Delete, and Assign Members actions. */
+  canManageCluster?: boolean;
+  onPersonStatusChanged?: (person: Person) => void;
+}
+
+export default function ClusterView({
+  cluster,
+  clusterMembers,
+  clusterFamilies,
+  coordinator,
+  onEdit,
+  onDelete,
+  onHardDelete,
+  onClose,
+  onAssignMembers,
+  onSubmitReport,
+  onViewPerson,
+  onViewFamily,
+  onEditCareCase,
+  selectedCareCaseId,
+  showTopHeader = true,
+  showSubmitReportButton = true,
+  canManageCluster = true,
+  onPersonStatusChanged,
+}: ClusterViewProps) {
+  const { branches } = useBranches();
+  const { user, isSeniorCoordinator, isModuleCoordinator } = useAuth();
+  const showMemberCare =
+    canManageCluster &&
+    userCanAccessMemberCare(
+      {
+        userId: user?.id,
+        role: user?.role,
+        isSeniorCoordinator,
+        isModuleCoordinator,
+      },
+      [cluster],
+    );
+  const [memberSearch, setMemberSearch] = useState("");
+  const [sortBy, setSortBy] = useState<SortField>("last_name");
+  const [sortOrder, setSortOrder] = useState<"asc" | "desc">("asc");
+  const [showSortDropdown, setShowSortDropdown] = useState(false);
+  const [statusOverrides, setStatusOverrides] = useState(
+    {} as Record<string, PersonStatus>,
+  );
+  const [statusPerson, setStatusPerson] = useState(
+    null as ClusterRosterPerson | null,
+  );
+  const [careReloadToken, setCareReloadToken] = useState(0);
+  const sortButtonRef = useRef<HTMLButtonElement>(null);
+  const sortDropdownRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (
+        sortButtonRef.current &&
+        sortDropdownRef.current &&
+        !sortButtonRef.current.contains(event.target as Node) &&
+        !sortDropdownRef.current.contains(event.target as Node)
+      ) {
+        setShowSortDropdown(false);
+      }
+    };
+
+    if (showSortDropdown) {
+      document.addEventListener("mousedown", handleClickOutside);
+    }
+
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+    };
+  }, [showSortDropdown]);
+
+  // Find the branch for this cluster
+  const clusterBranch = cluster.branch
+    ? branches.find((b) => b.id === cluster.branch)
+    : null;
+
+  const displayCoordinator = useMemo((): Person | undefined => {
+    if (coordinator) {
+      return { ...coordinator, id: String(coordinator.id) };
+    }
+    if (!cluster.coordinator) return undefined;
+    return {
+      id: String(cluster.coordinator.id),
+      username: cluster.coordinator.username || "",
+      email: "",
+      first_name: cluster.coordinator.first_name || "",
+      last_name: cluster.coordinator.last_name || "",
+      role: "MEMBER",
+      status: "ACTIVE",
+    };
+  }, [coordinator, cluster.coordinator]);
+
+  // Calculate member and visitor counts
+  // Members: role is NOT "ADMIN" and NOT "VISITOR" (includes MEMBER, PASTOR, etc.)
+  // Visitors: role is "VISITOR"
+  // ADMIN is excluded from both counts
+
+  // Check if coordinator is already in clusterMembers to avoid double counting
+  // (String() — peopleUI ids may be numeric while synthetic coordinator ids are strings)
+  const coordinatorInMembers = displayCoordinator
+    ? clusterMembers.some(
+        (m) => String(m.id) === String(displayCoordinator.id),
+      )
+    : false;
+
+  // Calculate members: all people who are not ADMIN or VISITOR
+  const memberCountFromCluster = clusterMembers.filter(
+    (member) => member.role !== "ADMIN" && member.role !== "VISITOR",
+  ).length;
+
+  // Add coordinator to member count only if not already in clusterMembers and is not ADMIN/VISITOR
+  const memberCount =
+    memberCountFromCluster +
+    (displayCoordinator &&
+    !coordinatorInMembers &&
+    displayCoordinator.role !== "ADMIN" &&
+    displayCoordinator.role !== "VISITOR"
+      ? 1
+      : 0);
+
+  // Calculate visitors: all people with VISITOR role
+  const visitorCountFromCluster = clusterMembers.filter(
+    (member) => member.role === "VISITOR",
+  ).length;
+
+  // Add coordinator to visitor count only if not already in clusterMembers and is VISITOR
+  const visitorCount =
+    visitorCountFromCluster +
+    (displayCoordinator &&
+    !coordinatorInMembers &&
+    displayCoordinator.role === "VISITOR"
+      ? 1
+      : 0);
+
+  const formatFullName = (person: Person) => formatPersonName(person);
+  const isPanelMode = !showTopHeader;
+  const stackMemberActions = canManageCluster && showSubmitReportButton;
+
+  const sortedDisplayMembers = useMemo(() => {
+    const getAttendanceDate = (person: Person) => {
+      const uiDate = (person as Person & { dateFirstAttended?: string })
+        .dateFirstAttended;
+      return uiDate || person.date_first_attended || "";
+    };
+
+    const combined = clusterMembers.map((member) => {
+      const nextStatus = statusOverrides[String(member.id)];
+      return nextStatus ? { ...member, status: nextStatus } : member;
+    });
+    if (
+      displayCoordinator &&
+      !combined.some(
+        (member) => String(member.id) === String(displayCoordinator.id),
+      )
+    ) {
+      combined.push({
+        ...displayCoordinator,
+        id: String(displayCoordinator.id),
+        status:
+          statusOverrides[String(displayCoordinator.id)] ||
+          displayCoordinator.status,
+        canOpenProfile: coordinator
+          ? (coordinator as Person & { can_view_profile?: boolean })
+              .can_view_profile !== false
+          : false,
+      });
+    }
+
+    return combined.sort((a, b) => {
+      let aValue: string | number;
+      let bValue: string | number;
+
+      switch (sortBy) {
+        case "first_name":
+          aValue = (a.first_name || "").toLowerCase();
+          bValue = (b.first_name || "").toLowerCase();
+          break;
+        case "last_name":
+          aValue = (a.last_name || "").toLowerCase();
+          bValue = (b.last_name || "").toLowerCase();
+          break;
+        case "date_first_attended": {
+          const aDate = getAttendanceDate(a);
+          const bDate = getAttendanceDate(b);
+          aValue = aDate ? new Date(aDate).getTime() : 0;
+          bValue = bDate ? new Date(bDate).getTime() : 0;
+          break;
+        }
+        case "water_baptism_date":
+          aValue = a.water_baptism_date
+            ? new Date(a.water_baptism_date).getTime()
+            : 0;
+          bValue = b.water_baptism_date
+            ? new Date(b.water_baptism_date).getTime()
+            : 0;
+          break;
+        default:
+          aValue = (a.last_name || "").toLowerCase();
+          bValue = (b.last_name || "").toLowerCase();
+      }
+
+      if (sortBy === "last_name" && aValue === bValue) {
+        aValue = (a.first_name || "").toLowerCase();
+        bValue = (b.first_name || "").toLowerCase();
+      }
+
+      if (aValue < bValue) return sortOrder === "asc" ? -1 : 1;
+      if (aValue > bValue) return sortOrder === "asc" ? 1 : -1;
+      return 0;
+    });
+  }, [clusterMembers, coordinator, displayCoordinator, sortBy, sortOrder, statusOverrides]);
+
+  const handleSortSelect = (field: SortField) => {
+    if (sortBy === field) {
+      setSortOrder(sortOrder === "asc" ? "desc" : "asc");
+    } else {
+      setSortBy(field);
+      setSortOrder("asc");
+    }
+    setShowSortDropdown(false);
+  };
+
+  const sortedCoreMembers = useMemo(
+    () =>
+      sortedDisplayMembers.filter(
+        (p) => p.role !== "ADMIN" && p.role !== "VISITOR",
+      ),
+    [sortedDisplayMembers],
+  );
+
+  const sortedVisitors = useMemo(
+    () => sortedDisplayMembers.filter((p) => p.role === "VISITOR"),
+    [sortedDisplayMembers],
+  );
+
+  const filteredCoreMembers = useMemo(() => {
+    const term = memberSearch.trim().toLowerCase();
+    if (!term) {
+      return sortedCoreMembers;
+    }
+    return sortedCoreMembers.filter((person) => {
+      const name = formatPersonName(person).toLowerCase();
+      const role = (person.role || "").toLowerCase();
+      const memberId = (person.member_id || "").toLowerCase();
+      return name.includes(term) || role.includes(term) || memberId.includes(term);
+    });
+  }, [sortedCoreMembers, memberSearch]);
+
+  const filteredVisitors = useMemo(() => {
+    const term = memberSearch.trim().toLowerCase();
+    if (!term) {
+      return sortedVisitors;
+    }
+    return sortedVisitors.filter((person) => {
+      const name = formatPersonName(person).toLowerCase();
+      const role = (person.role || "").toLowerCase();
+      const memberId = (person.member_id || "").toLowerCase();
+      return name.includes(term) || role.includes(term) || memberId.includes(term);
+    });
+  }, [sortedVisitors, memberSearch]);
+
+  const roleBadgeClass = (role: string) => getPersonRoleColor(role);
+
+  const peopleGridClass = "grid gap-2 grid-cols-1 sm:grid-cols-2";
+
+  const isClusterCoordinator = (member: ClusterRosterPerson) =>
+    Boolean(
+      displayCoordinator &&
+        String(member.id) === String(displayCoordinator.id),
+    );
+
+  const isClusterReporter = (member: ClusterRosterPerson) => {
+    const memberId = String(member.id);
+    if (
+      (cluster.reporter_ids ?? []).some(
+        (id) => String(id) === memberId,
+      )
+    ) {
+      return true;
+    }
+    return Boolean(
+      (member.module_coordinator_assignments ?? []).some(
+        (assignment) =>
+          assignment.module === "CLUSTER" &&
+          assignment.level === "REPORTER" &&
+          assignment.resource_id != null &&
+          Number(assignment.resource_id) === Number(cluster.id),
+      ),
+    );
+  };
+
+  const roleBadgeHighlightClass = (
+    isCoordinator: boolean,
+    isReporter: boolean,
+  ) => {
+    if (isCoordinator) return " border-primary/30 bg-primary/5";
+    if (isReporter) return " border-amber-300/60 bg-amber-50/50";
+    return "";
+  };
+
+  const renderPersonCard = (member: ClusterRosterPerson) => {
+    const canOpen = Boolean(member.canOpenProfile && onViewPerson);
+    const isCoordinator = isClusterCoordinator(member);
+    const isReporter = isClusterReporter(member);
+    const cardClass = canOpen
+      ? "cursor-pointer hover:bg-gray-50"
+      : "cursor-default";
+    const memberName = formatFullName(member);
+    const isLongWrappedName = memberName.length > 20;
+    return (
+      <div
+        key={member.id}
+        className={`flex items-start gap-3 p-3 bg-white border border-gray-200 rounded-md ${cardClass}${roleBadgeHighlightClass(
+          isCoordinator,
+          isReporter,
+        )}`}
+        onClick={() => canOpen && onViewPerson?.(member)}
+      >
+        <PersonAvatar person={member} size="sm" />
+        <div className="flex-1 min-w-0">
+          <p
+            className={`font-medium text-gray-900 break-words flex items-start gap-1 ${
+              isLongWrappedName ? "text-xs leading-5" : "text-sm leading-5"
+            }`}
+          >
+            <span className="min-w-0 break-words">{memberName}</span>
+            {isCoordinator && (
+              <span
+                className="inline-flex items-center text-primary flex-shrink-0 mt-0.5"
+                title="Cluster coordinator"
+                aria-label="Cluster coordinator"
+              >
+                <CoordinatorIcon />
+              </span>
+            )}
+            {isReporter && (
+              <span
+                className="inline-flex items-center text-amber-700 flex-shrink-0 mt-0.5"
+                title="Cluster reporter"
+                aria-label="Cluster reporter"
+              >
+                <ReporterIcon />
+              </span>
+            )}
+          </p>
+          <div className="flex items-center gap-1 flex-wrap mt-0.5">
+            {member.status && (
+              <span
+                className={`inline-flex items-center px-1 py-0.5 rounded-full text-[9px] font-medium ${getPersonStatusColor(
+                  member.status,
+                )}`}
+              >
+                {formatPersonStatusLabel(member.status)}
+              </span>
+            )}
+            {canManageCluster && (
+              <button
+                type="button"
+                className="inline-flex items-center px-1 py-0.5 rounded text-[9px] font-medium text-primary hover:underline"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setStatusPerson(member);
+                }}
+              >
+                Change status
+              </button>
+            )}
+            {!isCoordinator && (
+              <span
+                className={`inline-flex items-center px-1 py-0.5 rounded-full text-[9px] font-medium ${roleBadgeClass(member.role)}`}
+              >
+                {member.role}
+              </span>
+            )}
+            {isCoordinator && (
+              <span className="inline-flex items-center gap-0.5 px-1 py-0.5 rounded-full text-[9px] font-medium chip-primary">
+                <CoordinatorIcon className="w-2.5 h-2.5" />
+                Coordinator
+              </span>
+            )}
+            {isReporter && (
+              <span className="inline-flex items-center gap-0.5 px-1 py-0.5 rounded-full text-[9px] font-medium chip-yellow-sm">
+                <ReporterIcon className="w-2.5 h-2.5" />
+                Reporter
+              </span>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div className="flex flex-col h-full space-y-0">
+      {/* Header */}
+      {showTopHeader && (
+        <div className="flex items-center justify-between p-3 md:p-4 border-b border-gray-200">
+          <div className="flex-1 min-w-0">
+            <h2 className="text-sm font-medium text-gray-900">
+              Cluster Details
+            </h2>
+            <p className="text-xs md:text-[11px] text-gray-600 mt-0.5 truncate">
+              {cluster.name || "Untitled Cluster"}
+            </p>
+          </div>
+          <button
+            onClick={onClose}
+            className="text-red-600 hover:text-red-700 text-xl font-bold p-2 rounded-md hover:bg-red-50 transition-colors min-w-[44px] min-h-[44px] flex items-center justify-center flex-shrink-0 ml-2"
+            aria-label="Close"
+          >
+            <svg
+              className="w-5 h-5"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth={2}
+                d="M6 18L18 6M6 6l12 12"
+              />
+            </svg>
+          </button>
+        </div>
+      )}
+
+      {/* Content */}
+      <div
+        className={`${
+          isPanelMode ? "p-3 sm:p-4" : "p-4 md:p-5"
+        } overflow-y-auto flex-1`}
+      >
+        <div
+          className={`${isPanelMode ? "space-y-3 sm:space-y-4" : "space-y-4 md:space-y-5"}`}
+        >
+          {/* Cluster Info Card */}
+          <div
+            className={`rounded-lg p-4 border ${
+              isPanelMode
+                ? "bg-white border-gray-200 shadow-sm"
+                : "bg-gradient-to-r from-lighthouse-ivory to-muted border-primary/20"
+            }`}
+          >
+            <div className="flex flex-row items-start justify-between gap-3 mb-3">
+              <div className="flex flex-row items-center gap-2 sm:gap-3 min-w-0 flex-1">
+                <h2
+                  className={`${
+                    isPanelMode
+                      ? "text-xl"
+                      : "text-lg md:text-xl"
+                  } font-bold text-gray-900 min-w-0 truncate`}
+                >
+                  {cluster.name || "Untitled Cluster"}
+                </h2>
+                {cluster.code && (
+                  <span
+                    className={`${CLUSTER_CODE_BADGE_CLASSNAME} flex-shrink-0`}
+                    style={getClusterCodeBadgeStyle(
+                      clusterBranch?.id,
+                      clusterBranch?.is_headquarters
+                    )}
+                  >
+                    {cluster.code}
+                  </span>
+                )}
+              </div>
+              <div className="flex flex-col items-start gap-1 text-gray-700 flex-shrink-0">
+                <div className="flex items-center gap-1">
+                  <svg
+                    className="w-4 h-4 shrink-0"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                    strokeWidth={2}
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"
+                    />
+                  </svg>
+                  <span className="text-sm font-normal">
+                    {memberCount} members
+                  </span>
+                </div>
+                <div className="flex items-center gap-1">
+                  <svg
+                    className="w-4 h-4 shrink-0"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                    strokeWidth={2}
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"
+                    />
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"
+                    />
+                  </svg>
+                  <span className="text-sm font-normal">
+                    {visitorCount} visitors
+                  </span>
+                </div>
+              </div>
+            </div>
+            <div
+              className={`${isPanelMode ? "space-y-2" : "flex flex-col gap-2 md:flex-row md:items-center md:justify-between"} text-sm text-gray-700`}
+            >
+              <div className="flex items-center gap-4 flex-wrap">
+                {(cluster as any).location && (
+                  <div className="flex items-center gap-1">
+                    <svg
+                      className="w-4 h-4"
+                      fill="none"
+                      viewBox="0 0 24 24"
+                      stroke="currentColor"
+                      strokeWidth={2}
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        d="M12 11a3 3 0 100-6 3 3 0 000 6z"
+                      />
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        d="M19.5 10.5c0 7.5-7.5 11.25-7.5 11.25S4.5 18 4.5 10.5a7.5 7.5 0 1115 0z"
+                      />
+                    </svg>
+                    <span>{(cluster as any).location}</span>
+                  </div>
+                )}
+                {(cluster as any).meeting_schedule && (
+                  <div className="flex items-center gap-1">
+                    <svg
+                      className="w-4 h-4"
+                      fill="none"
+                      viewBox="0 0 24 24"
+                      stroke="currentColor"
+                      strokeWidth={2}
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"
+                      />
+                    </svg>
+                    <span>{(cluster as any).meeting_schedule}</span>
+                  </div>
+                )}
+                {clusterBranch && (
+                  <span
+                    className={CLUSTER_BRANCH_CHIP_CLASSNAME}
+                    style={getBranchOutlineBadgeStyle(
+                      clusterBranch.id,
+                      clusterBranch.is_headquarters
+                    )}
+                  >
+                    <svg
+                      className="w-3 h-3 shrink-0"
+                      fill="none"
+                      viewBox="0 0 24 24"
+                      stroke="currentColor"
+                      strokeWidth={2}
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4"
+                      />
+                    </svg>
+                    {getBranchDisplayCode(clusterBranch)}
+                  </span>
+                )}
+              </div>
+              {displayCoordinator && (
+                <div className="flex items-center gap-1">
+                  <svg
+                    className="w-4 h-4"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                    strokeWidth={2}
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"
+                    />
+                  </svg>
+                  <span className="font-normal break-words">
+                    {formatFullName(displayCoordinator)}
+                  </span>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Description */}
+          {cluster.description && (
+            <div className="bg-gray-50 rounded-lg px-3 py-2">
+              <h3 className="text-xs font-medium text-gray-500 mb-0.5">
+                Description
+              </h3>
+              <p className="text-sm text-gray-600">{cluster.description}</p>
+            </div>
+          )}
+
+          {/* Members & visitors */}
+          {(sortedCoreMembers.length > 0 || sortedVisitors.length > 0) && (
+            <div className="w-full min-w-0">
+              <div
+                className={
+                  stackMemberActions
+                    ? "mb-4 flex w-full flex-col gap-3"
+                    : "mb-4 flex items-center justify-between gap-3"
+                }
+              >
+                <h3 className="text-base md:text-lg font-semibold text-gray-900 shrink-0">
+                  {sortedCoreMembers.length > 0
+                    ? `Members (${memberCount})`
+                    : `Visitors (${visitorCount})`}
+                </h3>
+                <div
+                  className={
+                    stackMemberActions
+                      ? "grid w-full grid-cols-3 items-stretch gap-1.5 sm:gap-2"
+                      : "flex shrink-0 flex-nowrap items-center gap-2"
+                  }
+                >
+                  <div
+                    className={
+                      stackMemberActions
+                        ? "relative min-w-0"
+                        : "relative shrink-0"
+                    }
+                  >
+                    <button
+                      ref={sortButtonRef}
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setShowSortDropdown(!showSortDropdown);
+                      }}
+                      className={`inline-flex h-10 items-center justify-center py-2.5 md:py-2 border border-gray-300 shadow-sm leading-4 font-medium rounded-lg text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-ring transition-colors min-h-[44px] md:min-h-0 whitespace-nowrap ${
+                        stackMemberActions
+                          ? "w-full min-w-0 px-1.5 sm:px-3 text-xs sm:text-sm"
+                          : "w-auto shrink-0 px-3 text-sm"
+                      }`}
+                    >
+                      <svg
+                        className="w-4 h-4 mr-1.5 shrink-0"
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={2}
+                          d="M3 4h13M3 8h9m-9 4h6m4 0l4-4m0 0l4 4m-4-4v12"
+                        />
+                      </svg>
+                      Sort
+                    </button>
+
+                    {showSortDropdown && (
+                      <div
+                        ref={sortDropdownRef}
+                        className="fixed w-56 rounded-lg shadow-lg bg-white ring-1 ring-black ring-opacity-5 focus:outline-none z-50 max-w-[calc(100vw-2rem)]"
+                        style={getSortDropdownStyle(
+                          sortButtonRef.current,
+                          stackMemberActions ? "left" : "right",
+                        )}
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <div className="py-1">
+                          <button
+                            type="button"
+                            onClick={() => handleSortSelect("last_name")}
+                            className={`block w-full text-left px-4 py-3 sm:py-2 text-sm min-h-[44px] sm:min-h-0 ${
+                              sortBy === "last_name"
+                                ? "bg-primary/10 text-primary"
+                                : "text-gray-700 hover:bg-gray-50"
+                            }`}
+                          >
+                            Last Name
+                            {sortBy === "last_name" && (
+                              <span className="ml-2">
+                                {sortOrder === "asc" ? "↑" : "↓"}
+                              </span>
+                            )}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleSortSelect("first_name")}
+                            className={`block w-full text-left px-4 py-3 sm:py-2 text-sm min-h-[44px] sm:min-h-0 ${
+                              sortBy === "first_name"
+                                ? "bg-primary/10 text-primary"
+                                : "text-gray-700 hover:bg-gray-50"
+                            }`}
+                          >
+                            First Name
+                            {sortBy === "first_name" && (
+                              <span className="ml-2">
+                                {sortOrder === "asc" ? "↑" : "↓"}
+                              </span>
+                            )}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleSortSelect("date_first_attended")
+                            }
+                            className={`block w-full text-left px-4 py-3 sm:py-2 text-sm min-h-[44px] sm:min-h-0 ${
+                              sortBy === "date_first_attended"
+                                ? "bg-primary/10 text-primary"
+                                : "text-gray-700 hover:bg-gray-50"
+                            }`}
+                          >
+                            Date First Attended
+                            {sortBy === "date_first_attended" && (
+                              <span className="ml-2">
+                                {sortOrder === "asc" ? "↑" : "↓"}
+                              </span>
+                            )}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleSortSelect("water_baptism_date")
+                            }
+                            className={`block w-full text-left px-4 py-3 sm:py-2 text-sm min-h-[44px] sm:min-h-0 ${
+                              sortBy === "water_baptism_date"
+                                ? "bg-primary/10 text-primary"
+                                : "text-gray-700 hover:bg-gray-50"
+                            }`}
+                          >
+                            Water Baptism Date
+                            {sortBy === "water_baptism_date" && (
+                              <span className="ml-2">
+                                {sortOrder === "asc" ? "↑" : "↓"}
+                              </span>
+                            )}
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                  {canManageCluster && (
+                    <Button
+                      onClick={onAssignMembers}
+                      variant="secondary"
+                      className={`!text-white h-10 !py-2.5 md:!py-2 leading-4 !font-medium bg-green-600 border border-green-600 hover:bg-green-700 hover:border-green-700 inline-flex items-center justify-center !min-h-[44px] md:!min-h-0 !rounded-lg whitespace-nowrap ${
+                        stackMemberActions
+                          ? "!w-full min-w-0 !px-1.5 sm:!px-3 text-xs sm:text-sm gap-1 sm:gap-2"
+                          : "w-auto shrink-0 !px-3 text-sm gap-2"
+                      }`}
+                    >
+                      <svg
+                        className="w-4 h-4 shrink-0"
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={2}
+                          d="M12 6v6m0 0v6m0-6h6m-6 0H6"
+                        />
+                      </svg>
+                      <span>Assign Members</span>
+                    </Button>
+                  )}
+                  {showSubmitReportButton && (
+                    <Button
+                      onClick={onSubmitReport}
+                      variant="secondary"
+                      className={`!text-primary h-10 !py-2.5 md:!py-2 leading-4 !font-medium bg-white border border-primary/20 hover:bg-primary/10 hover:border-primary/30 inline-flex items-center justify-center !min-h-[44px] md:!min-h-0 !rounded-lg whitespace-nowrap ${
+                        stackMemberActions
+                          ? "!w-full min-w-0 !px-1.5 sm:!px-3 text-xs sm:text-sm gap-1 sm:gap-2"
+                          : "w-auto shrink-0 !px-3 text-sm gap-2"
+                      }`}
+                    >
+                      <svg
+                        className="w-4 h-4 shrink-0"
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={2}
+                          d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
+                        />
+                      </svg>
+                      <span>Submit Report</span>
+                    </Button>
+                  )}
+                </div>
+              </div>
+              <ToolbarSearch
+                value={memberSearch}
+                onChange={setMemberSearch}
+                placeholder="Search members…"
+                ariaLabel="Search members"
+                fullWidth
+                className="mb-2"
+              />
+              {memberSearch.trim() && sortedCoreMembers.length > 0 && (
+                <p className="mb-2 text-xs text-gray-500">
+                  Showing {filteredCoreMembers.length} of{" "}
+                  {sortedCoreMembers.length}
+                </p>
+              )}
+              {filteredCoreMembers.length > 0 && (
+                <div
+                  className={`max-h-80 overflow-y-auto pr-1${
+                    sortedVisitors.length > 0 ? " mb-6" : ""
+                  }`}
+                >
+                  <div className={peopleGridClass}>
+                    {filteredCoreMembers.map((member) =>
+                      renderPersonCard(member),
+                    )}
+                  </div>
+                </div>
+              )}
+              {filteredVisitors.length > 0 &&
+                sortedCoreMembers.length > 0 && (
+                  <h3 className="text-base md:text-lg font-semibold text-gray-900 mb-4">
+                    Visitors ({visitorCount})
+                  </h3>
+                )}
+              {memberSearch.trim() &&
+                sortedVisitors.length > 0 &&
+                filteredVisitors.length > 0 && (
+                <p className="mb-2 text-xs text-gray-500">
+                  Showing {filteredVisitors.length} of {sortedVisitors.length}
+                </p>
+              )}
+              {filteredVisitors.length > 0 && (
+                <div className="max-h-80 overflow-y-auto pr-1">
+                  <div className={peopleGridClass}>
+                    {filteredVisitors.map((member) =>
+                      renderPersonCard(member),
+                    )}
+                  </div>
+                </div>
+              )}
+              {memberSearch.trim() &&
+                filteredCoreMembers.length === 0 &&
+                filteredVisitors.length === 0 && (
+                  <p className="text-sm text-gray-500 italic">
+                    No members match your search
+                  </p>
+                )}
+            </div>
+          )}
+
+          {showMemberCare && (
+            <div>
+              <h3 className="text-lg font-semibold text-gray-900 mb-3">
+                Cluster Care
+              </h3>
+              <ClusterCareRoster
+                clusterId={cluster.id}
+                clusters={[cluster]}
+                assigneePeople={[
+                  ...clusterMembers,
+                  ...(displayCoordinator ? [displayCoordinator] : []),
+                ]}
+                canEdit={canManageCluster}
+                compact
+                reloadToken={careReloadToken}
+                onViewPerson={onViewPerson}
+                onOpenCase={onEditCareCase}
+                selectedCaseId={selectedCareCaseId}
+              />
+            </div>
+          )}
+
+          <ClusterProspectsSection
+            clusterId={cluster.id}
+            compact={isPanelMode}
+            onViewPerson={onViewPerson}
+          />
+
+          {/* Families */}
+          {clusterFamilies.length > 0 && (
+            <div>
+              <h3 className="text-lg font-semibold text-gray-900 mb-4">
+                Families ({clusterFamilies.length})
+              </h3>
+              <div
+                className={`grid gap-2 ${
+                  isPanelMode
+                    ? "grid-cols-1"
+                    : "grid-cols-1 md:grid-cols-2 lg:grid-cols-3"
+                }`}
+              >
+                {clusterFamilies.map((family) => {
+                  const canOpenFamily = Boolean(
+                    family.canOpenProfile && onViewFamily
+                  );
+                  const memberLabelCount =
+                    family.member_count ?? family.members?.length ?? 0;
+                  return (
+                    <div
+                      key={family.id}
+                      className={`p-2 bg-white border border-gray-200 rounded-md ${
+                        canOpenFamily
+                          ? "cursor-pointer hover:bg-gray-50"
+                          : "cursor-default"
+                      }`}
+                      onClick={() =>
+                        canOpenFamily && onViewFamily?.(family)
+                      }
+                    >
+                      <h4 className="font-medium text-gray-900 text-sm">
+                        {family.name}
+                      </h4>
+                      <p className="text-xs text-gray-600">
+                        {memberLabelCount} members
+                      </p>
+                      {canOpenFamily && family.address && (
+                        <p className="text-xs text-gray-500 mt-1">
+                          {family.address}
+                        </p>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Empty States */}
+          {clusterMembers.length === 0 &&
+            clusterFamilies.length === 0 &&
+            !displayCoordinator && (
+              <div className="text-center py-8">
+                <svg
+                  className="mx-auto h-12 w-12 text-gray-400"
+                  fill="none"
+                  viewBox="0 0 24 24"
+                  stroke="currentColor"
+                  strokeWidth={2}
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"
+                  />
+                </svg>
+                <h3 className="mt-2 text-sm font-medium text-gray-900">
+                  No members or families
+                </h3>
+                <p className="mt-1 text-sm text-gray-500">
+                  This cluster doesn&rsquo;t have any members or families
+                  assigned yet.
+                </p>
+                {canManageCluster && (
+                  <div className="mt-4">
+                    <Button
+                      onClick={onAssignMembers}
+                      variant="secondary"
+                      className="!text-white py-2 px-4 text-sm font-normal bg-green-600 border border-green-600 hover:bg-green-700 hover:border-green-700 flex items-center justify-center space-x-2 mx-auto"
+                    >
+                      <svg
+                        className="w-4 h-4"
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={2}
+                          d="M12 6v6m0 0v6m0-6h6m-6 0H6"
+                        />
+                      </svg>
+                      <span>Assign Members</span>
+                    </Button>
+                  </div>
+                )}
+              </div>
+            )}
+        </div>
+      </div>
+
+      {/* Footer */}
+      <div
+        className={`flex flex-nowrap items-center gap-2 w-full overflow-x-auto border-t border-gray-200 ${
+          isPanelMode ? "bg-white p-3" : "bg-gray-50 p-3 md:p-4"
+        }`}
+      >
+        {canManageCluster ? (
+          <>
+            <div className="flex flex-nowrap items-center gap-2 shrink-0">
+              <Button
+                onClick={onDelete}
+                variant="secondary"
+                className="!text-gray-700 h-10 min-h-[44px] px-4 text-sm font-medium bg-white border border-gray-200 hover:bg-gray-50 hover:border-gray-300 flex items-center justify-center space-x-2 shrink-0"
+                aria-label="Mark cluster inactive"
+              >
+                <svg
+                  className="w-4 h-4"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={2}
+                    d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z"
+                  />
+                </svg>
+                <span>Mark Inactive</span>
+              </Button>
+              {onHardDelete && (
+                <DeleteClusterButton
+                  onClick={onHardDelete}
+                  buttonClassName="h-10 min-h-[44px] px-4 text-sm font-medium"
+                />
+              )}
+            </div>
+            <div className="flex flex-nowrap items-center gap-2 shrink-0 ml-auto">
+              <Button
+                onClick={onEdit}
+                variant="secondary"
+                className="!text-primary h-10 min-h-[44px] px-4 text-sm font-medium bg-white border border-primary/20 hover:bg-primary/10 hover:border-primary/30 flex items-center justify-center space-x-2 shrink-0"
+              >
+                <svg
+                  className="w-4 h-4"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={2}
+                    d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"
+                  />
+                </svg>
+                <span>Edit</span>
+              </Button>
+            </div>
+          </>
+        ) : null}
+      </div>
+
+      <ChangePersonStatusModal
+        person={statusPerson}
+        isOpen={Boolean(statusPerson)}
+        onClose={() => setStatusPerson(null)}
+        onSaved={(updated) => {
+          setStatusOverrides((prev) => ({
+            ...prev,
+            [String(updated.id)]: updated.status,
+          }));
+          setCareReloadToken((n) => n + 1);
+          onPersonStatusChanged?.(updated);
+        }}
+      />
+    </div>
+  );
+}

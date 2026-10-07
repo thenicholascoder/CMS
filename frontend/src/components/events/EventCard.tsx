@@ -1,0 +1,173 @@
+"use client";
+
+import { Event } from "@/src/types/event";
+import Card from "@/src/components/ui/Card";
+import Button from "../ui/Button";
+import { useEventTypeStyles } from "@/src/contexts/EventTypeStylesContext";
+import EventRecurringChip from "@/src/components/events/EventRecurringChip";
+import { formatRecurrenceSummary } from "@/src/lib/events/recurrenceLabel";
+
+interface EventCardProps {
+  event: Event;
+  occurrenceStartDate?: string;
+  occurrenceEndDate?: string;
+  onEdit?: () => void;
+  onView?: () => void;
+}
+
+export default function EventCard({
+  event,
+  occurrenceStartDate,
+  occurrenceEndDate,
+  onEdit,
+  onView,
+}: EventCardProps) {
+  const { getChipStyle } = useEventTypeStyles();
+  const nextStart =
+    occurrenceStartDate || event.next_occurrence?.start_date || event.start_date;
+  const nextEnd =
+    occurrenceEndDate || event.next_occurrence?.end_date || event.end_date;
+
+  return (
+    <Card>
+      <div className="space-y-4">
+        <div className="flex justify-between items-start">
+          <div className="flex-1">
+            <h3 className="text-lg font-semibold text-foreground">
+              {event.title}
+            </h3>
+            <span style={getChipStyle(event.type)}>
+              {event.type_display || event.type}
+            </span>
+            {event.is_recurring && (
+              <span className="ml-2 inline-flex align-middle">
+                <EventRecurringChip
+                  size="sm"
+                  pattern={event.recurrence_pattern}
+                />
+              </span>
+            )}
+          </div>
+        </div>
+
+        {event.description && (
+          <p className="text-sm text-gray-600 line-clamp-2">
+            {event.description}
+          </p>
+        )}
+
+        <div className="space-y-2">
+          <div className="flex items-start text-sm text-gray-600">
+            <svg
+              className="w-4 h-4 mt-0.5 mr-2 text-gray-400"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth={2}
+                d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"
+              />
+            </svg>
+            <div>
+              <div className="font-medium">
+                {new Date(nextStart).toLocaleDateString("en-US", {
+                  weekday: "short",
+                  month: "short",
+                  day: "numeric",
+                  hour: "numeric",
+                  minute: "2-digit",
+                })}
+              </div>
+              <div className="text-xs text-gray-500">
+                Ends
+                {" "}
+                {new Date(nextEnd).toLocaleTimeString("en-US", {
+                  hour: "numeric",
+                  minute: "2-digit",
+                })}
+              </div>
+              {event.is_recurring && event.recurrence_pattern && (
+                <div className="text-xs text-gray-500 mt-1">
+                  {formatRecurrenceSummary(event.recurrence_pattern)}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {event.location && (
+            <div className="flex items-start text-sm text-gray-600">
+              <svg
+                className="w-4 h-4 mt-0.5 mr-2 text-gray-400"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"
+                />
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"
+                />
+              </svg>
+              <span>{event.location}</span>
+            </div>
+          )}
+
+          {event.attendance_count !== undefined && event.attendance_count > 0 && (
+            <div className="flex items-center gap-4 text-xs text-gray-500">
+              <span className="flex items-center">
+                <svg
+                  className="w-4 h-4 mr-1"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={2}
+                    d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"
+                  />
+                </svg>
+                {event.attendance_count} attendee
+                {event.attendance_count !== 1 ? "s" : ""}
+              </span>
+            </div>
+          )}
+        </div>
+
+        {(onEdit || onView) && (
+          <div className="flex gap-2 pt-2 border-t">
+            {onEdit && (
+              <Button
+                variant="tertiary"
+                onClick={onEdit}
+                className="flex-1 text-xs min-h-[44px]"
+              >
+                Edit
+              </Button>
+            )}
+            {onView && (
+              <Button
+                variant="tertiary"
+                onClick={onView}
+                className="flex-1 text-xs min-h-[44px]"
+              >
+                View
+              </Button>
+            )}
+          </div>
+        )}
+      </div>
+    </Card>
+  );
+}

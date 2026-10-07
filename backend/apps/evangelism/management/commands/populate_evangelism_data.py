@@ -1,0 +1,759 @@
+"""
+Management command to populate the database with sample evangelism data
+Usage: python manage.py populate_evangelism_data
+"""
+
+from django.core.management.base import BaseCommand
+from django.utils import timezone
+from apps.evangelism.models import (
+    EvangelismGroup,
+    EvangelismSession,
+    Prospect,
+    Conversion,
+    MonthlyConversionTracking,
+    Each1Reach1Goal,
+    FollowUpTask,
+    DropOff,
+    EvangelismWeeklyReport,
+)
+from apps.evangelism.services import sync_conversion_pipeline
+from apps.lessons.models import Lesson, LessonSessionReport
+from apps.people.models import Person, ModuleCoordinator
+from apps.clusters.models import Cluster
+from datetime import datetime, timedelta, date
+import random
+
+
+class Command(BaseCommand):
+    help = (
+        "Populates the database with sample evangelism data for testing. "
+        "Run populate_sample_data and populate_clusters_data first so people and clusters exist."
+    )
+
+    def add_arguments(self, parser):
+        parser.add_argument(
+            "--groups",
+            type=int,
+            default=8,
+            help="Number of evangelism groups to create (default: 8)",
+        )
+        parser.add_argument(
+            "--prospects",
+            type=int,
+            default=30,
+            help="Number of prospects to create (default: 30)",
+        )
+        parser.add_argument(
+            "--sessions",
+            type=int,
+            default=20,
+            help="Number of sessions per group (default: 20)",
+        )
+        parser.add_argument(
+            "--clear",
+            action="store_true",
+            help="Clear existing evangelism data before populating",
+        )
+
+    def handle(self, *args, **options):
+        num_groups = options["groups"]
+        num_prospects = options["prospects"]
+        num_sessions = options["sessions"]
+        clear_existing = options["clear"]
+
+        if clear_existing:
+            self.stdout.write("Clearing existing evangelism data...")
+            visitor_ids = list(
+                Prospect.objects.exclude(person_id__isnull=True).values_list(
+                    "person_id", flat=True
+                )
+            )
+            DropOff.objects.all().delete()
+            FollowUpTask.objects.all().delete()
+            MonthlyConversionTracking.objects.all().delete()
+            Conversion.objects.all().delete()
+            Prospect.objects.all().delete()
+            EvangelismWeeklyReport.objects.all().delete()
+            EvangelismSession.objects.all().delete()
+            Each1Reach1Goal.objects.all().delete()
+            EvangelismGroup.objects.all().delete()
+            if visitor_ids:
+                LessonSessionReport.objects.filter(student_id__in=visitor_ids).delete()
+                Person.objects.filter(id__in=visitor_ids, role="VISITOR").delete()
+
+        # Check if we have people and clusters (exclude ADMIN users)
+        people = list(Person.objects.exclude(role="ADMIN"))
+        clusters = list(Cluster.objects.all())
+
+        if not people:
+            self.stdout.write(
+                self.style.ERROR(
+                    "No people found in database. Please run populate_sample_data first."
+                )
+            )
+            return
+
+        if not clusters:
+            self.stdout.write(
+                self.style.WARNING(
+                    "No clusters found. Some groups will be created without cluster affiliation."
+                )
+            )
+
+        # Group names
+        group_names = [
+            "North Bible Study",
+            "South Bible Study",
+            "East Bible Study",
+            "West Bible Study",
+            "Central Bible Study",
+            "Riverside Bible Study",
+            "Hillside Bible Study",
+            "Valley Bible Study",
+            "Bible Sharers Main",
+            "Bible Sharers Advanced",
+        ]
+
+        # Create Evangelism Groups
+        groups = []
+        bible_sharers_groups = []
+        for i in range(num_groups):
+            group_name = group_names[i % len(group_names)]
+            is_bible_sharers = "Bible Sharers" in group_name
+
+            # Select a random coordinator
+            coordinators = [p for p in people if p.role in ["MEMBER", "PASTOR"]]
+            if not coordinators:
+                coordinators = people
+            coordinator = random.choice(coordinators) if coordinators else None
+
+            # Select a random cluster (or None)
+            cluster = random.choice(clusters) if clusters and random.random() > 0.3 else None
+
+            group_branch = None
+            if cluster is not None:
+                group_branch = cluster.branch
+            elif coordinator is not None:
+                group_branch = coordinator.branch
+
+            group = EvangelismGroup(
+                name=group_name,
+                description=f"{group_name} focuses on evangelism and discipleship",
+                coordinator=coordinator,
+                cluster=cluster,
+                branch=group_branch,
+                location=f"{group_name} Location" if cluster else f"Community Center {i+1}",
+                meeting_time=datetime.strptime(
+                    f"{random.randint(6, 8)}:00 PM", "%I:00 %p"
+                ).time(),
+                meeting_day=random.choice(
+                    ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"]
+                ),
+                is_active=random.random() > 0.1,  # 90% active
+                is_bible_sharers_group=is_bible_sharers,
+            )
+            group.save()
+            
+            # Create ModuleCoordinator assignment for evangelism group coordinator
+            if coordinator:
+                ModuleCoordinator.objects.get_or_create(
+                    person=coordinator,
+                    module=ModuleCoordinator.ModuleType.EVANGELISM,
+                    resource_id=group.id,
+                    defaults={
+                        "level": ModuleCoordinator.CoordinatorLevel.COORDINATOR,
+                        "resource_type": "EvangelismGroup",
+                    }
+                )
+
+            # Add 3-8 members (prefer MEMBER role so weekly reports can record attendance)
+            available_people = [p for p in people if p != coordinator]
+            preferred = [p for p in available_people if p.role == "MEMBER"]
+            pool = preferred if len(preferred) >= 3 else available_people
+            cap = min(8, len(pool)) if pool else 0
+            if cap == 0:
+                members = []
+            else:
+                low = min(3, cap)
+                num_members = random.randint(low, cap)
+                members = random.sample(pool, num_members)
+
+            if members:
+                group.members.add(*members)
+            if coordinator:
+                group.members.add(coordinator)
+
+            if is_bible_sharers and members:
+                sharer = random.choice(members)
+                ModuleCoordinator.objects.update_or_create(
+                    person=sharer,
+                    module=ModuleCoordinator.ModuleType.EVANGELISM,
+                    resource_id=group.id,
+                    defaults={
+                        "level": ModuleCoordinator.CoordinatorLevel.BIBLE_SHARER,
+                        "resource_type": "EvangelismGroup",
+                    },
+                )
+            elif members and random.random() > 0.6:
+                reporter = random.choice(members)
+                ModuleCoordinator.objects.get_or_create(
+                    person=reporter,
+                    module=ModuleCoordinator.ModuleType.EVANGELISM,
+                    resource_id=group.id,
+                    defaults={
+                        "level": ModuleCoordinator.CoordinatorLevel.REPORTER,
+                        "resource_type": "EvangelismGroup",
+                    },
+                )
+
+            groups.append(group)
+            if is_bible_sharers:
+                bible_sharers_groups.append(group)
+
+        self.stdout.write(self.style.SUCCESS(f"✓ Created {len(groups)} evangelism groups"))
+        self.stdout.write(
+            self.style.SUCCESS(f"  • Bible Sharers groups: {len(bible_sharers_groups)}")
+        )
+
+        # Create Evangelism Sessions
+        today = date.today()
+        topics = [
+            "The Gospel Message",
+            "Salvation Through Faith",
+            "The Holy Spirit",
+            "Baptism",
+            "Discipleship",
+            "Prayer Life",
+            "Reading the Bible",
+            "Christian Living",
+            "Witnessing to Others",
+            "The Church",
+        ]
+
+        total_sessions = 0
+        for group in groups:
+            for i in range(num_sessions):
+                session_date = today - timedelta(days=random.randint(0, 180))
+                session_time = datetime.strptime(
+                    f"{random.randint(6, 8)}:00 PM", "%I:00 %p"
+                ).time()
+
+                session = EvangelismSession(
+                    evangelism_group=group,
+                    session_date=session_date,
+                    session_time=session_time,
+                    topic=random.choice(topics),
+                    notes=f"Session notes for {session_date.strftime('%B %d, %Y')}",
+                )
+                session.save()
+                total_sessions += 1
+
+        self.stdout.write(
+            self.style.SUCCESS(f"✓ Created {total_sessions} evangelism sessions")
+        )
+
+        sample_lessons = []
+        for lesson_order in range(1, 4):
+            lesson, _ = Lesson.objects.get_or_create(
+                code=f"sample-ncc-{lesson_order}",
+                version_label="v1",
+                defaults={
+                    "title": f"Sample NCC Lesson {lesson_order}",
+                    "order": lesson_order,
+                    "is_latest": True,
+                    "is_active": True,
+                },
+            )
+            sample_lessons.append(lesson)
+
+        pipeline_stages = [
+            Prospect.PipelineStage.INVITED,
+            Prospect.PipelineStage.ATTENDED,
+            Prospect.PipelineStage.TAKEN_NCC,
+            Prospect.PipelineStage.BAPTIZED,
+            Prospect.PipelineStage.RECEIVED_HG,
+            Prospect.PipelineStage.REACHED,
+        ]
+        stage_weights = [0.25, 0.25, 0.2, 0.12, 0.1, 0.08]
+
+        def stage_index(stage):
+            return pipeline_stages.index(stage)
+
+        def apply_person_milestones(person, prospect, target_stage):
+            first_invited = prospect.date_first_invited
+            person.date_first_invited = first_invited
+            person.status = "ONGOING"
+            fields = ["date_first_invited", "status"]
+
+            if stage_index(target_stage) >= stage_index(Prospect.PipelineStage.ATTENDED):
+                attended_date = first_invited + timedelta(
+                    days=random.randint(7, 30)
+                )
+                person.date_first_attended = attended_date
+                person.status = "ONGOING"
+                fields.extend(["date_first_attended", "status"])
+
+            if stage_index(target_stage) >= stage_index(
+                Prospect.PipelineStage.BAPTIZED
+            ):
+                baptized_date = (person.date_first_attended or first_invited) + timedelta(
+                    days=random.randint(14, 60)
+                )
+                person.water_baptism_date = baptized_date
+                fields.append("water_baptism_date")
+
+            if stage_index(target_stage) >= stage_index(
+                Prospect.PipelineStage.RECEIVED_HG
+            ):
+                spirit_date = (person.water_baptism_date or first_invited) + timedelta(
+                    days=random.randint(7, 45)
+                )
+                person.spirit_baptism_date = spirit_date
+                fields.append("spirit_baptism_date")
+
+            person.save(update_fields=fields)
+            prospect.last_activity_date = max(
+                filter(
+                    None,
+                    [
+                        person.date_first_invited,
+                        person.date_first_attended,
+                        person.water_baptism_date,
+                        person.spirit_baptism_date,
+                    ],
+                ),
+                default=first_invited,
+            )
+
+        def ensure_ncc_session(person, prospect, teacher):
+            if LessonSessionReport.objects.filter(student=person).exists():
+                return person.date_first_attended or prospect.date_first_invited
+            session_date = (person.date_first_attended or prospect.date_first_invited) + timedelta(
+                days=random.randint(3, 21)
+            )
+            LessonSessionReport.objects.create(
+                teacher=teacher,
+                student=person,
+                lesson=random.choice(sample_lessons),
+                session_date=session_date,
+                session_start=timezone.make_aware(
+                    datetime.combine(session_date, datetime.min.time())
+                ),
+            )
+            return session_date
+
+        # Create Prospects
+        prospect_names = [
+            "John Smith", "Mary Johnson", "David Brown", "Sarah Williams",
+            "Michael Davis", "Emily Miller", "James Wilson", "Jessica Moore",
+            "Robert Taylor", "Amanda Anderson", "William Thomas", "Michelle Jackson",
+            "Christopher White", "Ashley Harris", "Daniel Martin", "Stephanie Thompson",
+            "Matthew Garcia", "Nicole Martinez", "Anthony Robinson", "Lauren Clark",
+            "Mark Rodriguez", "Samantha Lewis", "Donald Walker", "Brittany Hall",
+            "Steven Young", "Rachel Allen", "Paul King", "Megan Wright",
+            "Andrew Lopez", "Kayla Hill",
+        ]
+
+        prospects = []
+        for i in range(num_prospects):
+            name = prospect_names[i % len(prospect_names)]
+            if i >= len(prospect_names):
+                name = f"Prospect {i+1}"
+                first_name, middle_name, last_name = "Prospect", "", str(i + 1)
+            else:
+                parts = name.split()
+                first_name = parts[0]
+                last_name = parts[-1] if len(parts) > 1 else ""
+                middle_name = " ".join(parts[1:-1]) if len(parts) > 2 else ""
+            if not (last_name or "").strip():
+                last_name = "Visitor"
+
+            # Select random inviter
+            inviter = random.choice(people)
+            group = random.choice(groups) if groups else None
+            # Cluster attribution is for cluster-report origin, not inviter membership.
+            inviter_cluster = None
+            if clusters and (group is None or random.random() < 0.2):
+                inviter_cluster = random.choice(clusters)
+
+            # Determine pipeline stage (weighted towards earlier stages)
+            stage = random.choices(pipeline_stages, weights=stage_weights)[0]
+
+            first_invited = today - timedelta(days=random.randint(7, 180))
+            last_activity = first_invited + timedelta(days=random.randint(0, 30))
+            at_or_past_ncc = stage_index(stage) >= stage_index(
+                Prospect.PipelineStage.TAKEN_NCC
+            )
+            at_or_past_baptized = stage_index(stage) >= stage_index(
+                Prospect.PipelineStage.BAPTIZED
+            )
+
+            prospect = Prospect(
+                first_name=first_name,
+                middle_name=middle_name,
+                last_name=last_name,
+                suffix="",
+                gender=random.choice(["MALE", "FEMALE"]),
+                contact_info=f"phone-{random.randint(1000000, 9999999)}" if random.random() > 0.2 else "",
+                facebook_name="",
+                invited_by=inviter,
+                inviter_cluster=inviter_cluster,
+                evangelism_group=group,
+                pipeline_stage=Prospect.PipelineStage.INVITED,
+                date_first_invited=first_invited,
+                last_activity_date=last_activity,
+                is_attending_cluster=stage != Prospect.PipelineStage.INVITED,
+                has_finished_lessons=at_or_past_baptized,
+                commitment_form_signed=at_or_past_baptized and random.random() > 0.3,
+                notes=f"Prospect notes for {name}",
+            )
+
+            if stage != Prospect.PipelineStage.INVITED:
+                uname = f"visitor_p{i}_{random.randint(10000, 99999)}"[:150]
+                person = Person.objects.create(
+                    username=uname,
+                    first_name=first_name,
+                    last_name=last_name,
+                    middle_name=middle_name,
+                    role="VISITOR",
+                    email=f"{uname}@example.com",
+                    must_change_password=True,
+                    first_login=True,
+                )
+                person.set_unusable_password()
+                if inviter:
+                    person.inviter = inviter
+                person.save()
+                prospect.person = person
+                apply_person_milestones(person, prospect, stage)
+
+                if at_or_past_ncc:
+                    ncc_date = ensure_ncc_session(person, prospect, inviter)
+                    prospect.last_activity_date = max(
+                        prospect.last_activity_date or first_invited,
+                        ncc_date,
+                    )
+
+            prospect.pipeline_stage = stage
+            prospect.save()
+            prospects.append(prospect)
+
+        self.stdout.write(self.style.SUCCESS(f"✓ Created {len(prospects)} prospects"))
+
+        # Create Conversions
+        converted_prospects = [
+            p
+            for p in prospects
+            if stage_index(p.pipeline_stage)
+            >= stage_index(Prospect.PipelineStage.BAPTIZED)
+            and p.person
+        ]
+
+        conversions = []
+        for prospect in converted_prospects[: min(10, len(converted_prospects))]:
+            person = prospect.person
+            conversion_date = (person.date_first_attended or prospect.date_first_invited) + timedelta(
+                days=random.randint(30, 120)
+            )
+            ncc_session = (
+                LessonSessionReport.objects.filter(student=person)
+                .order_by("session_date")
+                .first()
+            )
+            lesson_start_date = ncc_session.session_date if ncc_session else None
+
+            conversion = Conversion(
+                person=person,
+                prospect=prospect,
+                converted_by=prospect.invited_by,
+                evangelism_group=prospect.evangelism_group,
+                cluster=prospect.inviter_cluster,
+                conversion_date=conversion_date,
+                lesson_start_date=lesson_start_date,
+                water_baptism_date=person.water_baptism_date,
+                spirit_baptism_date=person.spirit_baptism_date,
+                notes=f"Conversion notes for {prospect.display_name}",
+            )
+            conversion.save()
+            sync_conversion_pipeline(
+                conversion,
+                date_first_invited=person.date_first_invited,
+                date_first_attended=person.date_first_attended,
+                lesson_start_date=lesson_start_date,
+            )
+            conversions.append(conversion)
+
+        self.stdout.write(self.style.SUCCESS(f"✓ Created {len(conversions)} conversions"))
+
+        # Create Monthly Conversion Tracking
+        current_year = today.year
+        for month in range(1, 13):
+            month_prospects = [
+                p for p in prospects
+                if p.inviter_cluster
+                and p.date_first_invited
+                and p.date_first_invited.year == current_year
+                and p.date_first_invited.month <= month
+            ]
+
+            for prospect in month_prospects[:min(20, len(month_prospects))]:
+                # Determine which stage to track for this month
+                first_contact_month = prospect.date_first_invited.month
+                if month < first_contact_month:
+                    continue
+
+                # Simple logic: progress through stages over months
+                months_since_contact = month - first_contact_month
+                if months_since_contact == 0:
+                    stage = MonthlyConversionTracking.Stage.INVITED
+                elif months_since_contact == 1:
+                    stage = MonthlyConversionTracking.Stage.ATTENDED
+                elif months_since_contact == 2:
+                    stage = MonthlyConversionTracking.Stage.TAKEN_NCC
+                elif months_since_contact >= 3:
+                    if stage_index(prospect.pipeline_stage) >= stage_index(
+                        Prospect.PipelineStage.BAPTIZED
+                    ):
+                        if stage_index(prospect.pipeline_stage) >= stage_index(
+                            Prospect.PipelineStage.REACHED
+                        ):
+                            stage = MonthlyConversionTracking.Stage.REACHED
+                        elif stage_index(prospect.pipeline_stage) >= stage_index(
+                            Prospect.PipelineStage.RECEIVED_HG
+                        ):
+                            stage = MonthlyConversionTracking.Stage.RECEIVED_HG
+                        else:
+                            stage = MonthlyConversionTracking.Stage.BAPTIZED
+                    else:
+                        stage = MonthlyConversionTracking.Stage.TAKEN_NCC
+                else:
+                    continue
+
+                MonthlyConversionTracking.objects.get_or_create(
+                    cluster=prospect.inviter_cluster,
+                    prospect=prospect,
+                    person=prospect.person,
+                    year=current_year,
+                    month=month,
+                    stage=stage,
+                    defaults={
+                        "count": 1,
+                        "first_date_in_stage": date(current_year, month, 1),
+                    },
+                )
+
+        self.stdout.write(
+            self.style.SUCCESS(
+                f"✓ Created monthly conversion tracking for {current_year}"
+            )
+        )
+
+        # Create Each 1 Reach 1 Goals
+        for cluster in clusters:
+            goal = Each1Reach1Goal.objects.get_or_create(
+                cluster=cluster,
+                year=current_year,
+                defaults={
+                    "target_conversions": random.randint(5, 15),
+                    "achieved_conversions": random.randint(0, 10),
+                    "status": random.choice([
+                        Each1Reach1Goal.Status.NOT_STARTED,
+                        Each1Reach1Goal.Status.IN_PROGRESS,
+                        Each1Reach1Goal.Status.COMPLETED,
+                    ]),
+                },
+            )[0]
+            # Update status based on progress
+            if goal.achieved_conversions >= goal.target_conversions:
+                goal.status = Each1Reach1Goal.Status.COMPLETED
+            elif goal.achieved_conversions > 0:
+                goal.status = Each1Reach1Goal.Status.IN_PROGRESS
+            goal.save()
+
+        self.stdout.write(
+            self.style.SUCCESS(
+                f"✓ Created Each 1 Reach 1 goals for {len(clusters)} clusters"
+            )
+        )
+
+        # Create Follow-up Tasks
+        active_prospects = [
+            p for p in prospects
+            if not p.is_dropped_off
+            and p.pipeline_stage in [
+                Prospect.PipelineStage.INVITED,
+                Prospect.PipelineStage.ATTENDED,
+            ]
+        ]
+
+        task_types = [
+            FollowUpTask.TaskType.PHONE_CALL,
+            FollowUpTask.TaskType.TEXT_MESSAGE,
+            FollowUpTask.TaskType.VISIT,
+            FollowUpTask.TaskType.EMAIL,
+            FollowUpTask.TaskType.PRAYER,
+        ]
+
+        for prospect in active_prospects[:min(15, len(active_prospects))]:
+            task = FollowUpTask(
+                prospect=prospect,
+                assigned_to=prospect.invited_by,
+                task_type=random.choice(task_types),
+                due_date=today + timedelta(days=random.randint(1, 14)),
+                status=random.choice([
+                    FollowUpTask.Status.PENDING,
+                    FollowUpTask.Status.IN_PROGRESS,
+                    FollowUpTask.Status.COMPLETED,
+                ]),
+                priority=random.choice([
+                    FollowUpTask.Priority.LOW,
+                    FollowUpTask.Priority.MEDIUM,
+                    FollowUpTask.Priority.HIGH,
+                ]),
+                notes=f"Follow-up task for {prospect.display_name}",
+                created_by=prospect.invited_by,
+            )
+            if task.status == FollowUpTask.Status.COMPLETED:
+                task.completed_date = today - timedelta(days=random.randint(1, 7))
+            task.save()
+
+        self.stdout.write(
+            self.style.SUCCESS(f"✓ Created follow-up tasks for prospects")
+        )
+
+        # Create Drop-offs
+        drop_off_prospects = prospects[:min(5, len(prospects))]
+        for prospect in drop_off_prospects:
+            if prospect.pipeline_stage == Prospect.PipelineStage.REACHED:
+                continue
+
+            last_touch = prospect.last_activity_date or prospect.date_first_invited or today
+            drop_off_date = last_touch + timedelta(days=35)
+            if drop_off_date > today:
+                continue
+
+            prospect.is_dropped_off = True
+            prospect.drop_off_date = drop_off_date
+            prospect.drop_off_stage = prospect.pipeline_stage
+            prospect.save()
+
+            drop_off = DropOff(
+                prospect=prospect,
+                drop_off_date=drop_off_date,
+                drop_off_stage=prospect.pipeline_stage,
+                days_inactive=35,
+                reason=random.choice([
+                    DropOff.DropOffReason.NO_CONTACT,
+                    DropOff.DropOffReason.NO_SHOW,
+                    DropOff.DropOffReason.LOST_INTEREST,
+                    DropOff.DropOffReason.OTHER,
+                ]),
+                reason_details=f"Drop-off reason for {prospect.display_name}",
+            )
+            drop_off.save()
+
+        self.stdout.write(self.style.SUCCESS(f"✓ Created drop-off records"))
+
+        # Create Weekly Reports
+        gathering_types = ["PHYSICAL", "ONLINE", "HYBRID"]
+        activities = [
+            "Bible Study",
+            "Prayer Meeting",
+            "Fellowship",
+            "Worship",
+            "Testimony Sharing",
+            "Evangelism Training",
+        ]
+
+        report_keys_seen = set()
+        for group in groups:
+            group_members = list(
+                group.members.filter(role="MEMBER").values_list("id", flat=True)
+            )
+            group_prospects = list(group.prospects.all())
+
+            submitter = group.coordinator
+            if not submitter and group_members:
+                submitter = Person.objects.filter(pk=random.choice(group_members)).first()
+            if not submitter and people:
+                submitter = random.choice(people)
+
+            for week_offset in range(12):
+                week_date = today - timedelta(weeks=week_offset)
+                year = week_date.year
+                week_number = week_date.isocalendar()[1]
+                key = (group.id, year, week_number)
+                if key in report_keys_seen:
+                    continue
+                report_keys_seen.add(key)
+
+                if group_members:
+                    n = len(group_members)
+                    k = random.randint(min(2, n), n) if n >= 2 else n
+                    members_attended_ids = random.sample(group_members, k)
+                else:
+                    members_attended_ids = []
+
+                visitors_attended_ids = []
+                if group_prospects:
+                    sample_n = min(random.randint(0, 3), len(group_prospects))
+                    if sample_n > 0:
+                        visitors_attended_ids = [
+                            p.person.id
+                            for p in random.sample(group_prospects, sample_n)
+                            if p.person
+                        ]
+
+                report, _ = EvangelismWeeklyReport.objects.get_or_create(
+                    evangelism_group=group,
+                    year=year,
+                    week_number=week_number,
+                    defaults={
+                        "meeting_date": week_date,
+                        "gathering_type": random.choice(gathering_types),
+                        "topic": random.choice(topics),
+                        "activities_held": random.choice(activities),
+                        "prayer_requests": random.choice([
+                            "Prayer for new prospects",
+                            "Prayer for conversions",
+                            "Prayer for group members",
+                            "",
+                        ]),
+                        "testimonies": random.choice([
+                            "New member shared conversion story",
+                            "Member shared answered prayer",
+                            "",
+                        ]),
+                        "new_prospects": random.randint(0, 3),
+                        "conversions_this_week": random.randint(0, 2),
+                        "notes": f"Weekly report for {week_date.strftime('%B %d, %Y')}",
+                        "submitted_by": submitter,
+                    },
+                )
+                report.members_attended.set(members_attended_ids)
+                report.visitors_attended.set(visitors_attended_ids)
+
+        self.stdout.write(
+            self.style.SUCCESS(f"✓ Created weekly reports for groups")
+        )
+
+        # Summary
+        self.stdout.write(self.style.SUCCESS("\n✓ Evangelism data population complete!"))
+        self.stdout.write(f"  • Groups: {EvangelismGroup.objects.count()}")
+        member_link_count = sum(g.members.count() for g in EvangelismGroup.objects.all())
+        self.stdout.write(f"  • Group member links (M2M total): {member_link_count}")
+        self.stdout.write(f"  • Sessions: {EvangelismSession.objects.count()}")
+        self.stdout.write(f"  • Prospects: {Prospect.objects.count()}")
+        self.stdout.write(f"  • Conversions: {Conversion.objects.count()}")
+        self.stdout.write(
+            f"  • NCC lesson sessions: {LessonSessionReport.objects.count()}"
+        )
+        self.stdout.write(f"  • Monthly Tracking: {MonthlyConversionTracking.objects.count()}")
+        self.stdout.write(f"  • Each 1 Reach 1 Goals: {Each1Reach1Goal.objects.count()}")
+        self.stdout.write(f"  • Follow-up Tasks: {FollowUpTask.objects.count()}")
+        self.stdout.write(f"  • Drop-offs: {DropOff.objects.count()}")
+        self.stdout.write(f"  • Weekly Reports: {EvangelismWeeklyReport.objects.count()}")
+        self.stdout.write(
+            f"  • Evangelism Module Coordinator Assignments: {ModuleCoordinator.objects.filter(module=ModuleCoordinator.ModuleType.EVANGELISM, resource_type='EvangelismGroup').count()}"
+        )
+

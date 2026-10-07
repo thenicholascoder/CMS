@@ -1,0 +1,513 @@
+import { Person } from "./person";
+import { Cluster } from "./cluster";
+
+export interface EvangelismGroup {
+  id: string;
+  name: string;
+  description?: string;
+  coordinator?: Person;
+  coordinator_id?: string;
+  cluster?: Cluster;
+  cluster_id?: string;
+  branch?: number | null;
+  branch_id?: number | null;
+  location?: string;
+  meeting_time?: string | null;
+  meeting_day?: string;
+  meeting_frequency?: "WEEKLY" | "BIWEEKLY" | "MONTHLY" | "IRREGULAR";
+  is_active: boolean;
+  approval_status?: "pending" | "approved" | "rejected";
+  created_by?: number | null;
+  reviewed_by?: number | null;
+  reviewed_at?: string | null;
+  review_note?: string;
+  is_bible_sharers_group?: boolean;
+  reporter_ids?: number[];
+  bible_sharer_ids?: number[];
+  created_at: string;
+  updated_at: string;
+  members?: Person[];
+  members_count?: number;
+  visitors_count?: number;
+  conversions_count?: number;
+  has_bible_sharers?: boolean;
+}
+
+export type EvangelismGroupWrite = Partial<
+  Omit<EvangelismGroup, "members" | "cluster_id" | "branch_id">
+> & {
+  members?: number[];
+  cluster_id?: number | string | null;
+  branch_id?: number | string | null;
+};
+
+export interface EvangelismSession {
+  id: string;
+  evangelism_group: EvangelismGroup;
+  evangelism_group_id: string;
+  event?: string;
+  event_id?: string;
+  session_date: string;
+  session_time?: string;
+  topic?: string;
+  notes?: string;
+  is_recurring_instance: boolean;
+  recurring_group_id?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface EvangelismWeeklyReport {
+  id: string;
+  evangelism_group: EvangelismGroup;
+  year: number;
+  week_number: number;
+  meeting_date: string;
+  members_attended: string[];
+  visitors_attended: string[];
+  members_attended_details?: Person[];
+  visitors_attended_details?: Person[];
+  prospects_invited?: number[];
+  prospects_invited_details?: EvangelismProspectInvitedDetail[];
+  gathering_type: "PHYSICAL" | "ONLINE" | "HYBRID";
+  topic?: string;
+  activities_held?: string;
+  prayer_requests?: string;
+  testimonies?: string;
+  new_prospects: number;
+  conversions_this_week: number;
+  notes?: string;
+  submitted_by?: Person;
+  submitted_at: string;
+  updated_at: string;
+}
+
+export interface EvangelismProspectInvitedDetail {
+  id: number;
+  first_name: string;
+  last_name: string;
+  middle_name?: string;
+  suffix?: string;
+  display_name?: string;
+  pipeline_stage?: string;
+  pipeline_stage_display?: string;
+  invited_by?: {
+    id: number | string;
+    first_name?: string;
+    last_name?: string;
+    username?: string;
+  } | null;
+  person_id?: number | null;
+}
+
+export interface EvangelismReportNewInvitedProspectInput {
+  first_name: string;
+  last_name: string;
+  invited_by_id: number | string;
+  middle_name?: string;
+  suffix?: string;
+  gender?: string;
+  contact_info?: string;
+  facebook_name?: string;
+  notes?: string;
+  date_first_invited?: string | null;
+}
+
+export interface EvangelismReportNewVisitorInput {
+  first_name: string;
+  last_name: string;
+  inviter_id?: number | string | null;
+  middle_name?: string;
+  suffix?: string;
+  gender?: string;
+  facebook_name?: string;
+  note?: string;
+  date_first_attended?: string | null;
+  first_activity_attended?: string | null;
+}
+
+export interface EvangelismTallyRow {
+  cluster_id?: number;
+  cluster_name?: string;
+  cluster_code?: string;
+  year: number;
+  week_number: number;
+  meeting_date?: string;
+  gathering_type: "PHYSICAL" | "ONLINE" | "HYBRID" | "MIXED" | "UNKNOWN";
+  members_count: number;
+  visitors_count: number;
+  evangelism_reports_count: number;
+  cluster_reports_count: number;
+  new_prospects: number;
+  conversions_this_week: number;
+}
+
+export interface EvangelismPeopleTallyRow {
+  month?: number | null;
+  year: number;
+  invited_count: number;
+  attended_count: number;
+  students_count: number;
+  baptized_count: number;
+  received_hg_count: number;
+  reached_count: number;
+  unique_hc_count: number;
+  cluster_id?: number | null;
+  cluster_name?: string | null;
+  cluster_code?: string | null;
+  row_kind?: "cluster" | "unassigned" | "total" | null;
+}
+
+export type EvangelismTallyDrilldownMetric =
+  | "invited"
+  | "attended"
+  | "students"
+  | "baptized"
+  | "received_hg"
+  | "reached"
+  | "unique_hc"
+  | "members"
+  | "visitors";
+
+export interface EvangelismTallyDrilldownRow {
+  entity_type: "person" | "prospect";
+  id: number;
+  display_name: string;
+  first_name?: string | null;
+  middle_name?: string | null;
+  last_name?: string | null;
+  suffix?: string | null;
+  nickname?: string | null;
+  username?: string | null;
+  member_id?: string | null;
+  role?: string | null;
+  status?: string | null;
+  pipeline_stage?: string | null;
+  person_id?: number | null;
+  event_date?: string | null;
+  date_first_invited?: string | null;
+  date_first_attended?: string | null;
+  lessons_finished_at?: string | null;
+  water_baptism_date?: string | null;
+  spirit_baptism_date?: string | null;
+  reached_date?: string | null;
+  metric: EvangelismTallyDrilldownMetric;
+}
+
+export type PipelineStage =
+  | "INVITED"
+  | "ATTENDED"
+  | "TAKEN_NCC"
+  | "BAPTIZED"
+  | "RECEIVED_HG"
+  | "REACHED";
+
+export interface Prospect {
+  id: string;
+  first_name: string;
+  middle_name?: string;
+  last_name: string;
+  suffix?: string;
+  gender?: "" | "MALE" | "FEMALE" | string;
+  display_name?: string;
+  contact_info?: string;
+  facebook_name?: string;
+  invited_by: Person;
+  invited_by_id: string;
+  inviter_cluster?: Cluster;
+  evangelism_group?: EvangelismGroup;
+  evangelism_group_id?: string;
+  endorsed_cluster?: Cluster;
+  endorsed_cluster_id?: string;
+  person?: Person;
+  person_id?: string;
+  pipeline_stage: PipelineStage;
+  pipeline_stage_display: string;
+  date_first_invited?: string;
+  date_first_attended?: string | null;
+  lessons_finished_at?: string | null;
+  water_baptism_date?: string | null;
+  spirit_baptism_date?: string | null;
+  reached_date?: string | null;
+  last_activity_date?: string;
+  is_attending_cluster: boolean;
+  is_dropped_off: boolean;
+  drop_off_date?: string;
+  drop_off_stage?: PipelineStage;
+  drop_off_reason?: string;
+  has_finished_lessons: boolean;
+  commitment_form_signed: boolean;
+  notes?: string;
+  days_since_last_activity?: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export type TaskType =
+  | "PHONE_CALL"
+  | "TEXT_MESSAGE"
+  | "VISIT"
+  | "EMAIL"
+  | "PRAYER"
+  | "OTHER";
+export type TaskStatus = "PENDING" | "IN_PROGRESS" | "COMPLETED" | "CANCELLED";
+export type TaskPriority = "LOW" | "MEDIUM" | "HIGH" | "URGENT";
+
+export interface FollowUpTask {
+  id: string;
+  prospect: Prospect;
+  prospect_id: string;
+  assigned_to: Person;
+  assigned_to_id: string;
+  task_type: TaskType;
+  task_type_display: string;
+  due_date: string;
+  completed_date?: string;
+  status: TaskStatus;
+  status_display: string;
+  notes?: string;
+  priority: TaskPriority;
+  priority_display: string;
+  created_by?: Person;
+  created_by_id?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export type DropOffReason =
+  | "NO_CONTACT"
+  | "NO_SHOW"
+  | "LOST_INTEREST"
+  | "MOVED"
+  | "OTHER";
+
+export interface DropOff {
+  id: string;
+  prospect: Prospect;
+  drop_off_date: string;
+  drop_off_stage: PipelineStage;
+  drop_off_stage_display: string;
+  days_inactive: number;
+  reason?: DropOffReason;
+  reason_display?: string;
+  reason_details?: string;
+  recovery_attempted: boolean;
+  recovery_date?: string;
+  recovered: boolean;
+  recovered_date?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface Conversion {
+  id: string;
+  person: Person;
+  person_id: string;
+  prospect?: Prospect;
+  prospect_id?: string;
+  converted_by: Person;
+  converted_by_id: string;
+  evangelism_group?: EvangelismGroup;
+  evangelism_group_id?: string;
+  cluster?: Cluster;
+  cluster_id?: string;
+  conversion_date: string;
+  lesson_start_date?: string;
+  water_baptism_date?: string;
+  spirit_baptism_date?: string;
+  is_complete: boolean;
+  notes?: string;
+  verified_by?: Person;
+  verified_by_id?: string;
+  baptized_by?: Person | null;
+  baptized_by_id?: string;
+  baptized_by_first_name?: string;
+  baptized_by_last_name?: string;
+  baptized_by_display_name?: string | null;
+  hg_witnessed_by?: Person | null;
+  hg_witnessed_by_id?: string;
+  hg_witnessed_by_first_name?: string;
+  hg_witnessed_by_last_name?: string;
+  hg_witnessed_by_display_name?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** POST/PATCH body for conversions (write-only milestone fields + nullable clears). */
+export type ConversionWritePayload = {
+  person_id?: string;
+  prospect_id?: string | null;
+  evangelism_group_id?: string | null;
+  cluster_id?: string | null;
+  converted_by_id?: string | null;
+  conversion_date?: string | null;
+  date_first_invited?: string | null;
+  date_first_attended?: string | null;
+  lesson_start_date?: string | null;
+  water_baptism_date?: string | null;
+  spirit_baptism_date?: string | null;
+  baptized_by_id?: string | null;
+  baptized_by_first_name?: string | null;
+  baptized_by_last_name?: string | null;
+  hg_witnessed_by_id?: string | null;
+  hg_witnessed_by_first_name?: string | null;
+  hg_witnessed_by_last_name?: string | null;
+  notes?: string;
+};
+
+export type MonthlyTrackingStage =
+  | "INVITED"
+  | "ATTENDED"
+  | "TAKEN_NCC"
+  | "BAPTIZED"
+  | "RECEIVED_HG"
+  | "REACHED";
+
+export interface MonthlyConversionTracking {
+  id: string;
+  cluster: Cluster;
+  prospect: Prospect;
+  person?: Person;
+  year: number;
+  month: number;
+  stage: MonthlyTrackingStage;
+  stage_display: string;
+  count: number;
+  first_date_in_stage: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface MonthlyStatistics {
+  year: number;
+  month: number;
+  cluster_id: number;
+  cluster_name: string;
+  invited_count: number;
+  attended_count: number;
+  taken_ncc_count: number;
+  baptized_count: number;
+  received_hg_count: number;
+  converted_count: number;
+}
+
+export type GoalStatus = "IN_PROGRESS" | "COMPLETED" | "NOT_STARTED";
+
+export interface Each1Reach1Goal {
+  id: string;
+  cluster: Cluster;
+  cluster_id: string;
+  year: number;
+  target_conversions: number;
+  achieved_conversions: number;
+  status: GoalStatus;
+  progress_percentage: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface EvangelismSummary {
+  total_groups: number;
+  active_groups: number;
+  total_visitors: number;
+  total_reached: number;
+  completed_conversions: number;
+  year: number;
+  each1reach1_target?: number;
+  each1reach1_achieved?: number;
+  monthly_statistics?: MonthlyStatistics[];
+}
+
+export interface RecurringSessionData {
+  evangelism_group_id: number;
+  start_date: string;
+  end_date?: string;
+  num_occurrences?: number;
+  recurrence_pattern: "weekly" | "bi_weekly" | "monthly";
+  day_of_week?: number;
+  default_topic?: string;
+}
+
+export interface BulkEnrollData {
+  person_ids: number[];
+}
+
+export interface EvangelismGroupFormValues {
+  name: string;
+  description: string;
+  coordinator_id?: string;
+  cluster_id?: string;
+  branch_id?: string;
+  location: string;
+  meeting_time: string;
+  meeting_day: string;
+  meeting_frequency: "WEEKLY" | "BIWEEKLY" | "MONTHLY" | "IRREGULAR";
+  is_active: boolean;
+  /** Person IDs enrolled on create/update (optional) */
+  initial_member_ids?: string[];
+  reporter_ids?: string[];
+  bible_sharer_ids?: string[];
+}
+
+export interface BibleSharersGroupInfo {
+  id: string | number;
+  name: string;
+  coordinator: string | null;
+  bible_sharers_count?: number;
+  members_count?: number;
+}
+
+export interface BibleSharerCoveragePerson {
+  id: number;
+  name: string;
+  groups: string[];
+}
+
+export interface BibleSharersClusterSummary {
+  id: number | null;
+  name: string | null;
+  code: string | null;
+  branch: number | null;
+}
+
+export interface BibleSharersCoverageItem {
+  cluster: BibleSharersClusterSummary;
+  has_bible_sharers: boolean;
+  bible_sharers?: BibleSharerCoveragePerson[];
+  bible_sharers_groups: BibleSharersGroupInfo[];
+  bible_sharers_count: number;
+}
+
+export interface BibleSharerDirectoryGroup {
+  id: number;
+  name: string;
+  cluster: BibleSharersClusterSummary | null;
+}
+
+export interface BibleSharerDirectoryPerson {
+  id: number;
+  name: string;
+  on_hq_roster: boolean;
+  roster_active: boolean | null;
+  has_module_wide_grant: boolean;
+  assigned: boolean;
+  groups: BibleSharerDirectoryGroup[];
+  group_count: number;
+}
+
+export interface BibleSharersCoverage {
+  people?: BibleSharerDirectoryPerson[];
+  coverage: BibleSharersCoverageItem[];
+  summary: {
+    total_bible_sharers?: number;
+    assigned_count?: number;
+    unassigned_count?: number;
+    total_clusters: number;
+    clusters_with_bible_sharers: number;
+    clusters_without_bible_sharers: number;
+    clusters_without_names: string[];
+    total_bible_sharers_groups: number;
+    bible_sharers_ministry_id?: number | null;
+    can_manage_roster?: boolean;
+  };
+}

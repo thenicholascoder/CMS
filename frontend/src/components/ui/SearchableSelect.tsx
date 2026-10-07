@@ -1,0 +1,328 @@
+"use client";
+
+import { useState, useRef, useEffect, useMemo } from "react";
+import { createPortal } from "react-dom";
+import { formatPersonName, personNameSearchText } from "@/src/lib/name";
+import { getPersonRoleColor } from "@/src/lib/personRole";
+import {
+  formatPersonClusterLabel,
+  formatPersonStatusLabel,
+  getPersonClusterChipClass,
+  getPersonStatusColor,
+} from "@/src/lib/personStatus";
+
+export type SearchableOption = {
+  id?: string | number;
+  first_name?: string;
+  middle_name?: string;
+  last_name?: string;
+  suffix?: string;
+  username: string;
+  [key: string]: unknown;
+};
+
+interface SearchableSelectProps {
+  value: string;
+  onChange: (value: string) => void;
+  options: SearchableOption[];
+  className?: string;
+  controlClassName?: string;
+  placeholder?: string;
+  label?: string;
+  emptyMessage?: string;
+  showEmptyOption?: boolean;
+  emptyOptionLabel?: string;
+  disabled?: boolean;
+  showStatus?: boolean;
+  showClusterCodes?: boolean;
+}
+
+export default function SearchableSelect({
+  value,
+  onChange,
+  options,
+  className = "",
+  controlClassName = "",
+  placeholder = "Search...",
+  label,
+  emptyMessage = "No results found",
+  showEmptyOption = true,
+  emptyOptionLabel = "All",
+  disabled = false,
+  showStatus = true,
+  showClusterCodes = true,
+}: SearchableSelectProps) {
+  const [isOpen, setIsOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [dropdownPosition, setDropdownPosition] = useState({
+    top: 0,
+    left: 0,
+    width: 0,
+  });
+  const containerRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLDivElement>(null);
+  const dropdownRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const updateDropdownPosition = () => {
+    if (triggerRef.current) {
+      const rect = triggerRef.current.getBoundingClientRect();
+      setDropdownPosition({
+        top: rect.bottom + 4,
+        left: rect.left,
+        width: rect.width,
+      });
+    }
+  };
+
+  const selectedOption = useMemo(() => {
+    if (!value) return null;
+    return options.find((opt) => opt.id !== undefined && String(opt.id) === value);
+  }, [options, value]);
+
+  const filteredOptions = useMemo(() => {
+    // Filter out options without IDs
+    const validOptions = options.filter((opt) => opt.id !== undefined);
+    
+    if (!searchQuery.trim()) {
+      return validOptions;
+    }
+    const query = searchQuery.toLowerCase();
+    return validOptions.filter((option) => {
+      const haystack = personNameSearchText(option);
+      return haystack.includes(query);
+    });
+  }, [options, searchQuery]);
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      const target = event.target as Node;
+      if (
+        containerRef.current &&
+        !containerRef.current.contains(target) &&
+        dropdownRef.current &&
+        !dropdownRef.current.contains(target)
+      ) {
+        setIsOpen(false);
+        setSearchQuery("");
+      }
+    };
+
+    if (isOpen) {
+      updateDropdownPosition();
+      document.addEventListener("mousedown", handleClickOutside);
+      window.addEventListener("scroll", updateDropdownPosition, true);
+      window.addEventListener("resize", updateDropdownPosition);
+      setTimeout(() => {
+        inputRef.current?.focus();
+      }, 0);
+    }
+
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+      window.removeEventListener("scroll", updateDropdownPosition, true);
+      window.removeEventListener("resize", updateDropdownPosition);
+    };
+  }, [isOpen]);
+
+  const handleSelect = (optionId: string | number | undefined) => {
+    if (disabled || optionId === undefined) return;
+    onChange(String(optionId));
+    setIsOpen(false);
+    setSearchQuery("");
+  };
+
+  const handleClear = () => {
+    if (disabled) return;
+    onChange("");
+    setIsOpen(false);
+    setSearchQuery("");
+  };
+
+  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (disabled) return;
+    setSearchQuery(e.target.value);
+    if (!isOpen) {
+      setIsOpen(true);
+    }
+  };
+
+  const handleInputFocus = () => {
+    if (!disabled) {
+      setIsOpen(true);
+    }
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (disabled) return;
+    if (e.key === "Escape") {
+      setIsOpen(false);
+      setSearchQuery("");
+    } else if (e.key === "Enter" && filteredOptions.length === 1) {
+      handleSelect(filteredOptions[0].id);
+    }
+  };
+
+  // Close dropdown if disabled while open
+  useEffect(() => {
+    if (disabled && isOpen) {
+      setIsOpen(false);
+      setSearchQuery("");
+    }
+  }, [disabled, isOpen]);
+
+  return (
+    <div className={`space-y-1 ${className}`} ref={containerRef}>
+      {label && (
+        <label className="block text-xs font-semibold uppercase tracking-wide text-gray-600">
+          {label}
+        </label>
+      )}
+      <div className="relative">
+        <div
+          ref={triggerRef}
+          className={`w-full rounded-md border border-gray-300 px-3 py-2 text-sm bg-white ${controlClassName} ${
+            disabled
+              ? "bg-gray-50 cursor-not-allowed opacity-60"
+              : "focus-within:border-primary focus-within:outline-none focus-within:ring-1 focus-within:ring-ring cursor-pointer"
+          }`}
+          onClick={() => {
+            if (!disabled && !isOpen) {
+              setIsOpen(true);
+              inputRef.current?.focus();
+            }
+          }}
+        >
+          {!isOpen && selectedOption ? (
+            <div className="flex items-center justify-between">
+              <span className={disabled ? "text-gray-500" : "text-gray-900"}>
+                {formatPersonName(selectedOption)}
+              </span>
+              {!disabled && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleClear();
+                  }}
+                  className="text-gray-400 hover:text-gray-600 ml-2"
+                  aria-label="Clear selection"
+                >
+                  ×
+                </button>
+              )}
+            </div>
+          ) : !isOpen && !selectedOption ? (
+            <span className="text-gray-500">{placeholder}</span>
+          ) : (
+            <input
+              ref={inputRef}
+              type="text"
+              value={searchQuery}
+              onChange={handleInputChange}
+              onFocus={handleInputFocus}
+              onKeyDown={handleKeyDown}
+              placeholder={placeholder}
+              disabled={disabled}
+              className="w-full outline-none bg-transparent text-gray-900 disabled:cursor-not-allowed disabled:text-gray-500"
+            />
+          )}
+        </div>
+
+        {isOpen &&
+          !disabled &&
+          createPortal(
+            <div
+              ref={dropdownRef}
+              className="fixed z-[80] bg-white border border-gray-300 rounded-md shadow-lg max-h-60 overflow-y-auto"
+              style={{
+                top: `${dropdownPosition.top}px`,
+                left: `${dropdownPosition.left}px`,
+                width: `${dropdownPosition.width}px`,
+              }}
+            >
+              {showEmptyOption && (
+                <button
+                  type="button"
+                  onClick={handleClear}
+                  className={`w-full px-3 py-2 text-left text-sm hover:bg-gray-50 ${
+                    !value ? "bg-primary/10 text-primary" : "text-gray-900"
+                  }`}
+                >
+                  {emptyOptionLabel}
+                </button>
+              )}
+              {filteredOptions.length === 0 ? (
+                <div className="px-3 py-2 text-gray-500 text-sm">
+                  {emptyMessage}
+                </div>
+              ) : (
+                filteredOptions.map((option) => {
+                  const optionId = option.id;
+                  if (optionId === undefined) return null;
+                  const isSelected = String(optionId) === value;
+                  const role =
+                    typeof option.role === "string" ? option.role : "";
+                  const status =
+                    showStatus && typeof option.status === "string"
+                      ? option.status
+                      : "";
+                  const clusterCodes =
+                    showClusterCodes && Array.isArray(option.cluster_codes)
+                      ? (option.cluster_codes as string[])
+                      : null;
+                  return (
+                    <button
+                      key={optionId}
+                      type="button"
+                      onClick={() => handleSelect(optionId)}
+                      className={`w-full px-3 py-2 text-left text-sm hover:bg-gray-50 ${
+                        isSelected
+                          ? "bg-primary/10 text-primary font-medium"
+                          : "text-gray-900"
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="min-w-0 truncate">
+                          {formatPersonName(option)}
+                        </span>
+                        {(role || status || clusterCodes) && (
+                          <span className="flex shrink-0 flex-wrap gap-1">
+                            {role ? (
+                              <span
+                                className={`inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium ${getPersonRoleColor(role)}`}
+                              >
+                                {role}
+                              </span>
+                            ) : null}
+                            {status ? (
+                              <span
+                                className={`inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium ${getPersonStatusColor(status)}`}
+                              >
+                                {formatPersonStatusLabel(status)}
+                              </span>
+                            ) : null}
+                            {clusterCodes ? (
+                              <span
+                                className={getPersonClusterChipClass(
+                                  clusterCodes.filter(Boolean).length > 0,
+                                )}
+                              >
+                                {formatPersonClusterLabel(clusterCodes)}
+                              </span>
+                            ) : null}
+                          </span>
+                        )}
+                      </div>
+                    </button>
+                  );
+                })
+              )}
+            </div>,
+            document.body,
+          )}
+      </div>
+    </div>
+  );
+}
+

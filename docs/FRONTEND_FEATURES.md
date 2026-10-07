@@ -1,0 +1,86 @@
+## Frontend Feature Map
+
+### Pages (App Router)
+
+- `src/app/page.tsx`: Landing/dashboard entry
+- `src/app/dashboard/page.tsx`: Dashboard widgets (overview)
+- `src/app/people/page.tsx`: People & Families management
+  - Tabs: People | Families
+  - People: search, filter (role, date range), table listing via `PeopleTable`
+  - Create person via `PersonForm` (uses `usePeople` hook → backend)
+  - Person form fields include optional `maiden_name`; visitor status options are Ongoing / No Response / Deceased (member statuses unchanged). A filled water baptism date promotes Visitor → Member and hides Visitor from the role dropdown. Member requires water baptism: the Member role option is hidden when the baptism date is empty, and create defaults to Visitor.
+  - **Families tab:** `FamilyManagementDashboard` with stacked mobile toolbar (search, branch, Table/Cards, Sort, Filter), filter chips in toolbar card, responsive unassigned-members grid
+- `src/app/evangelism/page.tsx`: Evangelism hub — Groups, Prospects (senior coordinators+), Each 1 Reach 1, Tally, Reports, Bible Sharers
+- `src/app/clusters/page.tsx`: Clusters hub via `ClustersPageView` — tabs **Clusters | Tally | Care | Reports | Compliance**. Same stacked list toolbar on the Clusters tab (search, branch, Table/Cards, Select, Bulk, Sort, Filter). **Tally** (`ClusterStatusTallyReport`) is a current-month snapshot of member statuses by cluster (branch from the Clusters page; click a count for the producing transition). Cluster detail includes a Prospects section (invited visitors for that cluster).
+- `src/app/finance/page.tsx`: Finance hub for donations, offerings, and pledges
+- `src/app/members/page.tsx`: Members listing placeholder
+
+### Hooks & Components (referenced)
+
+- `hooks/usePeople`: Fetch, create, update, delete people via `/api/people/`
+- Forms: `components/people/PersonForm`, `components/families/FamilyForm`
+- Tables/Cards: `components/people/PeopleTable`, `components/families/FamilyCard`
+- Layout/UI: `components/layout/DashboardLayout`, `components/ui/*`, `SearchBar`, `FilterOptions`
+- **List toolbars** (Families, Clusters, Evangelism Groups, Each 1 Reach 1): shared `ToolbarSearch`, `ViewModeToggle`, and classes in `lib/toolbarStyles.ts`. Mobile layout stacks rows — full-width search, branch + Table/Cards, then wrapping action buttons (Select, Sort, Filter, etc.) and filter chips; toolbar card uses `p-4 md:p-6`. On viewports below `md`, Table list mode falls back to cards (`lib/listViewMode.ts`).
+
+### Styling & Libraries
+
+- Tailwind CSS, Radix UI, Heroicons, React Hook Form, Zod
+- Charts/tables libraries are available (Recharts, FullCalendar) for future pages
+
+### Navbar notifications
+
+- `components/layout/NotificationBell.tsx`: Bell dropdown in the top navbar (alerts + recent activity)
+- `hooks/useNotifications.ts`: Fetches `/api/notifications/`, polls every 60s, dismiss / dismiss-all
+- Hidden for `VISITOR` role; badge count reflects **alerts** only
+- See [NOTIFICATIONS.md](./NOTIFICATIONS.md) for types, deep links, and coordinator report reminders
+
+### Navbar quick actions (+ menu)
+
+- `components/layout/NavbarQuickActions.tsx`: Circular **+** button before the notification bell; dropdown of role- and module-gated shortcuts
+- `lib/quickActionsConfig.ts`: Shared action definitions and `getAvailableQuickActions()` (also used by dashboard `QuickActions` card)
+- `hooks/useModuleSettings.ts`: Loads module on/off flags for gating (EVANGELISM, CLUSTER, etc.)
+- Hidden for `VISITOR`; hidden entirely when no actions apply to the user
+- Actions navigate via `?action=` query params on target pages (same pattern as dashboard quick actions)
+
+| Action | Deep link |
+|--------|-----------|
+| Add Person / Add Visitor | `/people?action=create` or `add-visitor` |
+| Create Event | `/events?action=create` |
+| Submit Cluster Report | `/clusters?action=submit-report` |
+| Submit Evangelism Report | `/evangelism?action=submit-report` |
+| Log Lesson Session | `/lessons?action=log-session` |
+
+Record Donation is intentionally not included (finance `?action=add-donation` can be wired later).
+
+### Evangelism page (`/evangelism`)
+
+- Main hub: `src/app/evangelism/page.tsx` with tabs **Groups | Each 1 Reach 1 | Tally | Reports | Bible Sharers**.
+- **Groups tab** (shared list toolbar pattern):
+  - Row 1: full-width search; row 2: branch + Table/Cards; row 3: Select, Bulk Actions, Sort, Filter; row 4: filter chips
+  - Table: `EvangelismGroupTable`; cards: `EvangelismGroupCard` (Table coerced to cards below `md`)
+  - Client-side filter/sort via `evangelismGroupListUtils.ts`; server-side search/branch via `useEvangelismGroups`
+  - Bulk actions: export (Excel/PDF/CSV), mark inactive, delete — all destructive/inactive flows use `ConfirmationModal`
+  - Default group list shows active groups only (`is_active: true`)
+- **Each 1 Reach 1:** `Each1Reach1Dashboard` uses the same toolbar pattern as Groups (search, branch, Table/Cards, year/status filters, Create Goal); defaults to cards; Table coerced to cards below `md`
+- **Add Visitor (`ProspectForm`)** and **weekly report modals** stack Cancel/Submit full-width on mobile (`flex-col-reverse sm:flex-row`, 44px touch targets)
+- **Tally / Reports:** people tally (`PeopleTallyReport`: default **By cluster** with All / YTD / quarter / custom months; **By month** year grid; Invited, Attended, NCC, Baptized, Received HG, Reached, Unique HC) and weekly unified tally; Unique HC drilldown highlights milestone chips in the selected months; gathering type badges use filled tonal styling in evangelism components. Same tally surface on Analytics **E1R1**.
+- **Bible Sharers:** `BibleSharersCoverage` — people directory (search, branch, status, Table/Cards) then cluster coverage. Idle HQ roster members and grant-only people appear for HQ/all; satellite branch shows facilitators on that branch’s groups. Click a name, group, or cluster to open People / Groups / Clusters. Roster editing stays in Ministries.
+- Deep link `?action=submit-report` opens weekly report submission flow
+- See [EVANGELISM_MODULE.md](./EVANGELISM_MODULE.md) for API, models, and full component map
+
+### Lessons page (`/lessons`)
+
+- Container/view split: `LessonsPageContainer` (data, branch filter, API) + `LessonsPageView` (layout).
+- **Tabs:** Lesson Content (catalog) | Student Progress | Teachers | Session Reports | Files — full-width segmented control on mobile; branch filter stacks below (`LessonContentTabs` + `TOOLBAR_BRANCH_SELECT_*`). Progress and Session Reports are hidden for users without Lessons write access (plain Members see Content and Files only). **Teachers** is coordinator-only (Admin/Pastor/Lessons coordinators/NCC primary+support); Lessons teachers do not see it.
+- **Branch filter** (below tab row on mobile): scopes progress, enrollments, session reports, and summary stats; defaults to the user's branch; HQ Lessons seniors (including HQ NCC primary) can switch branches. Lesson catalog and commitment PDF stay global. See [LESSONS_MODULE.md](./LESSONS_MODULE.md#branch-scoping).
+- **Student Progress:** students grouped under collapsible teacher headers (total assigned / in progress / completed / not started). Shared toolbar (`ToolbarSearch`, `ViewModeToggle`, `toolbarStyles`); cards on mobile by default; table coerced to cards below `md` via `listViewMode.ts`. Status filter/badge **Not started** is the person-level `ASSIGNED` bucket.
+- **Teachers:** sortable assigned / in progress / completed / not started chips; idle NCC roster teachers show as 0; click a teacher to open Student Progress with that group expanded.
+- **Session Reports:** Table/Cards toggle; table coerced to cards below `md` when selected on a narrow viewport. Lessons teachers are locked to themselves in the teacher filter and only see their assigned students.
+- **Assign Lessons:** full-screen modal on mobile; dropdown popover on desktop (`AssignLessonsDropdown`).
+- Deep link `?action=log-session` opens Session Reports and the log-session modal.
+
+### Notes
+
+- Families page uses local state; wiring to backend families endpoints can be added later.
+- People list filters out the `admin` user and entries without a name on the frontend only (API remains unchanged).

@@ -1,0 +1,319 @@
+"use client";
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import { Person } from "@/src/types/person";
+import { Branch } from "@/src/types/branch";
+import {
+  PEOPLE_EXPORT_FIELDS,
+  type PeopleExportFormat,
+} from "@/src/lib/peopleImport";
+import {
+  PEOPLE_BRANCH_LOCKED_HINT,
+  personMatchesExportBranch,
+} from "@/src/lib/peopleBranchFilter";
+import ScalableSelect from "@/src/components/ui/ScalableSelect";
+import { LockedControlTooltip } from "@/src/components/ui/LockedControlTooltip";
+
+export { PEOPLE_EXPORT_FIELDS };
+export type { PeopleExportFormat };
+
+const FORMAT_BUTTONS: {
+  format: PeopleExportFormat;
+  label: string;
+  className: string;
+}[] = [
+  {
+    format: "excel",
+    label: "Export Excel",
+    className:
+      "rounded-lg bg-emerald-600 px-4 py-2 text-white shadow-sm hover:bg-emerald-700",
+  },
+  {
+    format: "pdf",
+    label: "Export PDF",
+    className:
+      "rounded-lg bg-rose-600 px-4 py-2 text-white shadow-sm hover:bg-rose-700",
+  },
+  {
+    format: "csv",
+    label: "Export CSV",
+    className:
+      "rounded-lg bg-sky-600 px-4 py-2 text-white shadow-sm hover:bg-sky-700",
+  },
+];
+
+interface ExportPreviewModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  data: Person[];
+  onExport: (
+    format: PeopleExportFormat,
+    fields: string[],
+    people: Person[]
+  ) => void;
+  /** When set (e.g. from Bulk Actions), only show that format's export button. */
+  lockedFormat?: PeopleExportFormat | null;
+  branches?: Branch[];
+  canChangeBranchFilter?: boolean;
+  defaultBranchId?: number | string | null;
+  /** Export All: refetch matching people for the selected branch. */
+  onExportBranchChange?: (branchId: string) => Promise<void> | void;
+  isBulkExport?: boolean;
+}
+
+const DEFAULT_EXPORT_FIELDS = PEOPLE_EXPORT_FIELDS.map((f) => f.key).filter(
+  (k) => k !== "address"
+);
+
+function normalizeBranchId(value?: number | string | null): string {
+  if (value == null || value === "") return "";
+  return String(value);
+}
+
+export default function ExportPreviewModal({
+  isOpen,
+  onClose,
+  data,
+  onExport,
+  lockedFormat = null,
+  branches = [],
+  canChangeBranchFilter = true,
+  defaultBranchId = null,
+  onExportBranchChange,
+  isBulkExport = false,
+}: ExportPreviewModalProps) {
+  const [branchId, setBranchId] = useState(normalizeBranchId(defaultBranchId));
+  const [branchLoading, setBranchLoading] = useState(false);
+  const [selectedFields, setSelectedFields] = useState<Set<string>>(
+    () => new Set(DEFAULT_EXPORT_FIELDS)
+  );
+  const onExportBranchChangeRef = useRef(onExportBranchChange);
+  onExportBranchChangeRef.current = onExportBranchChange;
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = previousOverflow;
+    };
+  }, [isOpen]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+
+    setSelectedFields(new Set(DEFAULT_EXPORT_FIELDS));
+    const initialBranch = normalizeBranchId(defaultBranchId);
+    setBranchId(initialBranch);
+
+    if (isBulkExport || !onExportBranchChangeRef.current) {
+      setBranchLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    setBranchLoading(true);
+    void Promise.resolve(onExportBranchChangeRef.current(initialBranch)).finally(
+      () => {
+        if (!cancelled) setBranchLoading(false);
+      }
+    );
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen, isBulkExport, defaultBranchId]);
+
+  const branchOptions = useMemo(
+    () => branches.map((b) => ({ value: String(b.id), label: b.name })),
+    [branches]
+  );
+
+  const lockedBranchLabel = useMemo(() => {
+    const id = normalizeBranchId(defaultBranchId);
+    if (!id) return "No branch assigned";
+    return (
+      branchOptions.find((opt) => opt.value === id)?.label ?? "Your branch"
+    );
+  }, [branchOptions, defaultBranchId]);
+
+  const peopleForExport = useMemo(() => {
+    if (!isBulkExport) return data;
+    return data.filter((person) => personMatchesExportBranch(person, branchId));
+  }, [data, isBulkExport, branchId]);
+
+  const handleBranchChange = async (next: string) => {
+    setBranchId(next);
+    if (isBulkExport || !onExportBranchChangeRef.current) return;
+    setBranchLoading(true);
+    try {
+      await onExportBranchChangeRef.current(next);
+    } finally {
+      setBranchLoading(false);
+    }
+  };
+
+  if (!isOpen) return null;
+
+  const buttons = lockedFormat
+    ? FORMAT_BUTTONS.filter((b) => b.format === lockedFormat)
+    : FORMAT_BUTTONS;
+
+  const branchSelect = canChangeBranchFilter ? (
+    <div className="w-full sm:w-64">
+      <ScalableSelect
+        options={[
+          { value: "", label: "All branches" },
+          ...branchOptions,
+        ]}
+        value={branchId}
+        onChange={(next) => {
+          void handleBranchChange(next);
+        }}
+        placeholder="All branches"
+        searchPlaceholder="Search branches..."
+        showSearch={branchOptions.length > 8}
+        loading={branchLoading}
+        disabled={branchLoading}
+      />
+    </div>
+  ) : (
+    <LockedControlTooltip
+      label={PEOPLE_BRANCH_LOCKED_HINT}
+      wrapperClassName="inline-block w-full sm:w-64 shrink-0 align-middle cursor-default"
+    >
+      <ScalableSelect
+        options={
+          branchId
+            ? [{ value: branchId, label: lockedBranchLabel }]
+            : [{ value: "", label: lockedBranchLabel }]
+        }
+        value={branchId}
+        onChange={() => {}}
+        placeholder={lockedBranchLabel}
+        interactionBlocked
+        showSearch={false}
+      />
+    </LockedControlTooltip>
+  );
+
+  return createPortal(
+    <div
+      className="fixed inset-0 z-[70] flex items-center justify-center bg-black/50 p-4 !mt-0"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) {
+          onClose();
+        }
+      }}
+    >
+      <div className="flex max-h-[85vh] w-full max-w-4xl flex-col overflow-hidden rounded-lg bg-white shadow-xl">
+        <div className="overflow-y-auto p-4 sm:p-6">
+          <div className="mb-4 flex items-center justify-between gap-4">
+            <h2 className="text-xl font-semibold">Export</h2>
+            <button
+              type="button"
+              onClick={onClose}
+              className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md p-2 text-red-500 transition-colors hover:bg-red-50 hover:text-red-700"
+              aria-label="Close modal"
+            >
+              <svg
+                className="h-5 w-5"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M6 18L18 6M6 6l12 12"
+                />
+              </svg>
+            </button>
+          </div>
+
+          <div className="mb-4">
+            <h3 className="mb-2 text-sm font-medium text-gray-700">Branch</h3>
+            {branchSelect}
+          </div>
+
+          {/* Field selection */}
+          <div className="mb-4">
+            <h3 className="mb-2 text-sm font-medium text-gray-700">
+              Select fields
+            </h3>
+            <div className="grid grid-cols-2 gap-2 md:grid-cols-3 lg:grid-cols-4">
+              {PEOPLE_EXPORT_FIELDS.map((f) => (
+                <label key={f.key} className="flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={selectedFields.has(f.key)}
+                    onChange={(e) => {
+                      const next = new Set(selectedFields);
+                      if (e.target.checked) {
+                        next.add(f.key);
+                      } else {
+                        next.delete(f.key);
+                      }
+                      setSelectedFields(next);
+                    }}
+                    className="rounded border-gray-300 text-primary focus:ring-ring"
+                  />
+                  <span>{f.label}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+
+          {branchLoading ? (
+            <p className="text-sm text-gray-500">Loading people…</p>
+          ) : peopleForExport.length > 0 ? (
+            <p className="text-sm text-gray-500">
+              {peopleForExport.length}{" "}
+              {peopleForExport.length === 1 ? "person" : "people"} will be
+              exported
+            </p>
+          ) : (
+            <p className="text-sm text-gray-500">
+              No people match the selected branch.
+            </p>
+          )}
+
+          <div className="mt-6 flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:justify-end">
+            <button
+              type="button"
+              onClick={() => setSelectedFields(new Set())}
+              disabled={selectedFields.size === 0}
+              className="px-4 py-2 text-sm font-medium text-gray-700 hover:text-gray-900 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              Clear All
+            </button>
+            {buttons.map((button) => (
+              <button
+                key={button.format}
+                type="button"
+                onClick={() =>
+                  onExport(
+                    button.format,
+                    Array.from(selectedFields),
+                    peopleForExport
+                  )
+                }
+                disabled={
+                  branchLoading ||
+                  peopleForExport.length === 0 ||
+                  selectedFields.size === 0
+                }
+                className={`${button.className} disabled:cursor-not-allowed disabled:opacity-50`}
+              >
+                {button.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>,
+    document.body
+  );
+}

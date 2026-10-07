@@ -1,0 +1,281 @@
+## API Catalog (Active Routes)
+
+Base URL: `/api/people/`
+
+### Authentication
+
+- **JWT Token Authentication**: All endpoints require authentication except login
+- **Base URL**: `/api/auth/`
+- **Endpoints**:
+  - `POST /api/auth/login/` - Login (returns access + refresh tokens)
+  - `POST /api/auth/logout/` - Logout (blacklists refresh token when provided; client clears storage)
+  - `POST /api/auth/token/refresh/` - Refresh access token (rotates refresh; returns new access + refresh)
+  - `GET /api/auth/me/` - Get current authenticated user
+- **Role-Based Access**: Different modules have different permission requirements
+- **VISITOR Exclusion**: VISITOR role cannot log in
+- See `docs/AUTHENTICATION_MODULE.md` for detailed documentation
+
+### Branch
+
+- List: `GET /api/people/branches/`
+  - Query: `is_headquarters`, `is_active`, `search` (name, code)
+  - Access: All authenticated non-visitor users
+  - Returns: Array of branch objects
+- Retrieve: `GET /api/people/branches/{id}/`
+  - Access: All authenticated non-visitor users
+- Create: `POST /api/people/branches/`
+  - Required: `name`
+  - Optional: `code`, `address`, `phone`, `email`, `is_headquarters` (default=False), `is_active` (default=True)
+  - Access: ADMIN only
+- Update: `PUT /api/people/branches/{id}/`
+  - Access: ADMIN only
+- Partial Update: `PATCH /api/people/branches/{id}/`
+  - Access: ADMIN only
+- Delete: `DELETE /api/people/branches/{id}/`
+  - Access: ADMIN only
+
+Branch fields (serializer)
+
+```
+id, name, code?, address?, phone?, email?, is_headquarters, is_active, created_at (read-only)
+```
+
+### Person
+
+- List: `GET /api/people/`
+  - Query: `search` (username, email, first_name, last_name, nickname, maiden_name, member_id), `role`, `cluster` (membership on `Person.clusters`), `cluster__in` (comma-separated cluster PKs)
+  - Access: Based on role and module coordinator assignments. See `docs/ACCESS_CONTROL.md` for details.
+- Retrieve: `GET /api/people/{id}/`
+  - Access: Based on role and module coordinator assignments. See `docs/ACCESS_CONTROL.md` for details.
+- Create: `POST /api/people/`
+  - Required: `first_name`, `last_name`, `role`
+  - Auto: `username` generated from first two letters of first name + last name (lowercase; punctuation stripped); uniqueness enforced by suffixing a counter. Client `username` is ignored. PATCH/PUT: ADMIN may change `username`.
+  - Access: ADMIN, PASTOR, or Senior Coordinator
+- Update: `PUT /api/people/{id}/`
+  - Access: ADMIN, PASTOR, or Senior Coordinator
+- Partial Update: `PATCH /api/people/{id}/`
+  - Access: ADMIN, PASTOR, or Senior Coordinator
+- Delete: `DELETE /api/people/{id}/`
+  - Access: ADMIN, PASTOR
+
+Person fields (serializer)
+
+```
+id, username (generated on create; writable on update for ADMIN only), first_name, last_name, middle_name?, suffix?, nickname?, maiden_name?, gender?,
+facebook_name?, photo?, role, phone?, address?, country?, date_of_birth?,
+date_first_attended?, inviter (Person id)?, inviter_display_name? (read-only),
+water_baptism_date?, baptized_by (Person id)?, baptized_by_display_name? (read-only),
+spirit_baptism_date?, hg_witnessed_by (Person id)?, hg_witnessed_by_display_name? (read-only),
+branch (Branch id)?, member_id?,
+status? (ACTIVE|SEMIACTIVE|INACTIVE|DORMANT|FALLAWAY|DECEASED|ONGOING|NO_RESPONSE),
+status_change_reason? (write-only), latest_status_change? (read-only object)
+```
+
+Notes:
+- `maiden_name` is optional metadata (searchable); not part of display `full_name` / username generation.
+- `username` is generated on create from first two letters of first name + last name (lowercase; letters, digits, and `@ . + - _` only). Client-supplied `username` is ignored on create. On update, only ADMIN may change it (unique, non-blank, not reserved `admin`). Non-admin payloads drop `username`.
+- `inviter_display_name` (read-only) uses the usual display format: first name, nickname in quotes, middle initial, last name, suffix.
+- `baptized_by` / `hg_witnessed_by` are stored as `Journey.verified_by` on the BAPTISM / SPIRIT journeys. Optional; omit or send `null` when the baptizer/witness is unknown (UI: **Not sure**). The live person must not be a visitor or admin. To record someone who is not in the directory, send `baptized_by_first_name` / `baptized_by_last_name` (or `hg_witnessed_by_first_name` / `hg_witnessed_by_last_name`) instead of a person id — stored on the journey as `historical_verified_first_name` / `historical_verified_last_name`. A live person id clears those names. `baptized_by` is who baptized the member; `hg_witnessed_by` is who witnessed when they received the Holy Ghost. Display names use the same format as `inviter_display_name` (historical names are first + last).
+- Name fields (`first_name`, `last_name`, `middle_name`, `suffix`, `nickname`, `maiden_name`) are normalized on write: mixed-case is preserved; all-lower/all-upper is title-cased (particles, Mc/Mac, Roman numerals).
+- Status by role (UI): members/pastors/admins use ACTIVE|SEMIACTIVE|INACTIVE|DORMANT|FALLAWAY|DECEASED; visitors use ONGOING|NO_RESPONSE|DECEASED. Prospect pipeline stages INVITED/ATTENDED are separate from `Person.status`.
+- When `status` changes on update, a `PersonStatusChange` row and a Journey `NOTE` (`Status Update: OLD → NEW`) are created. `status_change_reason` is **required** when changing **to** SEMIACTIVE, INACTIVE, DORMANT, FALLAWAY, or DECEASED. Optional for Active / Ongoing / No Response. Not required on create, attendance auto-calc, or system baptism/role writes.
+- `latest_status_change` (retrieve/update response): `{id, from_status, to_status, reason, source (MANUAL|AUTO_ATTENDANCE|SYSTEM), changed_by, created_at, needs_follow_up}`. Omitted from list serializer.
+- `open_care_case` (retrieve/update response): nested `MemberCareCase` when the requester can access member care, the case is in the open caseload (OPEN / IN_PROGRESS / NO_ACTION), and the person is in their cluster scope. Omitted from list serializer and hidden from reporters / plain members.
+- When `branch` field is updated, a Journey entry with type `BRANCH_TRANSFER` is automatically created.
+
+- Update Status: `POST /api/people/people/{id}/update_status/`
+  - Access: ADMIN, PASTOR, or Senior Coordinator
+  - Manually trigger status update for a person based on attendance patterns
+  - Returns: `{"status": "ACTIVE|SEMIACTIVE|INACTIVE", "updated": true|false}` (or `updated: false` when status is a manual pastoral value: DORMANT, FALLAWAY, DECEASED, or when auto status updates are disabled)
+  - Note: Status is automatically updated in real-time when attendance records change **if** Admin Settings → Module Controls → People automations has automated attendance status updates enabled. This endpoint allows manual triggering of the same logic. Manual pastoral statuses are never overwritten. Visitor statuses (ONGOING, NO_RESPONSE) are not produced by this attendance auto-calc.
+
+- People Automation Settings: `GET|PATCH /api/people/people-automation-settings/`
+  - Access: ADMIN only
+  - Singleton: `auto_status_updates_enabled` (boolean). When false, attendance signals, the management command, and `update_status` do not change Active/Semi-active/Inactive.
+  - UI: Admin Settings → Module Controls → People automations
+
+### Member care cases
+
+- List: `GET /api/people/care-cases/`
+  - Access: ADMIN, PASTOR, CLUSTER Senior Coordinator, CLUSTER Coordinator. **Not** reporters or plain members.
+  - Scope: cases whose person is in an accessible cluster. Unclustered people: pastor/admin/senior only (grouped as “No cluster”).
+  - Query params: `cluster_id` (or `none`/`0` for unclustered), `unclustered=1`, `person_status`, `recommended_action`, `case_status`, `include_closed=1`, `search`, `page`, `page_size`
+  - Default list is the open caseload (`OPEN`, `IN_PROGRESS`, `NO_ACTION`). Recovered/completed require `include_closed=1` or an explicit `case_status`.
+  - Nested `person`: `id`, name fields, `status`, `cluster_ids`, `cluster_labels`. `needs_attention` is true for OPEN/IN_PROGRESS with no recommended action or an overdue `due_date`.
+- Retrieve: `GET /api/people/care-cases/{id}/`
+- Partial Update: `PATCH /api/people/care-cases/{id}/`
+  - Writable: `details`, `recommended_action`, `recommended_action_other`, `assigned_to` (person ids), `assigned_to_label`, `due_date`, `case_status`, `remarks`
+  - Setting `recommended_action=NO_ACTION` also sets `case_status=NO_ACTION`
+  - `recommended_action=OTHER` requires `recommended_action_other`; the custom text is cleared when the action is not Other
+  - No create/delete; cases are opened from status changes (`record_person_status_change`)
+
+### Family
+
+- List: `GET /api/people/families/`
+  - Access: Based on role and module coordinator assignments. Cluster coordinators see families in their clusters + families of cluster members. See `docs/ACCESS_CONTROL.md` for details.
+- Retrieve: `GET /api/people/families/{id}/`
+  - Access: Based on role and module coordinator assignments. See `docs/ACCESS_CONTROL.md` for details.
+- Create: `POST /api/people/families/`
+  - Access: ADMIN, PASTOR, or Senior Coordinator
+- Update: `PUT /api/people/families/{id}/`
+  - Access: ADMIN, PASTOR, or Senior Coordinator
+- Partial Update: `PATCH /api/people/families/{id}/`
+  - Access: ADMIN, PASTOR, or Senior Coordinator
+- Delete: `DELETE /api/people/families/{id}/`
+  - Access: ADMIN, PASTOR
+
+Family fields (serializer)
+
+```
+id, name, leader (Person id | null), members (Person ids[]), address?, created_at (read-only)
+```
+
+### Cluster
+
+- List: `GET /api/people/clusters/`
+- Retrieve: `GET /api/people/clusters/{id}/`
+- Create: `POST /api/people/clusters/`
+- Update: `PUT /api/people/clusters/{id}/`
+- Partial Update: `PATCH /api/people/clusters/{id}/`
+- Delete: `DELETE /api/people/clusters/{id}/`
+
+Cluster fields (serializer)
+
+```
+id, code, name, coordinator (Person id | null), families (Family ids[]),
+branch (Branch id)?, description?, created_at (read-only)
+```
+
+### Journey
+
+- List: `GET /api/people/journeys/`
+  - Query: `user` (Person ID), `type`
+- Retrieve: `GET /api/people/journeys/{id}/`
+- Create: `POST /api/people/journeys/`
+  - Required: `user` (Person ID), `date`, `type`
+  - Optional: `title`, `description`, `verified_by` (Person ID; for `BAPTISM` / `SPIRIT`, `null` means the baptizer/witness is unknown), `historical_verified_first_name` / `historical_verified_last_name` (legacy names when the person is not in the directory; both required together)
+- Update: `PUT /api/people/journeys/{id}/`
+- Partial Update: `PATCH /api/people/journeys/{id}/`
+- Delete: `DELETE /api/people/journeys/{id}/`
+
+Journey fields (serializer)
+
+```
+id, user (Person ID), title?, date, type (LESSON|BAPTISM|SPIRIT|CLUSTER|NOTE|EVENT_ATTENDANCE|MINISTRY|BRANCH_TRANSFER),
+description?, verified_by (Person ID | null), verified_by_display_name? (read-only), historical_verified_first_name?, historical_verified_last_name?, created_at (read-only)
+```
+
+Note: `BRANCH_TRANSFER` type is automatically created when a Person's branch changes. For `BAPTISM`, `verified_by` is who baptized the member. For `SPIRIT`, `verified_by` is who witnessed when they received the Holy Ghost. Both may be `null` when unknown. Live `verified_by` people cannot be visitors or admins. Use `historical_verified_*` names when the baptizer/witness is not in the directory.
+
+### Module Coordinator Assignments
+
+- List: `GET /api/people/module-coordinators/`
+  - Query: `person`, `module`, `level`, `resource_type`, `search`
+  - Access: ADMIN only
+- Retrieve: `GET /api/people/module-coordinators/{id}/`
+  - Access: ADMIN only
+- Create: `POST /api/people/module-coordinators/`
+  - Access: ADMIN only
+  - Payload: `{ person, module, level, resource_id?, resource_type? }`
+- Bulk Create: `POST /api/people/module-coordinators/bulk-create/`
+  - Access: ADMIN only
+  - Payload: `{ assignments: [{ person, module, level, resource_id?, resource_type? }, ...] }`
+  - Creates multiple assignments atomically (all validated before any are created)
+  - Returns: `{ message: string, created: ModuleCoordinator[] }`
+- Update: `PUT /api/people/module-coordinators/{id}/`
+  - Access: ADMIN only
+- Partial Update: `PATCH /api/people/module-coordinators/{id}/`
+  - Access: ADMIN only
+- Delete: `DELETE /api/people/module-coordinators/{id}/`
+  - Access: ADMIN only
+
+### Ministry
+
+- List: `GET /api/ministries/`
+  - Query: `activity_cadence`, `category`, `is_active`, `search` (name, description, coordinator names), `ordering` (name, activity_cadence, created_at)
+  - Access: All authenticated non-visitor users (read-only for MEMBER role)
+  - Returns: Array of ministry objects with nested `memberships`, `primary_coordinator`, and `support_coordinators`
+- Retrieve: `GET /api/ministries/{id}/`
+  - Access: All authenticated non-visitor users (read-only for MEMBER role)
+- Create: `POST /api/ministries/`
+  - Required: `name`, `activity_cadence`
+  - Optional: `description`, `category`, `primary_coordinator_id`, `support_coordinator_ids[]`, `meeting_location`, `meeting_schedule` (JSON object), `communication_channel` (URL), `is_active`
+  - Access: ADMIN, PASTOR, or Ministry Coordinator with write access
+  - Note: Coordinators are automatically synced to `MinistryMember` entries with appropriate roles
+- Update: `PUT /api/ministries/{id}/`
+  - Access: ADMIN, PASTOR, or Ministry Coordinator with write access
+- Partial Update: `PATCH /api/ministries/{id}/`
+  - Access: ADMIN, PASTOR, or Ministry Coordinator with write access
+- Delete: `DELETE /api/ministries/{id}/`
+  - Access: ADMIN, PASTOR, or Ministry Coordinator with write access
+  - Note: Cascade deletes all related `MinistryMember` entries
+
+Ministry fields (serializer)
+
+```
+id, name, description?, category? (worship|outreach|care|logistics|other),
+activity_cadence (weekly|monthly|seasonal|event_driven|holiday|ad_hoc),
+primary_coordinator (read-only, UserSummary), primary_coordinator_id (write-only),
+support_coordinators (read-only, UserSummary[]), support_coordinator_ids (write-only, Person ids[]),
+branch (Branch id)?, meeting_location?, meeting_schedule? (JSON object), communication_channel? (URL),
+is_active, created_at (read-only), updated_at (read-only), memberships (read-only, MinistryMember[])
+```
+
+### Ministry Member
+
+- List: `GET /api/ministry-members/`
+  - Query: `ministry` (Ministry ID), `role` (primary_coordinator|coordinator|team_member|guest_helper), `is_active`, `search` (ministry name, member names), `ordering` (join_date, role)
+  - Access: All authenticated non-visitor users (read-only for MEMBER role)
+- Retrieve: `GET /api/ministry-members/{id}/`
+  - Access: All authenticated non-visitor users (read-only for MEMBER role)
+- Create: `POST /api/ministry-members/`
+  - Required: `ministry` (Ministry ID), `member_id` (Person ID)
+  - Optional: `role` (defaults to team_member), `skills`, `notes`, `is_active` (defaults to true), `availability` (JSON object)
+  - Auto: `join_date` set to today if not provided
+  - Access: ADMIN, PASTOR, or Ministry Coordinator with write access
+- Update: `PUT /api/ministry-members/{id}/`
+  - Access: ADMIN, PASTOR, or Ministry Coordinator with write access
+- Partial Update: `PATCH /api/ministry-members/{id}/`
+  - Access: ADMIN, PASTOR, or Ministry Coordinator with write access
+- Delete: `DELETE /api/ministry-members/{id}/`
+  - Access: ADMIN, PASTOR, or Ministry Coordinator with write access
+
+Ministry Member fields (serializer)
+
+```
+id, ministry (Ministry ID), member (read-only, UserSummary), member_id (write-only, Person ID),
+role (primary_coordinator|coordinator|team_member|guest_helper), join_date (read-only, auto-set),
+is_active, availability? (JSON object), skills?, notes?
+```
+
+### Notifications
+
+Base URL: `/api/notifications/`
+
+See [NOTIFICATIONS.md](./NOTIFICATIONS.md) for full feature documentation (alert types, activity feed, coordinator scoping).
+
+- List feed: `GET /api/notifications/`
+  - Access: Authenticated non-visitor users
+  - Returns: `{ unread_count, alert_count, activity_count, items[] }`
+- Dismiss one: `POST /api/notifications/{notification_key}/dismiss/`
+  - `notification_key` must be URL-encoded
+- Dismiss all visible: `POST /api/notifications/dismiss-all/`
+
+Notification item fields
+
+```
+key, category (alert|activity), type, severity (info|warning|success),
+title, body, href, occurred_at (ISO 8601)
+```
+
+### Notes
+
+- Media uploads for `photo` use `MEDIA_URL = /media/` and `MEDIA_ROOT` from settings.
+- Pagination is default DRF (not explicitly configured).
+- Person serializer includes `journeys` field (read-only) with full journey data.
+- Access control: See `docs/ACCESS_CONTROL.md` for complete access matrix and permission rules, including branch-based filtering.
+- Branch filtering: All data (People, Families, Clusters, Events, Ministries, Journeys) is filtered by branch based on user's branch assignment. ADMIN and PASTOR from headquarters see all branches.
+- Branch transfers: When a Person's `branch` field is updated, a Journey entry with type `BRANCH_TRANSFER` is automatically created.
+- Cluster journey creation: When people attend cluster meetings (via ClusterWeeklyReport) or are added/transferred between clusters, Journey entries with type `CLUSTER` are automatically created. See `docs/CLUSTERS_MODULE.md` for details.
+- Cluster compliance monitoring: Compliance endpoints are available at `/api/clusters/cluster-weekly-reports/compliance/`, etc. Accessible to ADMIN, PASTOR, and Senior Coordinators only. See `docs/CLUSTERS_MODULE.md` for details.
+- Ministry coordinator sync: When `primary_coordinator` or `support_coordinators` are set on a Ministry, corresponding `MinistryMember` entries are automatically created/updated with roles `PRIMARY_COORDINATOR` or `COORDINATOR`. When coordinators are removed, their `MinistryMember` role is updated to `TEAM_MEMBER` if they still have a membership. See `docs/MINISTRIES_MODULE.md` for details.

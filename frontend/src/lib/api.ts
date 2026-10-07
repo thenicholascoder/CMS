@@ -1,0 +1,2707 @@
+import axios, { type AxiosResponse } from "axios";
+import { Person, Family, Journey, ModuleCoordinator, MemberCareCase } from "@/src/types/person";
+import {
+  Cluster,
+  ClusterStatusTallyDetailRow,
+  ClusterStatusTallyRow,
+  ClusterStatusTallyStatus,
+  ClusterWeeklyReport,
+  ClusterInput,
+  ClusterWeeklyReportInput,
+  ClusterAnalytics,
+  OverdueClusters,
+  ComplianceData,
+  ComplianceHistory,
+  AtRiskCluster,
+  ComplianceNote,
+} from "@/src/types/cluster";
+import {
+  Lesson,
+  LessonCommitmentSettings,
+  LessonProgressSummary,
+  LessonSessionReport,
+  LessonSessionReportInput,
+  LessonStudentEnrollment,
+  LessonTeacherTransfer,
+  LessonTeacherRosterEntry,
+  PersonLessonProgress,
+} from "@/src/types/lesson";
+import {
+  Event,
+  EventAttendanceRecord,
+  AttendanceMode,
+  AttendanceStatus,
+  AttendanceVenueOption,
+  EventTypeOption,
+  EventRoom,
+  EventRegistration,
+  EventRegistrationTier,
+  EventRegistrationPayment,
+  EventRegistrationPaymentMethod,
+} from "@/src/types/event";
+import {
+  SelfCheckInInviter,
+  SelfCheckInSessionResponse,
+  PublicSelfCheckInSessionResponse,
+  SelfCheckInVisitorMatch,
+  SelfCheckInVisitorWrite,
+} from "@/src/types/selfCheckIn";
+import type {
+  OnsiteGuestInviter,
+  OnsiteGuestSessionResponse,
+  OnsiteGuestVisitorMatch,
+  OnsiteGuestVisitorWrite,
+} from "@/src/types/onsiteGuest";
+import {
+  Ministry,
+  MinistryMember,
+  MinistryCreateInput,
+} from "@/src/types/ministry";
+import {
+  SundaySchoolCategory,
+  SundaySchoolClass,
+  SundaySchoolClassMember,
+  SundaySchoolSession,
+  SundaySchoolSummary,
+  UnenrolledByCategory,
+  AttendanceReport,
+  RecurringSessionData,
+} from "@/src/types/sundaySchool";
+import {
+  EvangelismGroup,
+  EvangelismGroupWrite,
+  EvangelismSession,
+  EvangelismWeeklyReport,
+  EvangelismPeopleTallyRow,
+  EvangelismTallyDrilldownRow,
+  EvangelismTallyRow,
+  Prospect,
+  FollowUpTask,
+  DropOff,
+  Conversion,
+  ConversionWritePayload,
+  MonthlyConversionTracking,
+  MonthlyStatistics,
+  Each1Reach1Goal,
+  EvangelismSummary,
+  RecurringSessionData as EvangelismRecurringSessionData,
+  BibleSharersCoverage,
+  BulkEnrollData,
+} from "@/src/types/evangelism";
+import {
+  Donation,
+  DonationPurpose,
+  Offering,
+  OfferingWeeklySummary,
+  PaymentMethod,
+  Pledge,
+  PledgeStatus,
+  PledgeSummary,
+  PledgeContribution,
+  PledgeContributionInput,
+} from "@/src/types/finance";
+import { Branch } from "@/src/types/branch";
+import { ModuleSetting } from "@/src/types/moduleSettings";
+import { PeopleAutomationSetting } from "@/src/types/peopleAutomationSettings";
+import { EventSetting } from "@/src/types/eventSettings";
+import { NotificationFeedResponse } from "@/src/types/notifications";
+import { ReportsScopeMeta, PeopleSummary, EngagementSummary, NccSummary, CymSummary, V2bSummary, StewardshipSummary, OverviewSummary } from "@/src/types/reports";
+
+const api = axios.create({
+  baseURL: process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api",
+  headers: {
+    "Content-Type": "application/json",
+  },
+});
+
+const publicApi = axios.create({
+  baseURL: process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api",
+  headers: {
+    "Content-Type": "application/json",
+  },
+});
+
+const PERSON_FORM_DATA_SKIP_FIELDS = new Set([
+  "photo",
+  "journeys",
+  "id",
+  "cluster_codes",
+  "cluster_labels",
+  "cluster_memberships",
+  "family_names",
+  "module_coordinator_assignments",
+  "can_view_journey_timeline",
+  "can_view_profile",
+  "temporary_password",
+  "branch_name",
+  "branch_code",
+  "full_name",
+  "groups",
+  "user_permissions",
+  "latest_status_change",
+  "open_care_case",
+  "baptized_by_display_name",
+  "hg_witnessed_by_display_name",
+]);
+
+export function personDataToFormData(
+  data: Partial<Person>,
+  photoFile: File
+): FormData {
+  const formData = new FormData();
+  for (const [key, value] of Object.entries(data)) {
+    if (
+      PERSON_FORM_DATA_SKIP_FIELDS.has(key) ||
+      value === undefined ||
+      value === null ||
+      value === ""
+    ) {
+      continue;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        formData.append(key, String(item));
+      }
+      continue;
+    }
+    if (typeof value === "boolean") {
+      formData.append(key, value ? "true" : "false");
+    } else {
+      formData.append(key, String(value));
+    }
+  }
+  formData.append("photo", photoFile);
+  return formData;
+}
+
+const peopleMultipartConfig = {
+  headers: { "Content-Type": "multipart/form-data" },
+};
+
+// Token storage keys
+const ACCESS_TOKEN_KEY = "access_token";
+const REFRESH_TOKEN_KEY = "refresh_token";
+const REMEMBER_ME_KEY = "remember_me";
+
+// Token management functions
+export const tokenStorage = {
+  getAccessToken: () => localStorage.getItem(ACCESS_TOKEN_KEY),
+  getRefreshToken: () => localStorage.getItem(REFRESH_TOKEN_KEY),
+  setTokens: (access: string, refresh: string, rememberMe?: boolean) => {
+    localStorage.setItem(ACCESS_TOKEN_KEY, access);
+    localStorage.setItem(REFRESH_TOKEN_KEY, refresh);
+    if (rememberMe !== undefined) {
+      localStorage.setItem(REMEMBER_ME_KEY, rememberMe.toString());
+    }
+  },
+  clearTokens: () => {
+    localStorage.removeItem(ACCESS_TOKEN_KEY);
+    localStorage.removeItem(REFRESH_TOKEN_KEY);
+    localStorage.removeItem(REMEMBER_ME_KEY);
+  },
+  getRememberMe: () => localStorage.getItem(REMEMBER_ME_KEY) === "true",
+};
+
+// Request interceptor: Add JWT token to requests
+api.interceptors.request.use(
+  (config) => {
+    const token = tokenStorage.getAccessToken();
+    if (token) {
+      config.headers.Authorization = `Bearer ${token}`;
+    }
+    return config;
+  },
+  (error) => {
+    return Promise.reject(error);
+  }
+);
+
+// Response interceptor: Handle 401 errors and token refresh
+let isRefreshing = false;
+let failedQueue: Array<{
+  resolve: (value?: any) => void;
+  reject: (reason?: any) => void;
+}> = [];
+
+const processQueue = (error: any, token: string | null = null) => {
+  failedQueue.forEach((prom) => {
+    if (error) {
+      prom.reject(error);
+    } else {
+      prom.resolve(token);
+    }
+  });
+  failedQueue = [];
+};
+
+api.interceptors.response.use(
+  (response) => response,
+  async (error) => {
+    const originalRequest = error.config;
+
+    // If error is 401 and we haven't tried to refresh yet
+    if (error.response?.status === 401 && !originalRequest._retry) {
+      if (isRefreshing) {
+        // If already refreshing, queue this request
+        return new Promise((resolve, reject) => {
+          failedQueue.push({ resolve, reject });
+        })
+          .then((token) => {
+            originalRequest.headers.Authorization = `Bearer ${token}`;
+            return api(originalRequest);
+          })
+          .catch((err) => {
+            return Promise.reject(err);
+          });
+      }
+
+      originalRequest._retry = true;
+      isRefreshing = true;
+
+      const refreshToken = tokenStorage.getRefreshToken();
+      if (!refreshToken) {
+        tokenStorage.clearTokens();
+        processQueue(new Error("No refresh token"), null);
+        window.location.href = "/login";
+        return Promise.reject(error);
+      }
+
+      try {
+        const response = await axios.post(
+          `${api.defaults.baseURL}/auth/token/refresh/`,
+          { refresh: refreshToken }
+        );
+        const { access, refresh: newRefresh } = response.data;
+        const rememberMe = tokenStorage.getRememberMe();
+        tokenStorage.setTokens(
+          access,
+          newRefresh || refreshToken,
+          rememberMe
+        );
+        originalRequest.headers.Authorization = `Bearer ${access}`;
+        processQueue(null, access);
+        return api(originalRequest);
+      } catch (refreshError) {
+        tokenStorage.clearTokens();
+        processQueue(refreshError, null);
+        window.location.href = "/login";
+        return Promise.reject(refreshError);
+      } finally {
+        isRefreshing = false;
+      }
+    }
+
+    // Standardize error response format
+    if (error.response?.data) {
+      const errorData = error.response.data;
+      if (errorData.error && errorData.message) {
+        // Already in standardized format
+        return Promise.reject(error);
+      } else {
+        // Convert to standardized format
+        error.response.data = {
+          error: "error",
+          message: errorData.detail || errorData.message || "An error occurred",
+          details: errorData,
+        };
+      }
+    }
+
+    return Promise.reject(error);
+  }
+);
+
+export interface PaginatedResponse<T> {
+  count: number;
+  next: string | null;
+  previous: string | null;
+  results: T[];
+}
+
+/** Query params for paginated people list / directory filters. */
+export type PeopleListParams = {
+  search?: string;
+  page?: number;
+  page_size?: number;
+  ordering?: string;
+  role?: string;
+  role__in?: string;
+  role_ne?: string;
+  status?: string;
+  status__in?: string;
+  status_ne?: string;
+  branch?: number | string;
+  branch__in?: string;
+  branch_ne?: number | string;
+  branch_ne__in?: string;
+  cluster?: number | string;
+  cluster__in?: string;
+  first_name?: string;
+  first_name__icontains?: string;
+  first_name__istartswith?: string;
+  first_name__iendswith?: string;
+  first_name_ne?: string;
+  last_name?: string;
+  last_name__icontains?: string;
+  last_name__istartswith?: string;
+  last_name__iendswith?: string;
+  last_name_ne?: string;
+  email?: string;
+  email__icontains?: string;
+  email__istartswith?: string;
+  email__iendswith?: string;
+  email_ne?: string;
+  phone?: string;
+  phone__icontains?: string;
+  phone__istartswith?: string;
+  phone__iendswith?: string;
+  phone_ne?: string;
+  member_id?: string;
+  member_id__icontains?: string;
+  member_id__istartswith?: string;
+  member_id__iendswith?: string;
+  member_id_ne?: string;
+  date_first_attended?: string;
+  date_first_attended_before?: string;
+  date_first_attended_after?: string;
+  date_first_attended_ne?: string;
+  date_first_attended_min?: string;
+  date_first_attended_max?: string;
+  date_of_birth?: string;
+  date_of_birth_before?: string;
+  date_of_birth_after?: string;
+  date_of_birth_ne?: string;
+  date_of_birth_min?: string;
+  date_of_birth_max?: string;
+  has_name?: boolean;
+  has_member_id?: boolean;
+  exclude_username?: string;
+  /** Same-branch people for weekly-report attendee pickers (Bible Sharers). */
+  for_report?: boolean | string;
+  /** Same-branch people for Lessons assign / session pickers. */
+  for_lessons?: boolean | string;
+};
+
+export type PeopleListResponse = PaginatedResponse<Person> | Person[];
+
+async function fetchAllPeoplePages(
+  params: PeopleListParams = {},
+  path = "/people/people/"
+): Promise<Person[]> {
+  const all: Person[] = [];
+  let page = 1;
+  // Cap pages to avoid runaway loops if next is malformed.
+  for (let i = 0; i < 500; i += 1) {
+    const { data } = await api.get<PeopleListResponse>(path, {
+      params: { ...params, page, page_size: 100 },
+    });
+    if (Array.isArray(data)) {
+      return data;
+    }
+    all.push(...(data.results ?? []));
+    if (!data.next) {
+      break;
+    }
+    page += 1;
+  }
+  return all;
+}
+
+export const peopleApi = {
+  /** Pages through the people list and returns every row (picker / legacy callers). */
+  getAll: async (params?: PeopleListParams): Promise<{ data: Person[] }> => {
+    const data = await fetchAllPeoplePages(params ?? {});
+    return { data };
+  },
+  /** ADMIN-only: every ADMIN role account (hidden from the people directory). */
+  listAdminAccounts: async (): Promise<{ data: Person[] }> => {
+    const data = await fetchAllPeoplePages(
+      {},
+      "/people/people/admin-accounts/"
+    );
+    return { data };
+  },
+  /** Fetch all pages matching directory filters (export). */
+  getAllMatching: (params?: PeopleListParams) => fetchAllPeoplePages(params ?? {}),
+  list: (params?: PeopleListParams) =>
+    api.get<PaginatedResponse<Person>>("/people/people/", { params }),
+  search: (params?: PeopleListParams) =>
+    api.get<PeopleListResponse>("/people/people/", { params }),
+  getById: (id: string) => api.get<Person>(`/people/people/${id}/`),
+  getPossibleDuplicates: (params?: {
+    match?: "name" | "member_id" | "both";
+    branch_id?: number | "";
+    same_branch_only?: boolean;
+  }) =>
+    api.get<{
+      groups: Array<{
+        match_type: "name" | "member_id";
+        key: string;
+        label: string;
+        count: number;
+        same_branch: boolean;
+        people: Array<{
+          id: number;
+          first_name: string;
+          last_name: string;
+          middle_name?: string;
+          username: string;
+          email?: string;
+          phone?: string;
+          member_id?: string;
+          role: string;
+          status?: string;
+          branch_id?: number | null;
+          branch_name?: string | null;
+          branch_code?: string | null;
+          cluster_codes?: string[];
+        }>;
+      }>;
+      count: number;
+    }>("/people/people/possible-duplicates/", {
+      params: {
+        match: params?.match,
+        branch_id:
+          params?.branch_id === "" || params?.branch_id == null
+            ? undefined
+            : params.branch_id,
+        same_branch_only: params?.same_branch_only ? "1" : undefined,
+      },
+    }),
+  create: (data: Partial<Person> | FormData) => {
+    if (data instanceof FormData) {
+      return api.post<Person>("/people/people/", data, peopleMultipartConfig);
+    }
+    return api.post<Person>("/people/people/", data);
+  },
+  update: (id: string, data: Partial<Person> | FormData) => {
+    if (data instanceof FormData) {
+      return api.put<Person>(`/people/people/${id}/`, data, peopleMultipartConfig);
+    }
+    return api.put<Person>(`/people/people/${id}/`, data);
+  },
+  patch: (id: string, data: Partial<Person>) =>
+    api.patch<Person>(`/people/people/${id}/`, data),
+  delete: (id: string) => api.delete(`/people/people/${id}/`),
+  listCareCases: (params?: {
+    cluster_id?: number | string;
+    unclustered?: boolean | string;
+    person_status?: string;
+    recommended_action?: string;
+    case_status?: string;
+    include_closed?: boolean | string;
+    search?: string;
+    page?: number;
+    page_size?: number;
+  }) =>
+    api.get<PaginatedResponse<MemberCareCase> | MemberCareCase[]>(
+      "/people/care-cases/",
+      { params },
+    ),
+  patchCareCase: (
+    id: number | string,
+    data: Partial<{
+      details: string;
+      recommended_action: string;
+      recommended_action_other: string;
+      assigned_to: number[];
+      assigned_to_label: string;
+      due_date: string | null;
+      case_status: string;
+      remarks: string;
+    }>,
+  ) => api.patch<MemberCareCase>(`/people/care-cases/${id}/`, data),
+};
+
+export async function fetchAllCareCases(
+  params: {
+    cluster_id?: number | string;
+    unclustered?: boolean | string;
+    person_status?: string;
+    recommended_action?: string;
+    case_status?: string;
+    include_closed?: boolean | string;
+    search?: string;
+  } = {},
+): Promise<MemberCareCase[]> {
+  const all: MemberCareCase[] = [];
+  let page = 1;
+  for (let i = 0; i < 50; i += 1) {
+    const { data } = await peopleApi.listCareCases({
+      ...params,
+      page,
+      page_size: 200,
+    });
+    if (Array.isArray(data)) {
+      return data;
+    }
+    all.push(...(data.results ?? []));
+    if (!data.next) {
+      break;
+    }
+    page += 1;
+  }
+  return all;
+}
+
+export type FamiliesListParams = {
+  search?: string;
+  page?: number;
+  page_size?: number;
+  ordering?: string;
+  branch?: number | string;
+  include_inactive?: boolean | string;
+  name?: string;
+  name__icontains?: string;
+  name__istartswith?: string;
+  name__iendswith?: string;
+  name_ne?: string;
+  member_count?: number | string;
+  member_count_min?: number | string;
+  member_count_max?: number | string;
+  visitor_count?: number | string;
+  visitor_count_min?: number | string;
+  visitor_count_max?: number | string;
+};
+
+export type FamiliesListResponse = PaginatedResponse<Family> | Family[];
+
+export type FamiliesSummary = {
+  family_count: number;
+  member_count: number;
+  unassigned_count: number;
+};
+
+async function fetchAllFamiliesPages(
+  params: FamiliesListParams = {}
+): Promise<Family[]> {
+  const all: Family[] = [];
+  let page = 1;
+  for (let i = 0; i < 500; i += 1) {
+    const { data } = await api.get<FamiliesListResponse>("/people/families/", {
+      params: { ...params, page, page_size: 100 },
+    });
+    if (Array.isArray(data)) {
+      return data;
+    }
+    all.push(...(data.results ?? []));
+    if (!data.next) {
+      break;
+    }
+    page += 1;
+  }
+  return all;
+}
+
+export const familiesApi = {
+  /** Pages through families and returns every row (pickers / legacy callers). */
+  getAll: async (
+    params?: FamiliesListParams
+  ): Promise<{ data: Family[] }> => {
+    const data = await fetchAllFamiliesPages(params ?? {});
+    return { data };
+  },
+  list: (
+    params?: FamiliesListParams,
+    config?: { signal?: AbortSignal }
+  ) =>
+    api.get<PaginatedResponse<Family>>("/people/families/", {
+      params,
+      ...config,
+    }),
+  unassignedPeople: (params?: {
+    search?: string;
+    page?: number;
+    page_size?: number;
+  }) =>
+    api.get<PaginatedResponse<Person>>(
+      "/people/families/unassigned-people/",
+      { params }
+    ),
+  summary: (params?: { branch?: number | string }) =>
+    api.get<FamiliesSummary>("/people/families/summary/", { params }),
+  getById: (id: string) => api.get<Family>(`/people/families/${id}/`),
+  create: (data: Partial<Family>) =>
+    api.post<Family>("/people/families/", data),
+  update: (id: string, data: Partial<Family>) =>
+    api.put<Family>(`/people/families/${id}/`, data),
+  patch: (id: string, data: Partial<Family>) =>
+    api.patch<Family>(`/people/families/${id}/`, data),
+  delete: (id: string) => api.delete(`/people/families/${id}/`),
+  addMember: (familyId: string, memberId: string) =>
+    api.post(`/people/families/${familyId}/members/`, { memberId }),
+  removeMember: (familyId: string, memberId: string) =>
+    api.delete(`/people/families/${familyId}/members/${memberId}/`),
+};
+
+export const moduleCoordinatorsApi = {
+  getAll: (params?: {
+    person?: number;
+    module?: string;
+    level?: string;
+    resource_type?: string;
+    search?: string;
+  }) =>
+    api.get<ModuleCoordinator[]>("/people/module-coordinators/", { params }),
+  getById: (id: number) =>
+    api.get<ModuleCoordinator>(`/people/module-coordinators/${id}/`),
+  create: (data: {
+    person: number;
+    module: ModuleCoordinator["module"];
+    level: ModuleCoordinator["level"];
+    resource_id?: number | null;
+    resource_type?: string;
+  }) => api.post<ModuleCoordinator>("/people/module-coordinators/", data),
+  bulkCreate: (
+    assignments: Array<{
+      person: number;
+      module: ModuleCoordinator["module"];
+      level: ModuleCoordinator["level"];
+      resource_id?: number | null;
+      resource_type?: string;
+    }>
+  ) =>
+    api.post<{
+      message: string;
+      created: ModuleCoordinator[];
+    }>("/people/module-coordinators/bulk-create/", { assignments }),
+  update: (
+    id: number,
+    data: Partial<{
+      person: number;
+      module: ModuleCoordinator["module"];
+      level: ModuleCoordinator["level"];
+      resource_id?: number | null;
+      resource_type?: string;
+    }>
+  ) => api.put<ModuleCoordinator>(`/people/module-coordinators/${id}/`, data),
+  patch: (
+    id: number,
+    data: Partial<{
+      person: number;
+      module: ModuleCoordinator["module"];
+      level: ModuleCoordinator["level"];
+      resource_id?: number | null;
+      resource_type?: string;
+    }>
+  ) => api.patch<ModuleCoordinator>(`/people/module-coordinators/${id}/`, data),
+  delete: (id: number) => api.delete(`/people/module-coordinators/${id}/`),
+};
+
+export const moduleSettingsApi = {
+  getAll: () => api.get<ModuleSetting[]>("/people/module-settings/"),
+  getById: (id: number) => api.get<ModuleSetting>(`/people/module-settings/${id}/`),
+  patch: (id: number, data: Partial<Pick<ModuleSetting, "is_enabled">>) =>
+    api.patch<ModuleSetting>(`/people/module-settings/${id}/`, data),
+};
+
+export const peopleAutomationSettingsApi = {
+  get: () =>
+    api.get<PeopleAutomationSetting>("/people/people-automation-settings/"),
+  patch: (
+    data: Partial<Pick<PeopleAutomationSetting, "auto_status_updates_enabled">>,
+  ) =>
+    api.patch<PeopleAutomationSetting>(
+      "/people/people-automation-settings/",
+      data,
+    ),
+};
+
+export const eventSettingsApi = {
+  get: () => api.get<EventSetting>("/events/settings/"),
+  patch: (
+    data: Partial<Pick<EventSetting, "member_self_checkin_enabled">>,
+  ) => api.patch<EventSetting>("/events/settings/", data),
+};
+
+export const branchesApi = {
+  getAll: (params?: {
+    is_headquarters?: boolean;
+    is_active?: boolean;
+    search?: string;
+  }) => api.get<Branch[]>("/people/branches/", { params }),
+  getById: (id: number | string) => api.get<Branch>(`/people/branches/${id}/`),
+  create: (data: Partial<Branch>) =>
+    api.post<Branch>("/people/branches/", data),
+  update: (id: number | string, data: Partial<Branch>) =>
+    api.put<Branch>(`/people/branches/${id}/`, data),
+  patch: (id: number | string, data: Partial<Branch>) =>
+    api.patch<Branch>(`/people/branches/${id}/`, data),
+  delete: (id: number | string) => api.delete(`/people/branches/${id}/`),
+};
+
+export type ClustersListParams = {
+  search?: string;
+  page?: number;
+  page_size?: number;
+  ordering?: string;
+  branch?: number | string;
+  branch_id?: number | string;
+  include_inactive?: boolean | string;
+  name?: string;
+  name__icontains?: string;
+  name__istartswith?: string;
+  name__iendswith?: string;
+  name_ne?: string;
+  code?: string;
+  code__icontains?: string;
+  code__istartswith?: string;
+  location?: string;
+  location__icontains?: string;
+  meeting_schedule__icontains?: string;
+  member_count?: number | string;
+  member_count_min?: number | string;
+  member_count_max?: number | string;
+  visitor_count?: number | string;
+  visitor_count_min?: number | string;
+  visitor_count_max?: number | string;
+  family_count?: number | string;
+  family_count_min?: number | string;
+  family_count_max?: number | string;
+};
+
+export type ClustersListResponse = PaginatedResponse<Cluster> | Cluster[];
+
+export type ClustersSummary = {
+  cluster_count: number;
+  member_count: number;
+  unassigned_count: number;
+};
+
+async function fetchAllClustersPages(
+  params: ClustersListParams = {}
+): Promise<Cluster[]> {
+  const all: Cluster[] = [];
+  let page = 1;
+  for (let i = 0; i < 500; i += 1) {
+    const { data } = await api.get<ClustersListResponse>("/clusters/clusters/", {
+      params: { ...params, page, page_size: 100 },
+    });
+    if (Array.isArray(data)) {
+      return data;
+    }
+    all.push(...(data.results ?? []));
+    if (!data.next) {
+      break;
+    }
+    page += 1;
+  }
+  return all;
+}
+
+export const clustersApi = {
+  /** Pages through clusters and returns every row (pickers / legacy callers). */
+  getAll: async (
+    params?: ClustersListParams
+  ): Promise<AxiosResponse<Cluster[]>> => {
+    const data = await fetchAllClustersPages(params ?? {});
+    return { data } as AxiosResponse<Cluster[]>;
+  },
+  list: (params?: ClustersListParams) =>
+    api.get<PaginatedResponse<Cluster>>("/clusters/clusters/", { params }),
+  unassignedPeople: (params?: {
+    search?: string;
+    page?: number;
+    page_size?: number;
+  }) =>
+    api.get<PaginatedResponse<Person>>(
+      "/clusters/clusters/unassigned-people/",
+      { params }
+    ),
+  summary: (params?: {
+    branch?: number | string;
+    branch_id?: number | string;
+    include_inactive?: boolean | string;
+  }) =>
+    api.get<ClustersSummary>("/clusters/clusters/summary/", { params }),
+  getStatusTally: (params: {
+    year?: number;
+    branch_id?: number | string;
+    months?: string;
+  }) =>
+    api.get<ClusterStatusTallyRow[]>("/clusters/clusters/status_tally/", {
+      params,
+    }),
+  getStatusTallyYears: (params: { branch_id?: number | string }) =>
+    api.get<{ years: number[]; default_year: number }>(
+      "/clusters/clusters/status_tally_years/",
+      { params },
+    ),
+  getStatusTallyDetail: (params: {
+    year?: number;
+    branch_id?: number | string;
+    months?: string;
+    status: ClusterStatusTallyStatus;
+    cluster?: number | string;
+    page?: number;
+    page_size?: number;
+  }) =>
+    api.get<PaginatedResponse<ClusterStatusTallyDetailRow>>(
+      "/clusters/clusters/status_tally_detail/",
+      { params },
+    ),
+  getById: (id: string | number) =>
+    api.get<Cluster>(`/clusters/clusters/${id}/`),
+  create: (data: ClusterInput) =>
+    api.post<Cluster>("/clusters/clusters/", data),
+  update: (id: string | number, data: Partial<ClusterInput>) =>
+    api.put<Cluster>(`/clusters/clusters/${id}/`, data),
+  patch: (id: string | number, data: Partial<ClusterInput>) =>
+    api.patch<Cluster>(`/clusters/clusters/${id}/`, data),
+  delete: (id: string | number) => api.delete(`/clusters/clusters/${id}/`),
+};
+
+export const clusterReportsApi = {
+  getAll: (params?: {
+    cluster?: string;
+    branch_id?: string | number;
+    year?: number;
+    week_number?: number;
+    gathering_type?: string;
+    submitted_by?: string;
+    month?: number;
+    page?: number;
+    page_size?: number;
+  }) =>
+    api.get<{
+      results: ClusterWeeklyReport[];
+      count: number;
+      next?: string;
+      previous?: string;
+    }>("/clusters/cluster-weekly-reports/", { params }),
+  getById: (id: string | number) =>
+    api.get<ClusterWeeklyReport>(`/clusters/cluster-weekly-reports/${id}/`),
+  create: (data: ClusterWeeklyReportInput) =>
+    api.post<ClusterWeeklyReport>("/clusters/cluster-weekly-reports/", data),
+  update: (id: string | number, data: Partial<ClusterWeeklyReportInput>) =>
+    api.put<ClusterWeeklyReport>(
+      `/clusters/cluster-weekly-reports/${id}/`,
+      data
+    ),
+  patch: (id: string, data: Partial<ClusterWeeklyReportInput>) =>
+    api.patch<ClusterWeeklyReport>(
+      `/clusters/cluster-weekly-reports/${id}/`,
+      data
+    ),
+  delete: (id: string) => api.delete(`/clusters/cluster-weekly-reports/${id}/`),
+  analytics: (params?: {
+    cluster?: string;
+    branch_id?: string | number;
+    year?: number;
+    week_number?: number | string;
+    gathering_type?: string;
+    month?: number | string;
+  }) =>
+    api.get<ClusterAnalytics>("/clusters/cluster-weekly-reports/analytics/", {
+      params,
+    }),
+  distinctYears: (params?: {
+    branch_id?: string | number;
+    cluster?: string;
+    gathering_type?: string;
+  }) =>
+    api.get<{ years: number[] }>(
+      "/clusters/cluster-weekly-reports/distinct_years/",
+      { params },
+    ),
+  overdue: () =>
+    api.get<OverdueClusters>("/clusters/cluster-weekly-reports/overdue/"),
+  compliance: (params?: {
+    start_date?: string;
+    end_date?: string;
+    branch_id?: number;
+    coordinator_id?: number;
+    status?: 'COMPLIANT' | 'NON_COMPLIANT' | 'PARTIAL';
+    min_compliance_rate?: number;
+  }) => api.get<ComplianceData>('/clusters/cluster-weekly-reports/compliance/', { params }),
+  atRisk: (params?: { weeks_back?: number }) => 
+    api.get<AtRiskCluster[]>('/clusters/cluster-weekly-reports/at_risk/', { params }),
+  complianceHistory: (params?: { 
+    months?: number; 
+    cluster_id?: number;
+    coordinator_id?: number;
+    group_by?: 'week' | 'month';
+  }) => api.get<ComplianceHistory>('/clusters/cluster-weekly-reports/compliance_history/', { params }),
+  addComplianceNote: (data: {
+    cluster_id: number;
+    note: string;
+    period_start: string;
+    period_end: string;
+  }) => api.post<ComplianceNote>('/clusters/cluster-weekly-reports/add_compliance_note/', data),
+  getComplianceNotes: (params?: {
+    cluster_id?: number;
+    start_date?: string;
+    end_date?: string;
+  }) => api.get<ComplianceNote[]>('/clusters/cluster-weekly-reports/compliance_notes/', { params }),
+  exportComplianceCSV: (params?: {
+    start_date?: string;
+    end_date?: string;
+    branch_id?: number;
+    coordinator_id?: number;
+    status?: 'COMPLIANT' | 'NON_COMPLIANT' | 'PARTIAL';
+    min_compliance_rate?: number;
+  }) => api.get('/clusters/cluster-weekly-reports/compliance_export_csv/', { params, responseType: 'blob' }),
+  exportCompliancePDF: (params?: {
+    start_date?: string;
+    end_date?: string;
+    branch_id?: number;
+    coordinator_id?: number;
+    status?: 'COMPLIANT' | 'NON_COMPLIANT' | 'PARTIAL';
+    min_compliance_rate?: number;
+  }) => api.get('/clusters/cluster-weekly-reports/compliance_export_pdf/', { params, responseType: 'blob' }),
+};
+
+export const eventsApi = {
+  getAll: (params?: {
+    include_attendance?: boolean;
+    attendance_date?: string;
+    start?: string;
+    end?: string;
+    type?: string;
+    search?: string;
+    booking_status?: "pending" | "approved";
+    page?: number;
+    page_size?: number;
+  }) =>
+    api.get<Event[]>("/events/", {
+      params,
+    }),
+  listTypes: () => api.get<EventTypeOption[]>("/events/types/"),
+  getById: (
+    id: string,
+    params?: { include_attendance?: boolean; attendance_date?: string }
+  ) =>
+    api.get<Event>(`/events/${id}/`, {
+      params,
+    }),
+  create: (data: Partial<Event>) => api.post<Event>("/events/", data),
+  update: (id: string, data: Partial<Event>) =>
+    api.put<Event>(`/events/${id}/`, data),
+  delete: (id: string) => api.delete(`/events/${id}/`),
+  excludeOccurrence: (id: string, payload: { date: string }) =>
+    api.post<Event>(`/events/${id}/exclude-occurrence/`, payload),
+  endRecurrence: (id: string, payload: { date: string }) =>
+    api.post<Event>(`/events/${id}/end-recurrence/`, payload),
+  splitEdit: (
+    id: string,
+    payload: Partial<Event> & { scope: "occurrence" | "following"; date: string }
+  ) =>
+    api.post<{ event: Event; created_event: Event }>(
+      `/events/${id}/split-edit/`,
+      payload
+    ),
+  approve: (id: string, payload?: { review_note?: string }) =>
+    api.post<Event>(`/events/${id}/approve/`, payload ?? {}),
+  reject: (id: string, payload?: { review_note?: string }) =>
+    api.post<Event>(`/events/${id}/reject/`, payload ?? {}),
+  listAttendance: (id: string, params?: { occurrence_date?: string }) =>
+    api.get<EventAttendanceRecord[]>(`/events/${id}/attendance/`, {
+      params,
+    }),
+  addAttendance: (
+    id: string,
+    payload: {
+      person_id: string;
+      occurrence_date: string;
+      status?: AttendanceStatus;
+      notes?: string;
+      attendance_mode?: AttendanceMode;
+      attendance_venue?: string | null;
+    }
+  ) =>
+    api.post<{
+      attendance_record: EventAttendanceRecord;
+      event: Event;
+      detail?: string;
+    }>(`/events/${id}/attendance/`, payload),
+  removeAttendance: (id: string, attendanceId: number | string) =>
+    api.delete<{ event: Event }>(`/events/${id}/attendance/${attendanceId}/`),
+  updateAttendance: (
+    id: string,
+    attendanceId: number | string,
+    payload: {
+      attendance_mode?: AttendanceMode;
+      attendance_venue?: string | null;
+      status?: AttendanceStatus;
+      notes?: string;
+    }
+  ) =>
+    api.patch<{
+      attendance_record: EventAttendanceRecord;
+      event: Event;
+    }>(`/events/${id}/attendance/${attendanceId}/`, payload),
+  selfCheckInSession: (params?: { event?: number | string }) =>
+    api.get<SelfCheckInSessionResponse>("/events/self-check-in/session/", {
+      params: params?.event ? { event: params.event } : undefined,
+    }),
+  selfCheckIn: (payload: {
+    person_ids: Array<number | string>;
+    event_id?: number | string;
+    attendance_venue?: string;
+  }) =>
+    api.post<SelfCheckInSessionResponse>("/events/self-check-in/", payload),
+  undoSelfCheckIn: (payload: {
+    person_ids: Array<number | string>;
+    event_id?: number | string;
+  }) =>
+    api.post<SelfCheckInSessionResponse>("/events/self-check-in/undo/", payload),
+  searchSelfCheckInVisitors: (
+    query: string,
+    params?: { event?: number | string }
+  ) =>
+    api.get<{ query: string; results: SelfCheckInVisitorMatch[] }>(
+      "/events/self-check-in/visitors/",
+      {
+        params: {
+          q: query,
+          ...(params?.event ? { event: params.event } : {}),
+        },
+      }
+    ),
+  selfCheckInVisitor: (payload: SelfCheckInVisitorWrite) =>
+    api.post<{
+      created_person: boolean;
+      already_checked_in: boolean;
+      person: SelfCheckInVisitorMatch;
+      attendance_record?: EventAttendanceRecord;
+      detail?: string;
+      matches?: SelfCheckInVisitorMatch[];
+    }>("/events/self-check-in/visitors/", payload),
+  searchSelfCheckInInviters: (
+    query: string,
+    params?: { event?: number | string }
+  ) =>
+    api.get<{ query: string; results: SelfCheckInInviter[] }>(
+      "/events/self-check-in/inviters/",
+      {
+        params: {
+          q: query,
+          ...(params?.event ? { event: params.event } : {}),
+        },
+      }
+    ),
+  onsiteGuestSession: (params?: {
+    event?: number | string;
+    occurrence?: string;
+  }) =>
+    api.get<OnsiteGuestSessionResponse>(
+      "/events/onsite-guest/session/",
+      {
+        params: {
+          ...(params?.event ? { event: params.event } : {}),
+          ...(params?.occurrence ? { occurrence: params.occurrence } : {}),
+        },
+      }
+    ),
+  searchOnsiteGuestVisitors: (
+    query: string,
+    params?: { event?: number | string; occurrence?: string }
+  ) =>
+    api.get<{ query: string; results: OnsiteGuestVisitorMatch[] }>(
+      "/events/onsite-guest/visitors/",
+      {
+        params: {
+          q: query,
+          ...(params?.event ? { event: params.event } : {}),
+          ...(params?.occurrence ? { occurrence: params.occurrence } : {}),
+        },
+      }
+    ),
+  onsiteGuestVisitor: (payload: OnsiteGuestVisitorWrite) =>
+    api.post<{
+      created_person: boolean;
+      already_checked_in: boolean;
+      person: OnsiteGuestVisitorMatch;
+      attendance_record?: EventAttendanceRecord;
+      detail?: string;
+      matches?: OnsiteGuestVisitorMatch[];
+    }>("/events/onsite-guest/visitors/", payload),
+  searchOnsiteGuestInviters: (
+    query: string,
+    params?: { event?: number | string; occurrence?: string }
+  ) =>
+    api.get<{ query: string; results: OnsiteGuestInviter[] }>(
+      "/events/onsite-guest/inviters/",
+      {
+        params: {
+          q: query,
+          ...(params?.event ? { event: params.event } : {}),
+          ...(params?.occurrence ? { occurrence: params.occurrence } : {}),
+        },
+      }
+    ),
+};
+
+export const publicSelfCheckInApi = {
+  session: (params?: { event?: number | string }) =>
+    publicApi.get<PublicSelfCheckInSessionResponse>(
+      "/events/self-check-in/public/session/",
+      {
+        params: params?.event ? { event: params.event } : undefined,
+      }
+    ),
+  identify: (payload: { member_id: string; event_id?: number | string }) =>
+    publicApi.post<PublicSelfCheckInSessionResponse>(
+      "/events/self-check-in/public/identify/",
+      payload
+    ),
+  checkIn: (payload: {
+    member_id: string;
+    attendance_venue?: string;
+    event_id?: number | string;
+  }) =>
+    publicApi.post<PublicSelfCheckInSessionResponse>(
+      "/events/self-check-in/public/",
+      payload
+    ),
+};
+
+export const eventRegistrationApi = {
+  listTiers: (eventId: number | string) =>
+    api.get<EventRegistrationTier[]>(
+      `/events/${eventId}/registration-tiers/`
+    ),
+  createTier: (
+    eventId: number | string,
+    data: Partial<EventRegistrationTier>
+  ) =>
+    api.post<EventRegistrationTier>(
+      `/events/${eventId}/registration-tiers/`,
+      data
+    ),
+  updateTier: (
+    eventId: number | string,
+    tierId: number | string,
+    data: Partial<EventRegistrationTier>
+  ) =>
+    api.patch<EventRegistrationTier>(
+      `/events/${eventId}/registration-tiers/${tierId}/`,
+      data
+    ),
+  deleteTier: (eventId: number | string, tierId: number | string) =>
+    api.delete(`/events/${eventId}/registration-tiers/${tierId}/`),
+  listRegistrations: (eventId: number | string) =>
+    api.get<EventRegistration[]>(`/events/${eventId}/registrations/`),
+  requestRegistration: (
+    eventId: number | string,
+    data: {
+      person: number;
+      mode: AttendanceMode;
+      tier?: number | null;
+      occurrence_date?: string | null;
+      allow_capacity_override?: boolean;
+    }
+  ) =>
+    api.post<EventRegistration>(
+      `/events/${eventId}/registrations/request/`,
+      data
+    ),
+  getRegistration: (registrationId: number | string) =>
+    api.get<EventRegistration>(`/events/registrations/${registrationId}/`),
+  updateRegistration: (
+    registrationId: number | string,
+    data: Partial<EventRegistration>
+  ) =>
+    api.patch<EventRegistration>(
+      `/events/registrations/${registrationId}/`,
+      data
+    ),
+  cancelRegistration: (registrationId: number | string) =>
+    api.post<EventRegistration>(
+      `/events/registrations/${registrationId}/cancel/`,
+      {}
+    ),
+  refundRegistration: (registrationId: number | string) =>
+    api.post<EventRegistration>(
+      `/events/registrations/${registrationId}/refund/`,
+      {}
+    ),
+  listPayments: (registrationId: number | string) =>
+    api.get<EventRegistrationPayment[]>(
+      `/events/registrations/${registrationId}/payments/`
+    ),
+  addPayment: (
+    registrationId: number | string,
+    data: {
+      amount: string | number;
+      method: EventRegistrationPaymentMethod;
+      paid_at?: string;
+      note?: string;
+    }
+  ) =>
+    api.post<EventRegistrationPayment>(
+      `/events/registrations/${registrationId}/payments/`,
+      data
+    ),
+};
+
+export const eventTypesApi = {
+  list: () => api.get<EventTypeOption[]>("/event-types/"),
+  create: (data: {
+    code: string;
+    label: string;
+    color: string;
+    sort_order: number;
+  }) => api.post<EventTypeOption>("/event-types/", data),
+  update: (
+    code: string,
+    data: Partial<{
+      label: string;
+      color: string;
+      sort_order: number;
+    }>
+  ) => api.patch<EventTypeOption>(`/event-types/${encodeURIComponent(code)}/`, data),
+  delete: (code: string) =>
+    api.delete(`/event-types/${encodeURIComponent(code)}/`),
+};
+
+export const attendanceVenuesApi = {
+  list: (params?: { active?: boolean | string }) =>
+    api.get<AttendanceVenueOption[]>("/attendance-venues/", { params }),
+  create: (data: {
+    code: string;
+    label: string;
+    color: string;
+    sort_order: number;
+    is_active?: boolean;
+  }) => api.post<AttendanceVenueOption>("/attendance-venues/", data),
+  update: (
+    code: string,
+    data: Partial<{
+      label: string;
+      color: string;
+      sort_order: number;
+      is_active: boolean;
+    }>
+  ) =>
+    api.patch<AttendanceVenueOption>(
+      `/attendance-venues/${encodeURIComponent(code)}/`,
+      data
+    ),
+  delete: (code: string) =>
+    api.delete(`/attendance-venues/${encodeURIComponent(code)}/`),
+};
+
+export type EventRoomWrite = {
+  branch: number;
+  name: string;
+  capacity?: number | null;
+  notes?: string;
+  is_active?: boolean;
+  sort_order?: number;
+};
+
+export const eventRoomsApi = {
+  list: (params?: { branch?: number | string; is_active?: boolean }) =>
+    api.get<EventRoom[]>("/event-rooms/", { params }),
+  getById: (id: number | string) => api.get<EventRoom>(`/event-rooms/${id}/`),
+  create: (data: EventRoomWrite) => api.post<EventRoom>("/event-rooms/", data),
+  update: (id: number | string, data: Partial<EventRoomWrite>) =>
+    api.patch<EventRoom>(`/event-rooms/${id}/`, data),
+  delete: (id: number | string) => api.delete(`/event-rooms/${id}/`),
+};
+
+export const attendanceApi = {
+  getAll: (params?: {
+    event?: string;
+    person?: string;
+    occurrence_date?: string;
+    status?: AttendanceStatus;
+  }) =>
+    api.get<EventAttendanceRecord[]>("/attendance/", {
+      params,
+    }),
+  byEvent: (eventId: string, params?: { occurrence_date?: string }) =>
+    api.get<EventAttendanceRecord[]>(`/attendance/by-event/${eventId}/`, {
+      params,
+    }),
+  create: (data: {
+    event_id: string;
+    person_id: string;
+    occurrence_date: string;
+    status?: AttendanceStatus;
+    notes?: string;
+  }) => api.post<EventAttendanceRecord>("/attendance/", data),
+  update: (
+    id: string | number,
+    data: Partial<{
+      status: AttendanceStatus;
+      notes: string;
+      occurrence_date: string;
+    }>
+  ) => api.put<EventAttendanceRecord>(`/attendance/${id}/`, data),
+  delete: (id: string | number) => api.delete(`/attendance/${id}/`),
+};
+
+export const journeysApi = {
+  getAll: () => api.get<Journey[]>("/people/journeys/"),
+  getById: (id: string) => api.get<Journey>(`/people/journeys/${id}/`),
+  create: (data: Partial<Journey>) =>
+    api.post<Journey>("/people/journeys/", data),
+  update: (id: string, data: Partial<Journey>) =>
+    api.put<Journey>(`/people/journeys/${id}/`, data),
+  delete: (id: string) => api.delete(`/people/journeys/${id}/`),
+  getByUser: (userId: string) =>
+    api.get<Journey[]>(`/people/journeys/?user=${userId}`),
+};
+
+export const lessonsApi = {
+  getAll: (params?: { include_superseded?: boolean }) =>
+    api.get<Lesson[]>("/lessons/lessons/", { params }),
+  create: (data: Partial<Lesson>) =>
+    api.post<Lesson>("/lessons/lessons/", data),
+  update: (id: number | string, data: Partial<Lesson>) =>
+    api.put<Lesson>(`/lessons/lessons/${id}/`, data),
+  patch: (id: number | string, data: Partial<Lesson>) =>
+    api.patch<Lesson>(`/lessons/lessons/${id}/`, data),
+  delete: (id: number | string) => api.delete(`/lessons/lessons/${id}/`),
+  getProgress: (params?: {
+    person?: string | number;
+    lesson?: string | number;
+    status?: string;
+    branch_id?: string | number;
+  }) =>
+    api.get<PersonLessonProgress[]>("/lessons/progress/", {
+      params,
+    }),
+  updateProgress: (id: number | string, data: Partial<PersonLessonProgress>) =>
+    api.patch<PersonLessonProgress>(`/lessons/progress/${id}/`, data),
+  assign: (payload: {
+    lesson_id: number | string;
+    person_ids: Array<number | string>;
+    teacher_id?: number | string;
+  }) => api.post<{ created: number }>("/lessons/progress/assign/", payload),
+  listEnrollments: (params?: {
+    student?: string | number;
+    teacher?: string | number;
+    branch_id?: string | number;
+  }) =>
+    api.get<LessonStudentEnrollment[]>("/lessons/enrollments/", { params }),
+  createEnrollment: (payload: {
+    student_id: number | string;
+    teacher_id: number | string;
+    note?: string;
+  }) => api.post<LessonStudentEnrollment>("/lessons/enrollments/", payload),
+  transferEnrollment: (
+    id: number | string,
+    payload: { teacher_id: number | string; note?: string }
+  ) =>
+    api.post<LessonStudentEnrollment>(
+      `/lessons/enrollments/${id}/transfer/`,
+      payload
+    ),
+  setEnrollmentCommitment: (
+    id: number | string,
+    payload: { commitment_signed: boolean; note?: string }
+  ) =>
+    api.post<LessonStudentEnrollment>(
+      `/lessons/enrollments/${id}/commitment/`,
+      payload
+    ),
+  listEnrollmentTransfers: (id: number | string) =>
+    api.get<LessonTeacherTransfer[]>(`/lessons/enrollments/${id}/transfers/`),
+  listTeachers: (params?: { branch_id?: string | number }) =>
+    api.get<LessonTeacherRosterEntry[]>("/lessons/teachers/", { params }),
+  complete: (
+    id: number | string,
+    payload: {
+      note?: string;
+      completed_at?: string;
+      completed_by?: number | string;
+    }
+  ) =>
+    api.post<PersonLessonProgress>(
+      `/lessons/progress/${id}/complete/`,
+      payload
+    ),
+  summary: (params?: {
+    lesson?: string | number;
+    version_label?: string;
+    include_superseded?: boolean;
+    year?: number;
+    branch_id?: string | number;
+  }) =>
+    api.get<LessonProgressSummary>("/lessons/progress/summary/", { params }),
+  listSessionReports: (params?: {
+    lesson?: string | number;
+    student?: string | number;
+    teacher?: string | number;
+    date_from?: string;
+    date_to?: string;
+    branch_id?: string | number;
+  }) => api.get<LessonSessionReport[]>("/lessons/session-reports/", { params }),
+  getSessionReport: (id: number | string) =>
+    api.get<LessonSessionReport>(`/lessons/session-reports/${id}/`),
+  createSessionReport: (payload: LessonSessionReportInput) =>
+    api.post<LessonSessionReport>("/lessons/session-reports/", payload),
+  updateSessionReport: (
+    id: number | string,
+    payload: Partial<LessonSessionReportInput>
+  ) => api.put<LessonSessionReport>(`/lessons/session-reports/${id}/`, payload),
+  deleteSessionReport: (id: number | string) =>
+    api.delete(`/lessons/session-reports/${id}/`),
+  getCommitmentForm: () =>
+    api.get<LessonCommitmentSettings>("/lessons/lessons/commitment-form/"),
+  uploadCommitmentForm: (formData: FormData) =>
+    api.post<LessonCommitmentSettings>(
+      "/lessons/lessons/commitment-form/",
+      formData,
+      {
+        headers: { "Content-Type": "multipart/form-data" },
+      }
+    ),
+  uploadNccLessonsPdf: (formData: FormData) =>
+    api.post<LessonCommitmentSettings>(
+      "/lessons/lessons/ncc-lessons-pdf/",
+      formData,
+      {
+        headers: { "Content-Type": "multipart/form-data" },
+      }
+    ),
+};
+
+export const ministriesApi = {
+  list: (params?: {
+    search?: string;
+    activity_cadence?: string;
+    category?: string;
+    is_active?: boolean;
+    code?: string;
+    is_system?: boolean;
+    branch?: number | string;
+  }) => api.get<Ministry[]>("/ministries/", { params }),
+  retrieve: (id: number | string) => api.get<Ministry>(`/ministries/${id}/`),
+  create: (data: MinistryCreateInput) =>
+    api.post<Ministry>("/ministries/", data),
+  update: (id: number | string, data: Partial<Ministry>) =>
+    api.put<Ministry>(`/ministries/${id}/`, data),
+  patch: (id: number | string, data: Partial<Ministry>) =>
+    api.patch<Ministry>(`/ministries/${id}/`, data),
+  delete: (id: number | string) => api.delete(`/ministries/${id}/`),
+};
+
+export const ministryMembersApi = {
+  list: (params?: {
+    ministry?: number | string;
+    role?: string;
+    is_active?: boolean;
+  }) => api.get<MinistryMember[]>("/ministries/members/", { params }),
+  create: (data: Partial<MinistryMember>) =>
+    api.post<MinistryMember>("/ministries/members/", data),
+  update: (id: number | string, data: Partial<MinistryMember>) =>
+    api.put<MinistryMember>(`/ministries/members/${id}/`, data),
+  delete: (id: number | string) => api.delete(`/ministries/members/${id}/`),
+};
+
+const mapDonation = (payload: any): Donation => ({
+  id: payload.id,
+  amount: Number(payload.amount ?? 0),
+  date: payload.date,
+  purpose: payload.purpose as DonationPurpose,
+  donorId: payload.donor ?? null,
+  donorName: payload.donor_name ?? payload.donorName ?? null,
+  notes: payload.notes ?? null,
+  paymentMethod: payload.payment_method as PaymentMethod,
+  isAnonymous: Boolean(payload.is_anonymous),
+  receiptNumber: payload.receipt_number,
+  recordedById: payload.recorded_by ?? null,
+  recordedByName: payload.recorded_by_name ?? null,
+  createdAt: payload.created_at,
+});
+
+const mapOffering = (payload: any): Offering => ({
+  id: payload.id,
+  serviceDate: payload.service_date,
+  serviceName: payload.service_name,
+  fund: payload.fund ?? null,
+  amount: Number(payload.amount ?? 0),
+  notes: payload.notes ?? null,
+  recordedByName: payload.recorded_by_name ?? null,
+  createdAt: payload.created_at,
+});
+
+const mapPledgeContribution = (payload: any): PledgeContribution => ({
+  id: payload.id,
+  pledgeId: payload.pledge,
+  contributorId: payload.contributor ?? null,
+  contributorName: payload.contributor_name ?? null,
+  amount: Number(payload.amount ?? 0),
+  contributionDate: payload.contribution_date,
+  note: payload.note ?? null,
+  recordedById: payload.recorded_by ?? null,
+  recordedByName: payload.recorded_by_name ?? null,
+  createdAt: payload.created_at,
+  updatedAt: payload.updated_at,
+});
+
+const mapPledge = (payload: any): Pledge => {
+  const pledgeAmount = Number(payload.pledge_amount ?? 0);
+  const contributionsTotal = Number(
+    payload.contributions_total ?? payload.amount_received ?? 0
+  );
+  const amountReceived = contributionsTotal;
+  const balance =
+    payload.balance !== undefined && payload.balance !== null
+      ? Number(payload.balance)
+      : pledgeAmount - amountReceived;
+  const contributions = Array.isArray(payload.contributions)
+    ? payload.contributions.map(mapPledgeContribution)
+    : [];
+  const progressPercent =
+    payload.progress_percent !== undefined && payload.progress_percent !== null
+      ? Number(payload.progress_percent)
+      : pledgeAmount
+      ? (amountReceived / pledgeAmount) * 100
+      : 0;
+
+  return {
+    id: payload.id,
+    pledgeTitle: payload.pledge_title,
+    pledgeAmount,
+    amountReceived,
+    contributionsTotal,
+    balance,
+    progressPercent,
+    startDate: payload.start_date,
+    targetDate: payload.target_date ?? null,
+    purpose: payload.purpose ?? null,
+    status: payload.status as PledgeStatus,
+    notes: payload.notes ?? null,
+    pledgerId: payload.pledger ?? null,
+    pledgerName: payload.pledger_name ?? null,
+    recordedByName: payload.recorded_by_name ?? null,
+    createdAt: payload.created_at,
+    updatedAt: payload.updated_at,
+    contributions,
+  };
+};
+
+const toDonationPayload = (donation: Partial<Donation>) => ({
+  donor: donation.donorId ?? null,
+  amount: donation.amount,
+  date: donation.date,
+  purpose: donation.purpose,
+  is_anonymous: donation.isAnonymous,
+  payment_method: donation.paymentMethod,
+  receipt_number: donation.receiptNumber,
+  notes: donation.notes,
+});
+
+const toOfferingPayload = (offering: Partial<Offering>) => ({
+  service_date: offering.serviceDate,
+  service_name: offering.serviceName,
+  fund: offering.fund,
+  amount: offering.amount,
+  notes: offering.notes,
+});
+
+const toPledgePayload = (pledge: Partial<Pledge>) => ({
+  pledger: pledge.pledgerId ?? null,
+  pledge_title: pledge.pledgeTitle,
+  pledge_amount: pledge.pledgeAmount,
+  amount_received: pledge.amountReceived ?? pledge.contributionsTotal ?? 0,
+  start_date: pledge.startDate,
+  target_date: pledge.targetDate,
+  purpose: pledge.purpose,
+  status: pledge.status,
+  notes: pledge.notes,
+});
+
+const toPledgeContributionPayload = (
+  pledgeId: number | string,
+  payload: PledgeContributionInput
+) => ({
+  pledge: pledgeId,
+  contributor: payload.contributorId ?? null,
+  amount: payload.amount,
+  contribution_date: payload.contributionDate,
+  note: payload.note,
+});
+
+export const financeApi = {
+  listDonations: (params?: { start?: string; end?: string }) =>
+    api
+      .get("/finance/donations/", { params })
+      .then(
+        (response) => (response.data as any[]).map(mapDonation) as Donation[]
+      ),
+  createDonation: (payload: Partial<Donation>) =>
+    api
+      .post("/finance/donations/", toDonationPayload(payload))
+      .then((response) => mapDonation(response.data)),
+  updateDonation: (id: number | string, payload: Partial<Donation>) =>
+    api
+      .put(`/finance/donations/${id}/`, toDonationPayload(payload))
+      .then((response) => mapDonation(response.data)),
+  deleteDonation: (id: number | string) =>
+    api.delete(`/finance/donations/${id}/`),
+  donationStats: (params?: { start?: string; end?: string }) =>
+    api.get("/finance/donations/stats/", { params }).then((response) => ({
+      totalAmount: Number(response.data.total_amount ?? 0),
+      donationCount: Number(response.data.donation_count ?? 0),
+      averageDonation: Number(response.data.average_donation ?? 0),
+      purposeBreakdown: response.data.purpose_breakdown ?? {},
+    })),
+  listOfferings: (params?: { start?: string; end?: string }) =>
+    api
+      .get("/finance/offerings/", { params })
+      .then(
+        (response) => (response.data as any[]).map(mapOffering) as Offering[]
+      ),
+  createOffering: (payload: Partial<Offering>) =>
+    api
+      .post("/finance/offerings/", toOfferingPayload(payload))
+      .then((response) => mapOffering(response.data)),
+  updateOffering: (id: number | string, payload: Partial<Offering>) =>
+    api
+      .put(`/finance/offerings/${id}/`, toOfferingPayload(payload))
+      .then((response) => mapOffering(response.data)),
+  deleteOffering: (id: number | string) =>
+    api.delete(`/finance/offerings/${id}/`),
+  weeklyOfferingSummary: (params?: { start?: string; end?: string }) =>
+    api.get("/finance/offerings/weekly_summary/", { params }).then((response) =>
+      (response.data as any[]).map(
+        (row) =>
+          ({
+            weekStart: row.week_start ?? row.weekStart ?? null,
+            totalAmount: Number(row.total_amount ?? row.totalAmount ?? 0),
+          } as OfferingWeeklySummary)
+      )
+    ),
+  listPledges: (params?: { status?: PledgeStatus | PledgeStatus[] }) =>
+    api
+      .get("/finance/pledges/", {
+        params: Array.isArray(params?.status)
+          ? { status: params?.status }
+          : params?.status
+          ? { status: [params.status] }
+          : undefined,
+      })
+      .then((response) => (response.data as any[]).map(mapPledge) as Pledge[]),
+  createPledge: (payload: Partial<Pledge>) =>
+    api
+      .post("/finance/pledges/", toPledgePayload(payload))
+      .then((response) => mapPledge(response.data)),
+  updatePledge: (id: number | string, payload: Partial<Pledge>) =>
+    api
+      .put(`/finance/pledges/${id}/`, toPledgePayload(payload))
+      .then((response) => mapPledge(response.data)),
+  deletePledge: (id: number | string) => api.delete(`/finance/pledges/${id}/`),
+  listPledgeContributions: (pledgeId: number | string) =>
+    api
+      .get("/finance/pledge-contributions/", {
+        params: { pledge: pledgeId },
+      })
+      .then((response) => {
+        const data = response.data;
+        if (!Array.isArray(data)) {
+          console.error("Expected array but got:", data);
+          return [];
+        }
+        return data.map(mapPledgeContribution) as PledgeContribution[];
+      }),
+  listAllPledgeContributions: (params?: { start?: string; end?: string }) =>
+    api
+      .get("/finance/pledge-contributions/", { params })
+      .then(
+        (response) =>
+          (response.data as any[]).map(
+            mapPledgeContribution
+          ) as PledgeContribution[]
+      ),
+  createPledgeContribution: (
+    pledgeId: number | string,
+    payload: PledgeContributionInput
+  ) =>
+    api
+      .post(
+        "/finance/pledge-contributions/",
+        toPledgeContributionPayload(pledgeId, payload)
+      )
+      .then((response) => mapPledgeContribution(response.data)),
+  updatePledgeContribution: (
+    id: number | string,
+    pledgeId: number | string,
+    payload: PledgeContributionInput
+  ) =>
+    api
+      .put(
+        `/finance/pledge-contributions/${id}/`,
+        toPledgeContributionPayload(pledgeId, payload)
+      )
+      .then((response) => mapPledgeContribution(response.data)),
+  deletePledgeContribution: (id: number | string) =>
+    api.delete(`/finance/pledge-contributions/${id}/`),
+  pledgeSummary: (params?: { status?: PledgeStatus[] }) =>
+    api
+      .get("/finance/pledges/summary/", {
+        params: params?.status ? { status: params.status } : undefined,
+      })
+      .then((response) =>
+        (response.data as any[]).map(
+          (row) =>
+            ({
+              id: row.id,
+              pledgeTitle: row.pledge_title ?? row.pledgeTitle,
+              pledgeAmount: Number(row.pledge_amount ?? row.pledgeAmount ?? 0),
+              amountReceived: Number(
+                row.amount_received ?? row.amountReceived ?? 0
+              ),
+              balance: Number(row.balance ?? 0),
+              progressPercent: Number(
+                row.progress_percent ?? row.progressPercent ?? 0
+              ),
+              status: (row.status ?? row.status) as PledgeStatus,
+            } as PledgeSummary)
+        )
+      ),
+};
+
+export const sundaySchoolApi = {
+  // Categories
+  listCategories: (params?: { is_active?: boolean }) =>
+    api.get<SundaySchoolCategory[]>("/sunday-school/categories/", { params }),
+  getCategory: (id: number | string) =>
+    api.get<SundaySchoolCategory>(`/sunday-school/categories/${id}/`),
+  createCategory: (data: Partial<SundaySchoolCategory>) =>
+    api.post<SundaySchoolCategory>("/sunday-school/categories/", data),
+  updateCategory: (id: number | string, data: Partial<SundaySchoolCategory>) =>
+    api.put<SundaySchoolCategory>(`/sunday-school/categories/${id}/`, data),
+  deleteCategory: (id: number | string) =>
+    api.delete(`/sunday-school/categories/${id}/`),
+
+  // Classes
+  listClasses: (params?: {
+    category?: number | string;
+    is_active?: boolean;
+    search?: string;
+    branch_id?: number | string;
+    branch?: number | string;
+  }) => api.get<SundaySchoolClass[]>("/sunday-school/classes/", { params }),
+  getClass: (id: number | string) =>
+    api.get<SundaySchoolClass>(`/sunday-school/classes/${id}/`),
+  createClass: (data: Partial<SundaySchoolClass>) =>
+    api.post<SundaySchoolClass>("/sunday-school/classes/", data),
+  updateClass: (id: number | string, data: Partial<SundaySchoolClass>) =>
+    api.put<SundaySchoolClass>(`/sunday-school/classes/${id}/`, data),
+  deleteClass: (id: number | string) =>
+    api.delete(`/sunday-school/classes/${id}/`),
+  enroll: (
+    classId: number | string,
+    payload: { person_ids: number[]; role: string }
+  ) =>
+    api.post<{ created: number; message: string }>(
+      `/sunday-school/classes/${classId}/enroll/`,
+      payload
+    ),
+  getClassSessions: (
+    classId: number | string,
+    params?: { date_from?: string; date_to?: string }
+  ) =>
+    api.get<SundaySchoolSession[]>(
+      `/sunday-school/classes/${classId}/sessions/`,
+      { params }
+    ),
+  getClassAttendance: (
+    classId: number | string,
+    params?: { occurrence_date?: string }
+  ) =>
+    api.get<any[]>(`/sunday-school/classes/${classId}/attendance/`, {
+      params,
+    }),
+  summary: (params?: { year?: number; month?: number }) =>
+    api.get<SundaySchoolSummary>("/sunday-school/classes/summary/", {
+      params,
+    }),
+  unenrolledByCategory: (params?: { status?: string; role?: string }) =>
+    api.get<UnenrolledByCategory[]>(
+      "/sunday-school/classes/unenrolled_by_category/",
+      { params }
+    ),
+
+  // Members
+  listMembers: (params?: {
+    sunday_school_class?: number | string;
+    role?: string;
+    is_active?: boolean;
+  }) =>
+    api.get<SundaySchoolClassMember[]>("/sunday-school/members/", { params }),
+  getMember: (id: number | string) =>
+    api.get<SundaySchoolClassMember>(`/sunday-school/members/${id}/`),
+  createMember: (data: Partial<SundaySchoolClassMember>) =>
+    api.post<SundaySchoolClassMember>("/sunday-school/members/", data),
+  updateMember: (id: number | string, data: Partial<SundaySchoolClassMember>) =>
+    api.put<SundaySchoolClassMember>(`/sunday-school/members/${id}/`, data),
+  deleteMember: (id: number | string) =>
+    api.delete(`/sunday-school/members/${id}/`),
+
+  // Sessions
+  listSessions: (params?: {
+    sunday_school_class?: number | string;
+    session_date?: string;
+    search?: string;
+  }) => api.get<SundaySchoolSession[]>("/sunday-school/sessions/", { params }),
+  getSession: (id: number | string) =>
+    api.get<SundaySchoolSession>(`/sunday-school/sessions/${id}/`),
+  createSession: (data: Partial<SundaySchoolSession>) =>
+    api.post<SundaySchoolSession>("/sunday-school/sessions/", data),
+  updateSession: (id: number | string, data: Partial<SundaySchoolSession>) =>
+    api.put<SundaySchoolSession>(`/sunday-school/sessions/${id}/`, data),
+  deleteSession: (id: number | string) =>
+    api.delete(`/sunday-school/sessions/${id}/`),
+  getSessionAttendanceReport: (id: number | string) =>
+    api.get<AttendanceReport>(
+      `/sunday-school/sessions/${id}/attendance_report/`
+    ),
+  createRecurringSessions: (payload: RecurringSessionData) =>
+    api.post<{ created: number; sessions: SundaySchoolSession[] }>(
+      "/sunday-school/sessions/create_recurring/",
+      payload
+    ),
+};
+
+export type EvangelismGroupApprovalStatus = "pending" | "approved" | "rejected";
+
+export type EvangelismGroupsListParams = {
+  search?: string;
+  page?: number;
+  page_size?: number;
+  ordering?: string;
+  cluster?: number | string;
+  branch?: number | string;
+  is_active?: boolean;
+  name?: string;
+  name__icontains?: string;
+  name__istartswith?: string;
+  name__iendswith?: string;
+  name_ne?: string;
+  description?: string;
+  description__icontains?: string;
+  description__istartswith?: string;
+  description__iendswith?: string;
+  location?: string;
+  location__icontains?: string;
+  meeting_schedule__icontains?: string;
+  coordinator?: string;
+  coordinator__icontains?: string;
+  cluster_code?: string;
+  cluster_code__icontains?: string;
+  cluster_code__istartswith?: string;
+  member_count?: number | string;
+  member_count_min?: number | string;
+  member_count_max?: number | string;
+  visitor_count?: number | string;
+  visitor_count_min?: number | string;
+  visitor_count_max?: number | string;
+  has_bible_sharers?: boolean;
+  approval_status?: EvangelismGroupApprovalStatus;
+};
+
+export type EvangelismProspectsListParams = {
+  invited_by?: number | string;
+  inviter_cluster?: number | string;
+  evangelism_group?: number | string;
+  pipeline_stage?: string;
+  endorsed_cluster?: number | string;
+  is_dropped_off?: boolean;
+  branch?: number | string;
+  cluster?: number | string;
+  source?: string;
+  search?: string;
+  person_isnull?: boolean;
+  page?: number;
+  page_size?: number;
+};
+
+async function fetchAllPaginatedRows<T>(
+  path: string,
+  params: Record<string, unknown> = {},
+): Promise<T[]> {
+  const all: T[] = [];
+  let page = 1;
+  for (let i = 0; i < 500; i += 1) {
+    const { data } = await api.get<PaginatedResponse<T> | T[]>(path, {
+      params: { ...params, page, page_size: 100 },
+    });
+    if (Array.isArray(data)) {
+      return data;
+    }
+    all.push(...(data.results ?? []));
+    if (!data.next) {
+      break;
+    }
+    page += 1;
+  }
+  return all;
+}
+
+export const evangelismApi = {
+  // Groups
+  listGroups: (
+    params?: EvangelismGroupsListParams,
+    config?: { signal?: AbortSignal },
+  ) =>
+    api.get<PaginatedResponse<EvangelismGroup>>("/evangelism/groups/", {
+      params,
+      ...config,
+    }),
+  getAllGroups: async (
+    params?: EvangelismGroupsListParams,
+  ): Promise<AxiosResponse<EvangelismGroup[]>> => {
+    const data = await fetchAllPaginatedRows<EvangelismGroup>(
+      "/evangelism/groups/",
+      params ?? {},
+    );
+    return { data } as AxiosResponse<EvangelismGroup[]>;
+  },
+  getGroup: (id: number | string) =>
+    api.get<EvangelismGroup>(`/evangelism/groups/${id}/`),
+  createGroup: (data: EvangelismGroupWrite) =>
+    api.post<EvangelismGroup>("/evangelism/groups/", data),
+  updateGroup: (id: number | string, data: EvangelismGroupWrite) =>
+    api.patch<EvangelismGroup>(`/evangelism/groups/${id}/`, data),
+  deleteGroup: (id: number | string) => api.delete(`/evangelism/groups/${id}/`),
+  approveGroup: (id: number | string, data?: { review_note?: string; note?: string }) =>
+    api.post<EvangelismGroup>(`/evangelism/groups/${id}/approve/`, data || {}),
+  rejectGroup: (id: number | string, data?: { review_note?: string; note?: string }) =>
+    api.post<EvangelismGroup>(`/evangelism/groups/${id}/reject/`, data || {}),
+  enroll: (groupId: number | string, payload: BulkEnrollData) =>
+    api.post<{ created: number; message: string }>(
+      `/evangelism/groups/${groupId}/enroll/`,
+      payload
+    ),
+  getGroupSessions: (
+    groupId: number | string,
+    params?: { date_from?: string; date_to?: string }
+  ) =>
+    api.get<EvangelismSession[]>(`/evangelism/groups/${groupId}/sessions/`, {
+      params,
+    }),
+  getGroupConversions: (groupId: number | string) =>
+    api.get<Conversion[]>(`/evangelism/groups/${groupId}/conversions/`),
+  getGroupVisitors: (groupId: number | string) =>
+    api.get<Prospect[]>(`/evangelism/groups/${groupId}/visitors/`),
+  getGroupPreviousVisitors: (
+    groupId: number | string,
+    params: {
+      year: number;
+      week_number: number;
+      exclude_report?: number | string;
+    }
+  ) =>
+    api.get<{
+      previously_attended_visitor_ids: number[];
+      most_recent_visitor_ids: number[];
+      previously_attended_member_ids: number[];
+      most_recent_member_ids: number[];
+    }>(`/evangelism/groups/${groupId}/previous_visitors/`, { params }),
+  getGroupSummary: (groupId: number | string) =>
+    api.get<any>(`/evangelism/groups/${groupId}/summary/`),
+  getBibleSharersCoverage: (params?: { branch?: number | string }) =>
+    api.get<BibleSharersCoverage>("/evangelism/groups/bible_sharers_coverage/", {
+      params,
+    }),
+  getDashboardStats: (params?: { year?: number }) =>
+    api.get<EvangelismSummary>("/evangelism/groups/dashboard-stats/", { params }),
+
+  // Sessions
+  listSessions: (params?: {
+    evangelism_group?: number | string;
+    session_date?: string;
+    search?: string;
+  }) => api.get<EvangelismSession[]>("/evangelism/sessions/", { params }),
+  getSession: (id: number | string) =>
+    api.get<EvangelismSession>(`/evangelism/sessions/${id}/`),
+  createSession: (data: Partial<EvangelismSession>) =>
+    api.post<EvangelismSession>("/evangelism/sessions/", data),
+  updateSession: (id: number | string, data: Partial<EvangelismSession>) =>
+    api.put<EvangelismSession>(`/evangelism/sessions/${id}/`, data),
+  deleteSession: (id: number | string) =>
+    api.delete(`/evangelism/sessions/${id}/`),
+  getSessionAttendanceReport: (id: number | string) =>
+    api.get<any>(`/evangelism/sessions/${id}/attendance_report/`),
+  createRecurringSessions: (payload: EvangelismRecurringSessionData) =>
+    api.post<{ created: number; sessions: EvangelismSession[] }>(
+      "/evangelism/sessions/create_recurring/",
+      payload
+    ),
+
+  // Weekly Reports
+  listWeeklyReports: (params?: {
+    evangelism_group?: number | string;
+    cluster?: number | string;
+    branch?: number | string;
+    year?: number;
+    week_number?: number;
+    month?: number;
+    gathering_type?: string;
+    search?: string;
+    ordering?: string;
+    page?: number;
+    page_size?: number;
+  }) =>
+    api.get<PaginatedResponse<EvangelismWeeklyReport>>(
+      "/evangelism/weekly-reports/",
+      {
+        params,
+      }
+    ),
+  getAllWeeklyReports: async (params?: {
+    evangelism_group?: number | string;
+    cluster?: number | string;
+    branch?: number | string;
+    year?: number;
+    week_number?: number;
+    month?: number;
+    gathering_type?: string;
+    search?: string;
+    ordering?: string;
+  }): Promise<AxiosResponse<EvangelismWeeklyReport[]>> => {
+    const data = await fetchAllPaginatedRows<EvangelismWeeklyReport>(
+      "/evangelism/weekly-reports/",
+      params ?? {},
+    );
+    return { data } as AxiosResponse<EvangelismWeeklyReport[]>;
+  },
+  weeklyReportsDistinctYears: (params?: {
+    branch?: number | string;
+    cluster?: number | string;
+    evangelism_group?: number | string;
+    gathering_type?: string;
+  }) =>
+    api.get<{ years: number[] }>("/evangelism/weekly-reports/distinct_years/", {
+      params,
+    }),
+  getWeeklyReport: (id: number | string) =>
+    api.get<EvangelismWeeklyReport>(`/evangelism/weekly-reports/${id}/`),
+  createWeeklyReport: (data: Partial<EvangelismWeeklyReport>) =>
+    api.post<EvangelismWeeklyReport>("/evangelism/weekly-reports/", data),
+  updateWeeklyReport: (
+    id: number | string,
+    data: Partial<EvangelismWeeklyReport>
+  ) =>
+    api.put<EvangelismWeeklyReport>(`/evangelism/weekly-reports/${id}/`, data),
+  deleteWeeklyReport: (id: number | string) =>
+    api.delete(`/evangelism/weekly-reports/${id}/`),
+  getTally: (params?: {
+    cluster?: number | string;
+    year?: number;
+    week_number?: number;
+  }) =>
+    api.get<EvangelismTallyRow[]>("/evangelism/weekly-reports/tally/", {
+      params,
+    }),
+  getPeopleTally: (params?: {
+    year?: number;
+    branch?: number | string;
+    cluster?: number | string;
+    evangelism_group?: number | string;
+    group_by?: "month" | "cluster";
+    months?: string;
+  }) =>
+    api.get<EvangelismPeopleTallyRow[]>(
+      "/evangelism/weekly-reports/people_tally/",
+      { params }
+    ),
+  getPeopleTallyYears: (params?: {
+    branch?: number | string;
+    cluster?: number | string;
+    evangelism_group?: number | string;
+  }) =>
+    api.get<{ years: number[]; default_year: number }>(
+      "/evangelism/weekly-reports/people_tally_years/",
+      { params }
+    ),
+  getPeopleTallyDetail: (params: {
+    year?: number;
+    branch?: number | string;
+    cluster?: number | string;
+    evangelism_group?: number | string;
+    month?: number;
+    months?: string;
+    metric: "invited" | "attended" | "students" | "baptized" | "received_hg" | "reached" | "unique_hc";
+    page?: number;
+    page_size?: number;
+  }) =>
+    api.get<PaginatedResponse<EvangelismTallyDrilldownRow>>(
+      "/evangelism/weekly-reports/people_tally_detail/",
+      { params }
+    ),
+  getWeeklyTallyPeopleDetail: (params: {
+    year?: number;
+    week_number: number;
+    cluster_id: number | string;
+    metric: "members" | "visitors";
+    page?: number;
+    page_size?: number;
+  }) =>
+    api.get<PaginatedResponse<EvangelismTallyDrilldownRow>>(
+      "/evangelism/weekly-reports/tally_people_detail/",
+      { params }
+    ),
+
+  // Prospects
+  listProspects: (params?: EvangelismProspectsListParams) =>
+    api.get<PaginatedResponse<Prospect>>("/evangelism/prospects/", { params }),
+  getAllProspects: async (
+    params?: EvangelismProspectsListParams,
+  ): Promise<AxiosResponse<Prospect[]>> => {
+    const data = await fetchAllPaginatedRows<Prospect>(
+      "/evangelism/prospects/",
+      params ?? {},
+    );
+    return { data } as AxiosResponse<Prospect[]>;
+  },
+  getProspect: (id: number | string) =>
+    api.get<Prospect>(`/evangelism/prospects/${id}/`),
+  createProspect: (data: Partial<Prospect>) =>
+    api.post<Prospect>("/evangelism/prospects/", data),
+  updateProspect: (id: number | string, data: Partial<Prospect>) =>
+    api.put<Prospect>(`/evangelism/prospects/${id}/`, data),
+  patchProspect: (id: number | string, data: Partial<Prospect>) =>
+    api.patch<Prospect>(`/evangelism/prospects/${id}/`, data),
+  deleteProspect: (id: number | string) =>
+    api.delete(`/evangelism/prospects/${id}/`),
+  endorseToCluster: (id: number | string, payload: { cluster_id: number }) =>
+    api.post<Prospect>(
+      `/evangelism/prospects/${id}/endorse_to_cluster/`,
+      payload
+    ),
+  updateProgress: (
+    id: number | string,
+    payload: { pipeline_stage?: string; last_activity_date?: string }
+  ) =>
+    api.post<Prospect>(`/evangelism/prospects/${id}/update_progress/`, payload),
+  markAttended: (
+    id: number | string,
+    payload?: {
+      first_name?: string;
+      last_name?: string;
+      last_activity_date?: string;
+      first_activity_attended?: string;
+    }
+  ) =>
+    api.post<Prospect>(
+      `/evangelism/prospects/${id}/mark_attended/`,
+      payload || {}
+    ),
+  createPerson: (id: number | string, data: Partial<Person>) =>
+    api.post<Prospect>(`/evangelism/prospects/${id}/create_person/`, data),
+  markDroppedOff: (
+    id: number | string,
+    payload: { reason?: string; reason_details?: string }
+  ) =>
+    api.post<Prospect>(
+      `/evangelism/prospects/${id}/mark_dropped_off/`,
+      payload
+    ),
+  recover: (id: number | string) =>
+    api.post<Prospect>(`/evangelism/prospects/${id}/recover/`),
+
+  // Follow-up Tasks
+  listFollowUpTasks: (params?: {
+    prospect?: number | string;
+    assigned_to?: number | string;
+    status?: string;
+    priority?: string;
+  }) => api.get<FollowUpTask[]>("/evangelism/follow-up-tasks/", { params }),
+  getFollowUpTask: (id: number | string) =>
+    api.get<FollowUpTask>(`/evangelism/follow-up-tasks/${id}/`),
+  createFollowUpTask: (data: Partial<FollowUpTask>) =>
+    api.post<FollowUpTask>("/evangelism/follow-up-tasks/", data),
+  updateFollowUpTask: (id: number | string, data: Partial<FollowUpTask>) =>
+    api.put<FollowUpTask>(`/evangelism/follow-up-tasks/${id}/`, data),
+  deleteFollowUpTask: (id: number | string) =>
+    api.delete(`/evangelism/follow-up-tasks/${id}/`),
+  completeTask: (id: number | string) =>
+    api.post<FollowUpTask>(`/evangelism/follow-up-tasks/${id}/complete/`),
+  getOverdueTasks: () =>
+    api.get<FollowUpTask[]>("/evangelism/follow-up-tasks/overdue/"),
+
+  // Drop-offs
+  listDropOffs: (params?: {
+    drop_off_stage?: string;
+    reason?: string;
+    recovered?: boolean;
+    start_date?: string;
+    end_date?: string;
+  }) => api.get<DropOff[]>("/evangelism/drop-offs/", { params }),
+  getDropOff: (id: number | string) =>
+    api.get<DropOff>(`/evangelism/drop-offs/${id}/`),
+  recoverDropOff: (id: number | string) =>
+    api.post<DropOff>(`/evangelism/drop-offs/${id}/recover/`),
+  getDropOffAnalytics: (params?: { start_date?: string; end_date?: string }) =>
+    api.get<any>("/evangelism/drop-offs/analytics/", { params }),
+
+  // Conversions
+  listConversions: (params?: {
+    converted_by?: number | string;
+    cluster?: number | string;
+    evangelism_group?: number | string;
+    year?: number;
+    person?: number | string;
+    person_id__in?: string;
+    page?: number;
+    page_size?: number;
+  }) =>
+    api.get<PaginatedResponse<Conversion>>("/evangelism/conversions/", {
+      params,
+    }),
+  getAllConversions: async (params?: {
+    converted_by?: number | string;
+    cluster?: number | string;
+    evangelism_group?: number | string;
+    year?: number;
+    person?: number | string;
+    person_id__in?: string;
+  }): Promise<AxiosResponse<Conversion[]>> => {
+    const data = await fetchAllPaginatedRows<Conversion>(
+      "/evangelism/conversions/",
+      params ?? {},
+    );
+    return { data } as AxiosResponse<Conversion[]>;
+  },
+  getConversion: (id: number | string) =>
+    api.get<Conversion>(`/evangelism/conversions/${id}/`),
+  createConversion: (data: ConversionWritePayload) =>
+    api.post<Conversion>("/evangelism/conversions/", data),
+  updateConversion: (id: number | string, data: ConversionWritePayload) =>
+    api.patch<Conversion>(`/evangelism/conversions/${id}/`, data),
+  deleteConversion: (id: number | string) =>
+    api.delete(`/evangelism/conversions/${id}/`),
+
+  // Monthly Tracking
+  listMonthlyTracking: (params?: {
+    cluster?: number | string;
+    year?: number;
+    month?: number;
+    stage?: string;
+  }) =>
+    api.get<MonthlyConversionTracking[]>("/evangelism/monthly-tracking/", {
+      params,
+    }),
+  getMonthlyStatistics: (params?: {
+    cluster?: number | string;
+    year?: number;
+    month?: number;
+  }) =>
+    api.get<MonthlyStatistics[]>("/evangelism/monthly-tracking/statistics/", {
+      params,
+    }),
+
+  // Each 1 Reach 1 Goals
+  listGoals: (params?: {
+    cluster?: number | string;
+    cluster__branch?: number | string;
+    year?: number;
+    status?: string;
+    search?: string;
+    page?: number;
+    page_size?: number;
+  }) =>
+    api.get<PaginatedResponse<Each1Reach1Goal>>("/evangelism/each1reach1-goals/", { params }),
+  getGoal: (id: number | string) =>
+    api.get<Each1Reach1Goal>(`/evangelism/each1reach1-goals/${id}/`),
+  createGoal: (data: Partial<Each1Reach1Goal>) =>
+    api.post<Each1Reach1Goal>("/evangelism/each1reach1-goals/", data),
+  getGoalDefaultTarget: (params: { cluster_id: number | string; year?: number }) =>
+    api.get<{ cluster_id: number; year: number; target_conversions: number }>(
+      "/evangelism/each1reach1-goals/default_target/",
+      { params }
+    ),
+  updateGoal: (id: number | string, data: Partial<Each1Reach1Goal>) =>
+    api.put<Each1Reach1Goal>(`/evangelism/each1reach1-goals/${id}/`, data),
+  deleteGoal: (id: number | string) =>
+    api.delete(`/evangelism/each1reach1-goals/${id}/`),
+  getGoalProgress: (id: number | string) =>
+    api.get<any>(`/evangelism/each1reach1-goals/${id}/progress/`),
+  getMemberProgress: (id: number | string) =>
+    api.get<any[]>(`/evangelism/each1reach1-goals/${id}/member_progress/`),
+  getLeaderboard: (params?: { year?: number }) =>
+    api.get<Each1Reach1Goal[]>("/evangelism/each1reach1-goals/leaderboard/", {
+      params,
+    }),
+  getSummary: (params?: { year?: number }) =>
+    api.get<any>("/evangelism/each1reach1-goals/summary/", { params }),
+};
+
+// Authentication API
+export interface LoginResponse {
+  access: string;
+  refresh: string;
+  user: {
+    id: number;
+    username: string;
+    email: string;
+    first_name: string;
+    last_name: string;
+    middle_name?: string;
+    full_name: string;
+    role: string;
+    photo?: string;
+    branch?: number | null;
+    branch_name?: string | null;
+  };
+}
+
+export interface User {
+  id: number;
+  username: string;
+  email: string;
+  first_name: string;
+  last_name: string;
+  middle_name?: string;
+  full_name: string;
+  role: string;
+  photo?: string;
+  branch?: number | null;
+  branch_name?: string | null;
+  branch_is_headquarters?: boolean;
+  can_see_all_branches?: boolean;
+  can_manage_national_events?: boolean;
+  must_change_password?: boolean;
+  first_login?: boolean;
+  module_coordinator_assignments?: ModuleCoordinator[];
+  ncc_lessons_role?: "PRIMARY" | "SUPPORT" | null;
+  ncc_primary_at_headquarters?: boolean;
+  on_bible_sharers_roster?: boolean;
+}
+
+export interface PasswordResetRequest {
+  id: number;
+  user_id: number;
+  username: string;
+  email: string;
+  full_name: string;
+  requested_at: string;
+  approved_at: string | null;
+  approved_by_name: string | null;
+  rejected_at: string | null;
+  rejected_by_name: string | null;
+  status: "PENDING" | "APPROVED" | "REJECTED";
+  notes: string;
+}
+
+export interface LockedAccount {
+  user_id: number;
+  username: string;
+  email: string;
+  full_name: string;
+  failed_attempts: number;
+  locked_until: string | null;
+  lockout_count: number;
+  last_attempt: string;
+}
+
+export interface AuditLog {
+  id: number;
+  user_id: number | null;
+  username: string | null;
+  full_name: string | null;
+  action: string;
+  ip_address: string;
+  user_agent: string;
+  details: any;
+  timestamp: string;
+}
+
+export const authApi = {
+  login: (username: string, password: string, rememberMe: boolean = false) =>
+    api
+      .post<LoginResponse & { must_change_password?: boolean }>(
+        "/auth/login/",
+        {
+          username,
+          password,
+          remember_me: rememberMe,
+        }
+      )
+      .then((response) => {
+        const { access, refresh, user, must_change_password } = response.data;
+        tokenStorage.setTokens(access, refresh, rememberMe);
+        return {
+          access,
+          refresh,
+          user: {
+            ...user,
+            must_change_password: must_change_password || false,
+          },
+        };
+      }),
+
+  logout: () => {
+    // Prefer blacklisting the refresh token server-side before clearing storage.
+    // AuthContext still clears tokens in finally even if this fails.
+    const refresh = tokenStorage.getRefreshToken();
+    return api.post("/auth/logout/", refresh ? { refresh } : {});
+  },
+
+  refreshToken: () => {
+    const refresh = tokenStorage.getRefreshToken();
+    if (!refresh) {
+      return Promise.reject(new Error("No refresh token available"));
+    }
+    return api
+      .post<{ access: string; refresh?: string }>("/auth/token/refresh/", {
+        refresh,
+      })
+      .then((response) => {
+        const rememberMe = tokenStorage.getRememberMe();
+        const nextRefresh = response.data.refresh || refresh;
+        tokenStorage.setTokens(response.data.access, nextRefresh, rememberMe);
+        return response.data.access;
+      });
+  },
+
+  getCurrentUser: () => api.get<User>("/auth/me/"),
+
+  changePassword: (
+    oldPassword: string,
+    newPassword: string,
+    confirmPassword: string
+  ) => {
+    const data: any = {
+      new_password: newPassword,
+      confirm_password: confirmPassword,
+    };
+    if (oldPassword) {
+      data.old_password = oldPassword;
+    }
+    return api.post("/auth/change-password/", data);
+  },
+
+  updateProfile: (data: FormData | any) => {
+    if (data instanceof FormData) {
+      return api.patch("/auth/me/", data, {
+        headers: {
+          "Content-Type": "multipart/form-data",
+        },
+      });
+    }
+    return api.patch<User>("/auth/me/", data);
+  },
+
+  requestPasswordReset: (userId: number, notes?: string) =>
+    api.post("/auth/password-reset-request/", {
+      user_id: userId,
+      notes: notes || "",
+    }),
+
+  getPasswordResetRequests: (
+    status?: string,
+    page?: number,
+    page_size?: number,
+    search?: string
+  ) => {
+    const params: any = {};
+    if (status) params.status = status;
+    if (page) params.page = page;
+    if (page_size) params.page_size = page_size;
+    if (search) params.search = search;
+    return api.get<{
+      count: number;
+      page: number;
+      page_size: number;
+      results: PasswordResetRequest[];
+    }>("/auth/admin/password-reset-requests/", {
+      params,
+    });
+  },
+
+  approvePasswordReset: (requestId: number) =>
+    api.post(`/auth/admin/password-reset-requests/${requestId}/approve/`),
+
+  rejectPasswordReset: (requestId: number, notes: string) =>
+    api.post(`/auth/admin/password-reset-requests/${requestId}/reject/`, {
+      notes,
+    }),
+
+  adminResetPassword: (
+    userId: number,
+    data:
+      | { generate_temporary_password: true }
+      | { new_password: string }
+  ) =>
+    api.post<{
+      message: string;
+      username: string;
+      temporary_password?: string;
+    }>(`/auth/admin/users/${userId}/reset-password/`, data),
+
+  getLockedAccounts: (
+    page?: number,
+    page_size?: number,
+    search?: string,
+    lockout_count_filter?: string,
+    sort_by?: string,
+    sort_order?: string
+  ) => {
+    const params: any = {};
+    if (page) params.page = page;
+    if (page_size) params.page_size = page_size;
+    if (search) params.search = search;
+    if (lockout_count_filter)
+      params.lockout_count_filter = lockout_count_filter;
+    if (sort_by) params.sort_by = sort_by;
+    if (sort_order) params.sort_order = sort_order;
+    return api.get<{
+      count: number;
+      page: number;
+      page_size: number;
+      results: LockedAccount[];
+    }>("/auth/admin/locked-accounts/", {
+      params,
+    });
+  },
+
+  unlockAccount: (userId: number) =>
+    api.post(`/auth/admin/unlock-account/${userId}/`),
+
+  getAuditLogs: (filters?: {
+    user_id?: number;
+    action?: string;
+    start_date?: string;
+    end_date?: string;
+    page?: number;
+    page_size?: number;
+  }) => {
+    return api.get<{
+      count: number;
+      page: number;
+      page_size: number;
+      results: AuditLog[];
+    }>("/auth/admin/audit-logs/", { params: filters });
+  },
+
+  getAdminDashboardStats: () =>
+    api.get<{
+      pending_password_resets: number;
+      locked_accounts: number;
+      recent_activity: AuditLog[];
+    }>("/auth/admin/dashboard-stats/"),
+};
+
+export const reportsApi = {
+  /** Current user's reporting scope (branch selectability + options). */
+  getMeta: (params?: { branch_id?: number | string }) =>
+    api.get<ReportsScopeMeta>("/reports/meta/", { params }),
+  getOverviewSummary: (params?: {
+    branch_id?: number | string;
+    year?: number;
+    months?: number;
+  }) => api.get<OverviewSummary>("/reports/overview/", { params }),
+  getCompliance: (params?: {
+    branch_id?: number | string;
+    start_date?: string;
+    end_date?: string;
+    status?: string;
+    min_compliance_rate?: number;
+    coordinator_id?: number;
+  }) => api.get<ComplianceData>("/reports/compliance/", { params }),
+  getComplianceOverdue: (params?: { branch_id?: number | string }) =>
+    api.get<OverdueClusters>("/reports/compliance/overdue/", { params }),
+  getComplianceAtRisk: (params?: {
+    branch_id?: number | string;
+    weeks_back?: number;
+  }) => api.get<AtRiskCluster[]>("/reports/compliance/at-risk/", { params }),
+  getComplianceHistory: (params?: {
+    branch_id?: number | string;
+    months?: number;
+    group_by?: "week" | "month";
+    cluster_id?: number;
+    coordinator_id?: number;
+  }) => api.get<ComplianceHistory>("/reports/compliance/history/", { params }),
+  getComplianceNotes: (params?: {
+    branch_id?: number | string;
+    cluster_id?: number;
+    start_date?: string;
+    end_date?: string;
+  }) => api.get<ComplianceNote[]>("/reports/compliance/notes/", { params }),
+  addComplianceNote: (data: {
+    cluster_id: number;
+    note: string;
+    period_start: string;
+    period_end: string;
+  }) => api.post<ComplianceNote>("/reports/compliance/notes/", data),
+  exportComplianceCSV: (params?: {
+    branch_id?: number | string;
+    start_date?: string;
+    end_date?: string;
+    status?: string;
+  }) =>
+    api.get("/reports/compliance/export/csv/", {
+      params,
+      responseType: "blob",
+    }),
+  getPeopleSummary: (params?: {
+    branch_id?: number | string;
+    months?: number;
+  }) => api.get<PeopleSummary>("/reports/people/summary/", { params }),
+  exportPeopleCSV: (params?: {
+    branch_id?: number | string;
+    months?: number;
+  }) =>
+    api.get("/reports/people/export/csv/", {
+      params,
+      responseType: "blob",
+    }),
+  getEngagementSummary: (params?: {
+    branch_id?: number | string;
+    months?: number;
+  }) => api.get<EngagementSummary>("/reports/engagement/summary/", { params }),
+  exportEngagementCSV: (params?: {
+    branch_id?: number | string;
+    months?: number;
+  }) =>
+    api.get("/reports/engagement/export/csv/", {
+      params,
+      responseType: "blob",
+    }),
+  getNccSummary: (params?: { branch_id?: number | string; year?: number }) =>
+    api.get<NccSummary>("/reports/ncc/summary/", { params }),
+  exportNccCSV: (params?: { branch_id?: number | string; year?: number }) =>
+    api.get("/reports/ncc/export/csv/", {
+      params,
+      responseType: "blob",
+    }),
+  getCymSummary: (params?: {
+    branch_id?: number | string;
+    year?: number;
+    month?: number;
+  }) => api.get<CymSummary>("/reports/cym/summary/", { params }),
+  exportCymCSV: (params?: {
+    branch_id?: number | string;
+    year?: number;
+    month?: number;
+  }) =>
+    api.get("/reports/cym/export/csv/", {
+      params,
+      responseType: "blob",
+    }),
+  getV2bSummary: (params?: { branch_id?: number | string; year?: number }) =>
+    api.get<V2bSummary>("/reports/v2b/summary/", { params }),
+  exportV2bCSV: (params?: { branch_id?: number | string; year?: number }) =>
+    api.get("/reports/v2b/export/csv/", {
+      params,
+      responseType: "blob",
+    }),
+  getStewardshipSummary: (params?: { branch_id?: number | string; year?: number }) =>
+    api.get<StewardshipSummary>("/reports/stewardship/summary/", { params }),
+  exportStewardshipCSV: (params?: { branch_id?: number | string; year?: number }) =>
+    api.get("/reports/stewardship/export/csv/", {
+      params,
+      responseType: "blob",
+    }),
+};
+
+export const notificationsApi = {
+  list: () => api.get<NotificationFeedResponse>("/notifications/"),
+  dismiss: (notificationKey: string) =>
+    api.post<NotificationFeedResponse>(
+      `/notifications/${encodeURIComponent(notificationKey)}/dismiss/`,
+    ),
+  dismissAll: () =>
+    api.post<NotificationFeedResponse>("/notifications/dismiss-all/"),
+};
+
+export default api;

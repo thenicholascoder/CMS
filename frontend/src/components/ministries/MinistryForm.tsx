@@ -1,0 +1,1383 @@
+"use client";
+
+import { ChangeEvent, FormEvent, useEffect, useMemo, useState } from "react";
+import Button from "@/src/components/ui/Button";
+import ErrorMessage from "@/src/components/ui/ErrorMessage";
+import ScalableSelect from "@/src/components/ui/ScalableSelect";
+import {
+  MinistryCadence,
+  MinistryCategory,
+  Ministry,
+  MinistryRole,
+  MinistryMember,
+  MinistryScope,
+} from "@/src/types/ministry";
+import { Person } from "@/src/types/person";
+import { useBranches } from "@/src/hooks/useBranches";
+import { useAuth } from "@/src/contexts/AuthContext";
+import { formatPersonName } from "@/src/lib/name";
+import { isSelectablePerson } from "@/src/lib/peopleSelectors";
+import {
+  formatPersonClusterLabel,
+  formatPersonStatusLabel,
+  getPersonStatusColor,
+} from "@/src/lib/personStatus";
+import { getClusterCodeBadgeStyle } from "@/src/lib/branchChipColor";
+import PersonAvatar from "@/src/components/people/PersonAvatar";
+import ConfirmationModal from "@/src/components/ui/ConfirmationModal";
+import {
+  isBibleSharersRoster,
+  isNccRoster,
+  isSystemMinistry,
+} from "@/src/lib/ministries/systemMinistries";
+
+export interface PendingMember {
+  member_id: string;
+  role: MinistryRole;
+  skills?: string;
+  notes?: string;
+  is_active?: boolean;
+  grant_lessons_teacher_access?: boolean;
+  grant_evangelism_bible_sharer_access?: boolean;
+  membership_id?: number;
+}
+
+export interface MinistryFormValues {
+  name: string;
+  code: string;
+  description: string;
+  category: MinistryCategory | "";
+  activity_cadence: MinistryCadence;
+  scope: MinistryScope;
+  primary_coordinator_id: string;
+  support_coordinator_ids: string[];
+  branch_id: string;
+  meeting_location: string;
+  meeting_schedule_day: string;
+  meeting_schedule_time: string;
+  meeting_schedule_window: string;
+  meeting_schedule_notes: string;
+  communication_channel: string;
+  is_active: boolean;
+  members: PendingMember[];
+  removed_member_ids: number[];
+}
+
+interface Option {
+  label: string;
+  value: string;
+}
+
+interface MinistryFormProps {
+  people: Person[];
+  cadenceOptions: Option[];
+  categoryOptions: Option[];
+  onSubmit: (values: MinistryFormValues) => Promise<void>;
+  onCancel: () => void;
+  isSubmitting: boolean;
+  error?: string | null;
+  submitLabel?: string;
+  initialData?: Ministry;
+}
+
+const DEFAULT_VALUES: MinistryFormValues = {
+  name: "",
+  code: "",
+  description: "",
+  category: "",
+  activity_cadence: "weekly",
+  scope: "BRANCH",
+  primary_coordinator_id: "",
+  support_coordinator_ids: [],
+  branch_id: "",
+  meeting_location: "",
+  meeting_schedule_day: "",
+  meeting_schedule_time: "",
+  meeting_schedule_window: "",
+  meeting_schedule_notes: "",
+  communication_channel: "",
+  is_active: true,
+  members: [],
+  removed_member_ids: [],
+};
+
+const ROLE_OPTIONS: Array<{ label: string; value: MinistryRole }> = [
+  { label: "Team Member", value: "team_member" },
+  { label: "Guest Helper", value: "guest_helper" },
+];
+
+function getMinistryRoleLabel(role: MinistryRole): string {
+  return (
+    ROLE_OPTIONS.find((option) => option.value === role)?.label ??
+    role.replace(/_/g, " ")
+  );
+}
+
+const DAYS_OF_WEEK = [
+  { label: "Not set", value: "" },
+  { label: "Sunday", value: "Sunday" },
+  { label: "Monday", value: "Monday" },
+  { label: "Tuesday", value: "Tuesday" },
+  { label: "Wednesday", value: "Wednesday" },
+  { label: "Thursday", value: "Thursday" },
+  { label: "Friday", value: "Friday" },
+  { label: "Saturday", value: "Saturday" },
+];
+
+export default function MinistryForm({
+  people,
+  cadenceOptions,
+  categoryOptions,
+  onSubmit,
+  onCancel,
+  isSubmitting,
+  error,
+  submitLabel = "Create Ministry",
+  initialData,
+}: MinistryFormProps) {
+  // Initialize form values from initialData if provided
+  const getInitialValues = (): MinistryFormValues => {
+    if (!initialData) {
+      return DEFAULT_VALUES;
+    }
+
+    // Parse meeting_schedule from API format to form fields
+    const meetingSchedule = initialData.meeting_schedule as Record<
+      string,
+      string
+    > | null;
+    const scheduleDay = meetingSchedule?.day ?? "";
+    const scheduleTime = meetingSchedule?.time ?? "";
+    const scheduleWindow = meetingSchedule?.window ?? "";
+    const scheduleNotes = meetingSchedule?.notes ?? "";
+
+    // Extract support coordinator IDs
+    const supportCoordinatorIds = (initialData.support_coordinators ?? []).map(
+      (coordinator) => String(coordinator.id),
+    );
+
+    // Extract existing members
+    const existingMembers: PendingMember[] = (
+      initialData.memberships || []
+    ).map((membership: MinistryMember) => ({
+      member_id: String(membership.member.id),
+      role: membership.role,
+      skills: membership.skills || "",
+      notes: membership.notes || "",
+      is_active: membership.is_active,
+      grant_lessons_teacher_access:
+        membership.has_lessons_teacher_access ?? true,
+      grant_evangelism_bible_sharer_access:
+        membership.has_evangelism_bible_sharer_access ?? true,
+      membership_id: membership.id,
+    }));
+
+    return {
+      name: initialData.name ?? "",
+      code: initialData.code ?? "",
+      description: initialData.description ?? "",
+      category: (initialData.category as MinistryCategory) ?? "",
+      activity_cadence: initialData.activity_cadence ?? "weekly",
+      scope: initialData.scope ?? (initialData.branch ? "BRANCH" : "NATIONAL"),
+      primary_coordinator_id: initialData.primary_coordinator
+        ? String(initialData.primary_coordinator.id)
+        : "",
+      support_coordinator_ids: supportCoordinatorIds,
+      branch_id: initialData.branch ? String(initialData.branch) : "",
+      meeting_location: initialData.meeting_location ?? "",
+      meeting_schedule_day: scheduleDay,
+      meeting_schedule_time: scheduleTime,
+      meeting_schedule_window: scheduleWindow,
+      meeting_schedule_notes: scheduleNotes,
+      communication_channel: initialData.communication_channel ?? "",
+      is_active: initialData.is_active ?? true,
+      members: existingMembers,
+      removed_member_ids: [],
+    };
+  };
+
+  const { branches } = useBranches();
+  const { user, isSeniorCoordinator } = useAuth();
+  const userBranch = branches.find(
+    (b) => Number(b.id) === Number(user?.branch),
+  );
+  const canChooseNational =
+    user?.role === "ADMIN" ||
+    isSeniorCoordinator("MINISTRIES") ||
+    (user?.role === "PASTOR" && Boolean(userBranch?.is_headquarters));
+  const canPickAnyBranch =
+    user?.role === "ADMIN" ||
+    (user?.role === "PASTOR" && Boolean(userBranch?.is_headquarters));
+
+  const [values, setValues] = useState<MinistryFormValues>(getInitialValues());
+  const [supportSelectorValue, setSupportSelectorValue] = useState("");
+  const [memberSearch, setMemberSearch] = useState("");
+  const [showMemberDropdown, setShowMemberDropdown] = useState(false);
+  const [selectedMemberRole, setSelectedMemberRole] =
+    useState<MinistryRole>("team_member");
+  const [removeMemberConfirmation, setRemoveMemberConfirmation] = useState<{
+    isOpen: boolean;
+    memberId: string | null;
+    memberName: string | null;
+  }>({ isOpen: false, memberId: null, memberName: null });
+
+  // Reset form when initialData changes
+  useEffect(() => {
+    if (initialData) {
+      const meetingSchedule = initialData.meeting_schedule as Record<
+        string,
+        string
+      > | null;
+      const scheduleDay = meetingSchedule?.day ?? "";
+      const scheduleTime = meetingSchedule?.time ?? "";
+      const scheduleWindow = meetingSchedule?.window ?? "";
+      const scheduleNotes = meetingSchedule?.notes ?? "";
+      const supportCoordinatorIds = (initialData.support_coordinators ?? []).map(
+        (coordinator) => String(coordinator.id),
+      );
+
+      // Extract existing members
+      const existingMembers: PendingMember[] = (
+        initialData.memberships || []
+      ).map((membership: MinistryMember) => ({
+        member_id: String(membership.member.id),
+        role: membership.role,
+        skills: membership.skills || "",
+        notes: membership.notes || "",
+        is_active: membership.is_active,
+        grant_lessons_teacher_access:
+          membership.has_lessons_teacher_access ?? true,
+        grant_evangelism_bible_sharer_access:
+          membership.has_evangelism_bible_sharer_access ?? true,
+        membership_id: membership.id,
+      }));
+
+      setValues({
+        name: initialData.name ?? "",
+        code: initialData.code ?? "",
+        description: initialData.description ?? "",
+        category: (initialData.category as MinistryCategory) ?? "",
+        activity_cadence: initialData.activity_cadence ?? "weekly",
+        scope:
+          initialData.scope ?? (initialData.branch ? "BRANCH" : "NATIONAL"),
+        primary_coordinator_id: initialData.primary_coordinator
+          ? String(initialData.primary_coordinator.id)
+          : "",
+        support_coordinator_ids: supportCoordinatorIds,
+        branch_id: initialData.branch ? String(initialData.branch) : "",
+        meeting_location: initialData.meeting_location ?? "",
+        meeting_schedule_day: scheduleDay,
+        meeting_schedule_time: scheduleTime,
+        meeting_schedule_window: scheduleWindow,
+        meeting_schedule_notes: scheduleNotes,
+        communication_channel: initialData.communication_channel ?? "",
+        is_active: initialData.is_active ?? true,
+        members: existingMembers,
+        removed_member_ids: [],
+      });
+    } else {
+      setValues({
+        ...DEFAULT_VALUES,
+        branch_id: user?.branch != null ? String(user.branch) : "",
+        scope: "BRANCH",
+      });
+      setMemberSearch("");
+      setSelectedMemberRole("team_member");
+    }
+  }, [initialData, user?.branch]);
+
+  const showBranchCodeInPickers = values.scope === "NATIONAL";
+
+  const personToSelectOption = (person: Person) => {
+    const clusterCodes = (person.cluster_codes ?? []).filter(Boolean);
+    return {
+      label: formatPersonName(person),
+      value: String(person.id),
+      statusLabel: formatPersonStatusLabel(person.status),
+      statusClassName: getPersonStatusColor(person.status),
+      clusterCode:
+        clusterCodes.length > 0 ? formatPersonClusterLabel(clusterCodes) : null,
+      clusterBranchId: person.branch ?? null,
+      branchCode: showBranchCodeInPickers
+        ? person.branch_code?.trim() || null
+        : null,
+      memberId: person.member_id?.trim() || null,
+      nickname: person.nickname?.trim() || null,
+      firstName: person.first_name?.trim() || null,
+    };
+  };
+
+  const coordinatorOptions = useMemo(
+    () =>
+      people
+        .filter(isSelectablePerson)
+        .map(personToSelectOption)
+        .sort((a, b) => a.label.localeCompare(b.label)),
+    [people, showBranchCodeInPickers],
+  );
+
+  const supportOptions = useMemo(
+    () =>
+      coordinatorOptions.map((option) => ({
+        ...option,
+        disabled:
+          option.value === values.primary_coordinator_id ||
+          values.support_coordinator_ids.includes(option.value),
+      })),
+    [
+      coordinatorOptions,
+      values.primary_coordinator_id,
+      values.support_coordinator_ids,
+    ],
+  );
+
+  // Filter available people for member selection (exclude admins and already added members)
+  const availablePeopleForMembers = useMemo(
+    () =>
+      people
+        .filter(
+          (person) =>
+            isSelectablePerson(person) &&
+            !values.members.some((m) => m.member_id === String(person.id)) &&
+            values.primary_coordinator_id !== String(person.id) &&
+            !values.support_coordinator_ids.includes(String(person.id)),
+        )
+        .sort((a, b) => {
+          const nameA = formatPersonName(a).toLowerCase();
+          const nameB = formatPersonName(b).toLowerCase();
+          return nameA.localeCompare(nameB);
+        }),
+    [
+      people,
+      values.members,
+      values.primary_coordinator_id,
+      values.support_coordinator_ids,
+    ],
+  );
+
+  const filteredMembers = useMemo(() => {
+    if (!memberSearch.trim()) return availablePeopleForMembers;
+    const searchLower = memberSearch.toLowerCase();
+    return availablePeopleForMembers.filter((person) => {
+      const clusterLabel = formatPersonClusterLabel(person.cluster_codes);
+      return (
+        formatPersonName(person).toLowerCase().includes(searchLower) ||
+        person.email?.toLowerCase().includes(searchLower) ||
+        person.role?.toLowerCase().includes(searchLower) ||
+        person.member_id?.toLowerCase().includes(searchLower) ||
+        clusterLabel.toLowerCase().includes(searchLower) ||
+        (person.branch_code?.toLowerCase().includes(searchLower) ?? false)
+      );
+    });
+  }, [availablePeopleForMembers, memberSearch]);
+
+  const isSystemRoster = isSystemMinistry(initialData);
+  const isNcc = isNccRoster(initialData);
+  const isBibleSharers = isBibleSharersRoster(initialData);
+
+  const addMember = (person: Person) => {
+    const memberId = String(person.id);
+    if (!values.members.some((m) => m.member_id === memberId)) {
+      setValues({
+        ...values,
+        members: [
+          {
+            member_id: memberId,
+            role: selectedMemberRole,
+            skills: "",
+            notes: "",
+            is_active: true,
+            grant_lessons_teacher_access: isNcc ? true : undefined,
+            grant_evangelism_bible_sharer_access: isBibleSharers
+              ? true
+              : undefined,
+          },
+          ...values.members,
+        ],
+      });
+    }
+    setMemberSearch("");
+    setShowMemberDropdown(false);
+    setSelectedMemberRole("team_member");
+  };
+
+  const closeRemoveMemberConfirmation = () => {
+    setRemoveMemberConfirmation({
+      isOpen: false,
+      memberId: null,
+      memberName: null,
+    });
+  };
+
+  const requestRemoveMember = (memberId: string, memberName: string) => {
+    setRemoveMemberConfirmation({
+      isOpen: true,
+      memberId,
+      memberName,
+    });
+  };
+
+  const removeMember = (memberId: string) => {
+    const member = values.members.find((m) => m.member_id === memberId);
+    setValues({
+      ...values,
+      members: values.members.filter((m) => m.member_id !== memberId),
+      removed_member_ids: initialData
+        ? values.removed_member_ids.concat(
+            initialData.memberships
+              ?.filter((m: MinistryMember) => String(m.member.id) === memberId)
+              .map((m: MinistryMember) => m.id) || [],
+          )
+        : values.removed_member_ids,
+    });
+  };
+
+  const confirmRemoveMember = () => {
+    const memberId = removeMemberConfirmation.memberId;
+    if (!memberId) return;
+    removeMember(memberId);
+    closeRemoveMemberConfirmation();
+  };
+
+  const updateMemberRole = (memberId: string, role: MinistryRole) => {
+    setValues({
+      ...values,
+      members: values.members.map((m) =>
+        m.member_id === memberId ? { ...m, role } : m,
+      ),
+    });
+  };
+
+  const updateMemberSkills = (memberId: string, skills: string) => {
+    setValues({
+      ...values,
+      members: values.members.map((m) =>
+        m.member_id === memberId ? { ...m, skills } : m,
+      ),
+    });
+  };
+
+  const updateMemberNotes = (memberId: string, notes: string) => {
+    setValues({
+      ...values,
+      members: values.members.map((m) =>
+        m.member_id === memberId ? { ...m, notes } : m,
+      ),
+    });
+  };
+
+  const updateMemberGrantAccess = (memberId: string, grant: boolean) => {
+    setValues({
+      ...values,
+      members: values.members.map((m) =>
+        m.member_id === memberId
+          ? { ...m, grant_lessons_teacher_access: grant }
+          : m,
+      ),
+    });
+  };
+
+  const updateMemberEvangelismGrantAccess = (
+    memberId: string,
+    grant: boolean,
+  ) => {
+    setValues({
+      ...values,
+      members: values.members.map((m) =>
+        m.member_id === memberId
+          ? { ...m, grant_evangelism_bible_sharer_access: grant }
+          : m,
+      ),
+    });
+  };
+
+  const updateMemberActive = (memberId: string, active: boolean) => {
+    if (
+      !active &&
+      isNcc &&
+      !window.confirm(
+        "Mark this teacher inactive? Lessons teacher access will be revoked, but they stay selectable for enrollments.",
+      )
+    ) {
+      return;
+    }
+    if (
+      !active &&
+      isBibleSharers &&
+      !window.confirm(
+        "Mark this Bible Sharer inactive? Evangelism access will be revoked (module-wide only). They stay selectable for HQ evangelism groups, and any group Bible Sharer assignments remain.",
+      )
+    ) {
+      return;
+    }
+    setValues({
+      ...values,
+      members: values.members.map((m) =>
+        m.member_id === memberId
+          ? {
+              ...m,
+              is_active: active,
+              grant_lessons_teacher_access: isNcc
+                ? active
+                  ? (m.grant_lessons_teacher_access ?? true)
+                  : false
+                : m.grant_lessons_teacher_access,
+              grant_evangelism_bible_sharer_access: isBibleSharers
+                ? active
+                  ? (m.grant_evangelism_bible_sharer_access ?? true)
+                  : false
+                : m.grant_evangelism_bible_sharer_access,
+            }
+          : m,
+      ),
+    });
+  };
+
+  const selectedMembersData = useMemo(() => {
+    return values.members
+      .map((pendingMember) => {
+        const person = people.find(
+          (p) => String(p.id) === pendingMember.member_id,
+        );
+        return person
+          ? {
+              person,
+              role: pendingMember.role,
+              member_id: pendingMember.member_id,
+              skills: pendingMember.skills || "",
+              notes: pendingMember.notes || "",
+              is_active: pendingMember.is_active !== false,
+              grant_lessons_teacher_access:
+                pendingMember.grant_lessons_teacher_access !== false,
+              grant_evangelism_bible_sharer_access:
+                pendingMember.grant_evangelism_bible_sharer_access !== false,
+            }
+          : null;
+      })
+      .filter(
+        (
+          item,
+        ): item is {
+          person: Person;
+          role: MinistryRole;
+          member_id: string;
+          skills: string;
+          notes: string;
+          is_active: boolean;
+          grant_lessons_teacher_access: boolean;
+          grant_evangelism_bible_sharer_access: boolean;
+        } => item !== null,
+      );
+  }, [values.members, people]);
+
+  const filteredAssignedMembers = useMemo(() => {
+    const term = memberSearch.trim().toLowerCase();
+    if (!term) {
+      return selectedMembersData;
+    }
+    return selectedMembersData.filter((row) => {
+      const name = formatPersonName(row.person).toLowerCase();
+      const roleLabel = getMinistryRoleLabel(row.role).toLowerCase();
+      const skills = row.skills.toLowerCase();
+      const notes = row.notes.toLowerCase();
+      return (
+        name.includes(term) ||
+        roleLabel.includes(term) ||
+        row.role.toLowerCase().includes(term) ||
+        skills.includes(term) ||
+        notes.includes(term)
+      );
+    });
+  }, [selectedMembersData, memberSearch]);
+
+  useEffect(() => {
+    setValues((prev) => {
+      if (
+        prev.primary_coordinator_id &&
+        prev.support_coordinator_ids.includes(prev.primary_coordinator_id)
+      ) {
+        return {
+          ...prev,
+          support_coordinator_ids: prev.support_coordinator_ids.filter(
+            (id) => id !== prev.primary_coordinator_id,
+          ),
+        };
+      }
+      return prev;
+    });
+  }, [values.primary_coordinator_id]);
+
+  const handleChange =
+    (field: keyof MinistryFormValues) =>
+    (
+      event: ChangeEvent<
+        HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement
+      >,
+    ) => {
+      const value =
+        event.target.type === "checkbox"
+          ? (event.target as HTMLInputElement).checked
+          : event.target.value;
+      setValues((prev) => ({
+        ...prev,
+        [field]: value,
+      }));
+    };
+
+  const handleAddSupportCoordinator = () => {
+    if (!supportSelectorValue) return;
+    setValues((prev) => ({
+      ...prev,
+      support_coordinator_ids: Array.from(
+        new Set([...prev.support_coordinator_ids, supportSelectorValue]),
+      ),
+    }));
+    setSupportSelectorValue("");
+  };
+
+  const handleRemoveSupportCoordinator = (id: string) => {
+    setValues((prev) => ({
+      ...prev,
+      support_coordinator_ids: prev.support_coordinator_ids.filter(
+        (item) => item !== id,
+      ),
+    }));
+  };
+
+  const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    await onSubmit(values);
+    // Only reset form if not editing (no initialData)
+    if (!initialData) {
+      setValues(DEFAULT_VALUES);
+      setSupportSelectorValue("");
+      setMemberSearch("");
+      setSelectedMemberRole("team_member");
+    }
+  };
+
+  const disableSubmit =
+    isSubmitting ||
+    values.name.trim().length === 0 ||
+    values.code.trim().length === 0 ||
+    values.activity_cadence === undefined;
+
+  return (
+    <>
+    <form onSubmit={handleSubmit} className="space-y-6">
+      {error && <ErrorMessage message={error} />}
+
+      <div className="grid gap-4 tablet:grid-cols-2">
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-1">
+            Ministry Name<span className="text-red-500">*</span>
+          </label>
+          <input
+            type="text"
+            required
+            value={values.name}
+            onChange={handleChange("name")}
+            placeholder="e.g. Worship Team"
+            className="w-full rounded-md border border-gray-200 px-3 py-2 min-h-[44px] text-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-ring"
+          />
+        </div>
+
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-1">
+            Ministry Code<span className="text-red-500">*</span>
+          </label>
+          <input
+            type="text"
+            required
+            value={values.code}
+            disabled={isSystemRoster}
+            onChange={(event) =>
+              setValues((prev) => ({
+                ...prev,
+                code: event.target.value.toUpperCase(),
+              }))
+            }
+            placeholder="e.g. WORSHIP"
+            className="w-full rounded-md border border-gray-200 px-3 py-2 min-h-[44px] text-sm uppercase focus:border-primary focus:outline-none focus:ring-1 focus:ring-ring disabled:bg-gray-100 disabled:text-gray-500"
+          />
+          <p className="mt-1 text-xs text-gray-500">
+            {isNcc
+              ? "NCC / Lessons roster code is system-managed and cannot be changed."
+              : isBibleSharers
+                ? "Bible Sharers roster code is system-managed and cannot be changed."
+                : isSystemRoster
+                  ? "System ministry codes cannot be changed."
+                  : "Shortcut name shown in tables and pickers."}
+          </p>
+        </div>
+
+        <div className="tablet:col-span-2">
+          <label className="block text-sm font-medium text-gray-700 mb-1">
+            Description
+          </label>
+          <textarea
+            value={values.description}
+            onChange={handleChange("description")}
+            rows={3}
+            placeholder="Describe the ministry's focus and activities."
+            className="w-full rounded-md border border-gray-200 px-3 py-2 min-h-[44px] text-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-ring"
+          />
+        </div>
+
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-1">
+            Category
+          </label>
+          <select
+            value={values.category}
+            onChange={handleChange("category")}
+            className="w-full rounded-md border border-gray-200 px-3 py-2 min-h-[44px] text-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-ring"
+          >
+            {categoryOptions.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-1">
+            Activity Cadence<span className="text-red-500">*</span>
+          </label>
+          <select
+            required
+            value={values.activity_cadence}
+            onChange={handleChange("activity_cadence")}
+            className="w-full rounded-md border border-gray-200 px-3 py-2 min-h-[44px] text-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-ring"
+          >
+            {cadenceOptions.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-1">
+            Scope<span className="text-red-500">*</span>
+          </label>
+          <select
+            required
+            value={values.scope}
+            onChange={(event) => {
+              const nextScope = event.target.value as MinistryScope;
+              setValues((prev) => ({
+                ...prev,
+                scope: nextScope,
+                branch_id:
+                  nextScope === "NATIONAL"
+                    ? ""
+                    : prev.branch_id ||
+                      (user?.branch != null ? String(user.branch) : ""),
+              }));
+            }}
+            disabled={!canChooseNational || isSystemRoster}
+            className="w-full rounded-md border border-gray-200 px-3 py-2 min-h-[44px] text-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-ring disabled:bg-gray-100"
+          >
+            <option value="BRANCH">Branch</option>
+            {(canChooseNational || values.scope === "NATIONAL") && (
+              <option value="NATIONAL">National</option>
+            )}
+          </select>
+          {!canChooseNational && (
+            <p className="mt-1 text-xs text-gray-500">
+              National ministries can be created by admins, HQ pastors, or
+              senior ministries coordinators.
+            </p>
+          )}
+        </div>
+
+        {values.scope === "BRANCH" && (
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Branch<span className="text-red-500">*</span>
+            </label>
+            <select
+              required
+              value={values.branch_id}
+              onChange={handleChange("branch_id")}
+              disabled={!canPickAnyBranch || isSystemRoster}
+              className="w-full rounded-md border border-gray-200 px-3 py-2 min-h-[44px] text-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-ring disabled:bg-gray-100"
+            >
+              <option value="">Select branch</option>
+              {branches.map((branch) => (
+                <option key={branch.id} value={String(branch.id)}>
+                  {branch.name}
+                  {branch.is_headquarters ? " (HQ)" : ""}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
+
+        <div className="tablet:col-span-2">
+          <label className="block text-sm font-medium text-gray-700 mb-1">
+            Primary Coordinator
+          </label>
+          {isNcc && (
+            <p className="mb-1 text-xs text-gray-500">
+              Grants Lessons senior coordinator access for this branch. HQ
+              primary coordinators can also view other branches in Lessons.
+            </p>
+          )}
+          <ScalableSelect
+            options={[{ label: "Not set", value: "" }, ...coordinatorOptions]}
+            value={values.primary_coordinator_id}
+            onChange={(value) =>
+              setValues((prev) => ({
+                ...prev,
+                primary_coordinator_id: value,
+              }))
+            }
+            placeholder="Select primary coordinator"
+            className="w-full"
+            showSearch
+          />
+        </div>
+
+        <div className="tablet:col-span-2">
+          <label className="block text-sm font-medium text-gray-700 mb-1">
+            Supporting Coordinators
+          </label>
+          {isNcc && (
+            <p className="mb-1 text-xs text-gray-500">
+              Grants the same Lessons access as a Lessons coordinator for this
+              branch (assign lessons, log sessions, manage the teacher roster).
+            </p>
+          )}
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
+            <div className="sm:flex-1">
+              <ScalableSelect
+                options={supportOptions}
+                value={supportSelectorValue}
+                onChange={setSupportSelectorValue}
+                placeholder="Search and pick coordinator to add"
+                className="w-full"
+                showSearch
+              />
+            </div>
+            <Button
+              type="button"
+              variant="secondary"
+              onClick={handleAddSupportCoordinator}
+              disabled={!supportSelectorValue}
+              className="w-full sm:w-auto min-h-[44px]"
+            >
+              Add Coordinator
+            </Button>
+          </div>
+          {values.support_coordinator_ids.length > 0 ? (
+            <ul className="mt-3 flex flex-wrap gap-2">
+              {values.support_coordinator_ids.map((id) => {
+                const label =
+                  coordinatorOptions.find((option) => option.value === id)
+                    ?.label ?? id;
+                return (
+                  <li key={id}>
+                    <span className="inline-flex items-center gap-2 rounded-full bg-primary/10 px-3 py-1 text-sm text-primary border border-primary/20">
+                      {label}
+                      <button
+                        type="button"
+                        onClick={() => handleRemoveSupportCoordinator(id)}
+                        className="text-primary hover:text-primary focus:outline-none"
+                        aria-label={`Remove ${label}`}
+                      >
+                        ×
+                      </button>
+                    </span>
+                  </li>
+                );
+              })}
+            </ul>
+          ) : (
+            <p className="mt-2 text-xs text-gray-500">
+              Add as many coordinating team members as needed. They&rsquo;ll
+              appear here once added.
+            </p>
+          )}
+        </div>
+
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-1">
+            Meeting Location
+          </label>
+          <input
+            type="text"
+            value={values.meeting_location}
+            onChange={handleChange("meeting_location")}
+            placeholder="e.g. Main Building Room 203"
+            className="w-full rounded-md border border-gray-200 px-3 py-2 min-h-[44px] text-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-ring"
+          />
+        </div>
+
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-1">
+            Communication Channel
+          </label>
+          <input
+            type="url"
+            value={values.communication_channel}
+            onChange={handleChange("communication_channel")}
+            placeholder="https://..."
+            className="w-full rounded-md border border-gray-200 px-3 py-2 min-h-[44px] text-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-ring"
+          />
+          <p className="mt-1 text-xs text-gray-500">
+            Optional link to the group chat, email list, or coordination doc.
+          </p>
+        </div>
+
+        <div className="tablet:col-span-2 border border-gray-200 rounded-lg p-4 bg-gray-50">
+          <h3 className="text-sm font-semibold text-gray-700 mb-3">
+            Meeting Schedule
+          </h3>
+          <div className="grid gap-4 tablet:grid-cols-2">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Typical Day
+              </label>
+              <select
+                value={values.meeting_schedule_day}
+                onChange={handleChange("meeting_schedule_day")}
+                className="w-full rounded-md border border-gray-200 px-3 py-2 min-h-[44px] text-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-ring"
+              >
+                {DAYS_OF_WEEK.map((option) => (
+                  <option key={option.value || "unset"} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Typical Time
+              </label>
+              <input
+                type="time"
+                value={values.meeting_schedule_time}
+                onChange={handleChange("meeting_schedule_time")}
+                className="w-full rounded-md border border-gray-200 px-3 py-2 min-h-[44px] text-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-ring"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Season / Window
+              </label>
+              <input
+                type="text"
+                value={values.meeting_schedule_window}
+                onChange={handleChange("meeting_schedule_window")}
+                placeholder="e.g. Holy Week, Summer Camp, Anniversary Week"
+                className="w-full rounded-md border border-gray-200 px-3 py-2 min-h-[44px] text-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-ring"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Additional Notes
+              </label>
+              <textarea
+                value={values.meeting_schedule_notes}
+                onChange={handleChange("meeting_schedule_notes")}
+                rows={2}
+                placeholder="Optional: add rotation details, prep time, or other schedule notes."
+                className="w-full rounded-md border border-gray-200 px-3 py-2 min-h-[44px] text-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-ring"
+              />
+            </div>
+          </div>
+          <p className="mt-2 text-xs text-gray-500">
+            Fill in what you know—leave fields blank if the ministry only serves
+            seasonally or on-demand.
+          </p>
+        </div>
+
+        {!isSystemRoster && (
+          <div className="flex items-center gap-2">
+            <input
+              id="is_active"
+              type="checkbox"
+              checked={values.is_active}
+              onChange={handleChange("is_active")}
+              className="h-4 w-4 rounded border-gray-300 text-primary focus:ring-ring"
+            />
+            <label
+              htmlFor="is_active"
+              className="text-sm font-medium text-gray-700"
+            >
+              Ministry is active
+            </label>
+          </div>
+        )}
+
+        {/* Members Section */}
+        <div className="tablet:col-span-2 border border-gray-200 rounded-lg p-4 bg-gray-50">
+          <h3 className="text-sm font-semibold text-gray-700 mb-3">
+            Members ({values.members.length})
+          </h3>
+
+          {/* Add Member Search */}
+          <div className="relative mb-4">
+            <div className="flex flex-col gap-2 mb-2 tablet:flex-row">
+              <div className="flex-1">
+                <input
+                  type="text"
+                  value={memberSearch}
+                  onChange={(e) => {
+                    setMemberSearch(e.target.value);
+                    setShowMemberDropdown(true);
+                  }}
+                  onFocus={() => setShowMemberDropdown(true)}
+                  className="w-full rounded-md border border-gray-200 px-3 py-2 min-h-[44px] text-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-ring"
+                  placeholder="Search to add or filter members…"
+                />
+              </div>
+              <select
+                value={selectedMemberRole}
+                onChange={(e) =>
+                  setSelectedMemberRole(e.target.value as MinistryRole)
+                }
+                className="w-full tablet:w-auto rounded-md border border-gray-200 px-3 py-2 min-h-[44px] text-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-ring"
+              >
+                {ROLE_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {/* Dropdown with filtered members */}
+            {showMemberDropdown && memberSearch && (
+              <div className="absolute z-10 w-full mt-1 bg-white border border-gray-300 rounded-lg shadow-lg max-h-60 overflow-y-auto">
+                {filteredMembers.length === 0 ? (
+                  <div className="px-3 py-2 text-gray-500 text-sm">
+                    No members found matching &ldquo;{memberSearch}&rdquo;
+                  </div>
+                ) : (
+                  filteredMembers.map((person) => {
+                    const clusterCodes = (person.cluster_codes ?? []).filter(
+                      Boolean,
+                    );
+                    const clusterLabel =
+                      clusterCodes.length > 0
+                        ? formatPersonClusterLabel(clusterCodes)
+                        : null;
+                    const branchCode = showBranchCodeInPickers
+                      ? person.branch_code?.trim() || null
+                      : null;
+                    return (
+                      <button
+                        key={person.id}
+                        type="button"
+                        onClick={() => addMember(person)}
+                        className="w-full px-3 py-2 text-left hover:bg-gray-50 flex items-center gap-3 text-gray-900"
+                      >
+                        <PersonAvatar person={person} size="sm" />
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2 min-w-0">
+                            <p className="font-medium text-sm truncate">
+                              {formatPersonName(person)}
+                            </p>
+                            <span
+                              className={`inline-flex shrink-0 items-center rounded-full px-2 py-0.5 text-[10px] font-semibold ${getPersonStatusColor(
+                                person.status,
+                              )}`}
+                            >
+                              {formatPersonStatusLabel(person.status)}
+                            </span>
+                            {clusterLabel && (
+                              <span
+                                className="inline-flex shrink-0 items-center rounded-full px-2 py-0.5 text-[10px] font-semibold"
+                                style={getClusterCodeBadgeStyle(person.branch)}
+                              >
+                                {clusterLabel}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                        {branchCode && (
+                          <span className="text-xs font-medium text-gray-500 shrink-0">
+                            {branchCode}
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Selected Members Display */}
+          {values.members.length > 0 ? (
+            <>
+              {memberSearch.trim() && (
+                <p className="mb-2 text-xs text-gray-500">
+                  Showing {filteredAssignedMembers.length} of{" "}
+                  {values.members.length}
+                </p>
+              )}
+              {filteredAssignedMembers.length === 0 ? (
+                <p className="text-sm text-gray-500 italic">
+                  No members match your search
+                </p>
+              ) : (
+            <div className="max-h-80 overflow-y-auto space-y-3 pr-1">
+              {filteredAssignedMembers.map(
+                ({
+                  person,
+                  role,
+                  member_id,
+                  skills,
+                  notes,
+                  is_active,
+                  grant_lessons_teacher_access,
+                  grant_evangelism_bible_sharer_access,
+                }) => (
+                  <div
+                    key={member_id}
+                    className={`bg-white border rounded-lg p-3 ${
+                      is_active
+                        ? "border-gray-200"
+                        : "border-gray-200 opacity-75"
+                    }`}
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="flex items-start gap-3 flex-1 min-w-0">
+                        <PersonAvatar
+                          person={person}
+                          size="sm"
+                          className="flex-shrink-0"
+                        />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-medium text-gray-900 truncate">
+                            {formatPersonName(person)}
+                            {!is_active && (
+                              <span className="ml-2 text-xs font-semibold text-gray-500">
+                                Inactive
+                              </span>
+                            )}
+                          </p>
+                          <div className="flex flex-col gap-2 mt-2">
+                            <select
+                              value={role}
+                              onChange={(e) =>
+                                updateMemberRole(
+                                  member_id,
+                                  e.target.value as MinistryRole,
+                                )
+                              }
+                              className="text-xs rounded border border-gray-300 px-2 py-1 focus:border-primary focus:outline-none focus:ring-1 focus:ring-ring w-full"
+                              onClick={(e) => e.stopPropagation()}
+                            >
+                              {ROLE_OPTIONS.map((option) => (
+                                <option key={option.value} value={option.value}>
+                                  {option.label}
+                                </option>
+                              ))}
+                            </select>
+                            {isNcc && (
+                              <label className="inline-flex items-start gap-2 text-xs text-gray-700 cursor-pointer">
+                                <input
+                                  type="checkbox"
+                                  className="mt-0.5 rounded border-gray-300 text-primary focus:ring-ring"
+                                  checked={
+                                    grant_lessons_teacher_access && is_active
+                                  }
+                                  disabled={!is_active}
+                                  onChange={(e) =>
+                                    updateMemberGrantAccess(
+                                      member_id,
+                                      e.target.checked,
+                                    )
+                                  }
+                                  onClick={(e) => e.stopPropagation()}
+                                />
+                                <span>
+                                  <span className="font-medium">
+                                    Grant Lessons teacher access
+                                  </span>
+                                  <span className="block text-gray-500 mt-0.5">
+                                    Lets them open Lessons, be assigned
+                                    students, and submit session reports.
+                                    Uncheck for roster-only (no module
+                                    access).
+                                  </span>
+                                </span>
+                              </label>
+                            )}
+                            {isBibleSharers && (
+                              <label className="inline-flex items-start gap-2 text-xs text-gray-700 cursor-pointer">
+                                <input
+                                  type="checkbox"
+                                  className="mt-0.5 rounded border-gray-300 text-primary focus:ring-ring"
+                                  checked={
+                                    grant_evangelism_bible_sharer_access &&
+                                    is_active
+                                  }
+                                  disabled={!is_active}
+                                  onChange={(e) =>
+                                    updateMemberEvangelismGrantAccess(
+                                      member_id,
+                                      e.target.checked,
+                                    )
+                                  }
+                                  onClick={(e) => e.stopPropagation()}
+                                />
+                                <span>
+                                  <span className="font-medium">
+                                    Grant Evangelism access
+                                  </span>
+                                  <span className="block text-gray-500 mt-0.5">
+                                    Lets them open Evangelism read-only.
+                                    Weekly reports require being assigned as
+                                    Bible Sharer on a group. Uncheck for
+                                    roster-only.
+                                  </span>
+                                </span>
+                              </label>
+                            )}
+                            {(isNcc || isBibleSharers) && (
+                              <label className="inline-flex items-center gap-2 text-xs text-gray-700 cursor-pointer">
+                                <input
+                                  type="checkbox"
+                                  className="rounded border-gray-300 text-primary focus:ring-ring"
+                                  checked={is_active}
+                                  onChange={(e) =>
+                                    updateMemberActive(
+                                      member_id,
+                                      e.target.checked,
+                                    )
+                                  }
+                                  onClick={(e) => e.stopPropagation()}
+                                />
+                                Active on roster
+                              </label>
+                            )}
+                            <input
+                              type="text"
+                              value={skills}
+                              onChange={(e) =>
+                                updateMemberSkills(member_id, e.target.value)
+                              }
+                              placeholder="Skills/Designation (e.g., Pianist, Singer)"
+                              className="text-xs rounded border border-gray-300 px-2 py-1 focus:border-primary focus:outline-none focus:ring-1 focus:ring-ring w-full"
+                              onClick={(e) => e.stopPropagation()}
+                            />
+                            <textarea
+                              value={notes}
+                              onChange={(e) =>
+                                updateMemberNotes(member_id, e.target.value)
+                              }
+                              placeholder="Notes (optional)"
+                              rows={2}
+                              className="text-xs rounded border border-gray-300 px-2 py-1 focus:border-primary focus:outline-none focus:ring-1 focus:ring-ring w-full resize-none"
+                              onClick={(e) => e.stopPropagation()}
+                            />
+                          </div>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          requestRemoveMember(
+                            member_id,
+                            formatPersonName(person),
+                          )
+                        }
+                        className="text-gray-400 hover:text-red-500 flex-shrink-0 mt-1"
+                        aria-label={`Remove ${formatPersonName(person)}`}
+                      >
+                        <svg
+                          className="w-5 h-5"
+                          fill="none"
+                          stroke="currentColor"
+                          viewBox="0 0 24 24"
+                        >
+                          <path
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            strokeWidth={2}
+                            d="M6 18L18 6M6 6l12 12"
+                          />
+                        </svg>
+                      </button>
+                    </div>
+                  </div>
+                ),
+              )}
+            </div>
+              )}
+            </>
+          ) : (
+            <p className="text-xs text-gray-500 italic">
+              No members added yet. Use the search above to add members to this
+              ministry.
+            </p>
+          )}
+
+          {/* Click outside to close dropdown */}
+          {showMemberDropdown && (
+            <div
+              className="fixed inset-0 z-0"
+              onClick={() => setShowMemberDropdown(false)}
+            />
+          )}
+        </div>
+      </div>
+
+      <div className="flex flex-col-reverse sm:flex-row gap-3">
+        <Button
+          type="button"
+          variant="tertiary"
+          onClick={() => {
+            if (!isSubmitting) {
+              setValues(DEFAULT_VALUES);
+              setSupportSelectorValue("");
+              setMemberSearch("");
+              setSelectedMemberRole("team_member");
+              onCancel();
+            }
+          }}
+          disabled={isSubmitting}
+          className="w-full sm:flex-1 min-h-[44px]"
+        >
+          Cancel
+        </Button>
+        <Button
+          type="submit"
+          variant="primary"
+          disabled={disableSubmit}
+          className="w-full sm:flex-1 min-h-[44px]"
+        >
+          {isSubmitting ? "Saving..." : submitLabel}
+        </Button>
+      </div>
+    </form>
+    <ConfirmationModal
+      isOpen={removeMemberConfirmation.isOpen}
+      onClose={closeRemoveMemberConfirmation}
+      onConfirm={confirmRemoveMember}
+      title="Remove Member"
+      message={
+        <>
+          Are you sure you want to remove{" "}
+          <strong className="font-semibold text-gray-900">
+            &quot;{removeMemberConfirmation.memberName ?? ""}&quot;
+          </strong>{" "}
+          from this ministry? They will be removed when you save.
+        </>
+      }
+      confirmText="Remove"
+      cancelText="Cancel"
+      variant="warning"
+      zIndex={80}
+    />
+    </>
+  );
+}

@@ -1,0 +1,367 @@
+import { useState, useEffect, useCallback } from "react";
+import {
+  Event,
+  EventAttendanceRecord,
+  AttendanceMode,
+  AttendanceStatus,
+  EventTypeOption,
+} from "@/src/types/event";
+import { eventsApi, eventTypesApi } from "@/src/lib/api";
+
+interface CalendarOccurrence {
+  occurrence_id: string;
+  event_id: string;
+  start_date: string;
+  end_date: string;
+  is_base_occurrence: boolean;
+  title: string;
+  description: string;
+  type: Event["type"];
+  type_display: string;
+  location: string;
+  is_recurring: boolean;
+}
+
+export const useEvents = () => {
+  const [events, setEvents] = useState<Event[]>([]);
+  const [eventTypes, setEventTypes] = useState<EventTypeOption[]>([]);
+  const [calendarEvents, setCalendarEvents] = useState<CalendarOccurrence[]>(
+    []
+  );
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const buildCalendarOccurrences = useCallback(
+    (items: Event[]): CalendarOccurrence[] => {
+      return items.flatMap((event) => {
+        if (!event.occurrences || event.occurrences.length === 0) {
+          return [
+            {
+              occurrence_id: `${event.id}:${event.start_date}`,
+              event_id: event.id,
+              start_date: event.start_date,
+              end_date: event.end_date,
+              is_base_occurrence: true,
+              title: event.title,
+              description: event.description,
+              type: event.type,
+              type_display: event.type_display,
+              location: event.location,
+              is_recurring: event.is_recurring,
+            },
+          ];
+        }
+
+        return event.occurrences.map((occurrence) => ({
+          occurrence_id: occurrence.occurrence_id,
+          event_id: String(occurrence.event_id ?? event.id),
+          start_date: occurrence.start_date,
+          end_date: occurrence.end_date,
+          is_base_occurrence: occurrence.is_base_occurrence,
+          title: event.title,
+          description: event.description,
+          type: event.type,
+          type_display: event.type_display,
+          location: event.location,
+          is_recurring: event.is_recurring,
+        }));
+      });
+    },
+    []
+  );
+
+  const applyEvents = useCallback(
+    (items: Event[]) => {
+      setEvents(items);
+      setCalendarEvents(buildCalendarOccurrences(items));
+    },
+    [buildCalendarOccurrences]
+  );
+
+  const fetchEventTypes = useCallback(async () => {
+    const typesResponse = await eventTypesApi
+      .list()
+      .catch(() => eventsApi.listTypes().catch(() => ({ data: [] as EventTypeOption[] })));
+    setEventTypes(typesResponse.data);
+    return typesResponse.data;
+  }, []);
+
+  const fetchEvents = useCallback(
+    async (params?: Parameters<typeof eventsApi.getAll>[0]) => {
+      try {
+        setLoading(true);
+        const [eventsResponse, types] = await Promise.all([
+          eventsApi.getAll({ ...params, include_attendance: true }),
+          fetchEventTypes(),
+        ]);
+        applyEvents(eventsResponse.data);
+        setEventTypes(types);
+        setError(null);
+      } catch (err) {
+        console.error("Error fetching events:", err);
+        setError("Failed to fetch events");
+      } finally {
+        setLoading(false);
+      }
+    },
+    [applyEvents, fetchEventTypes]
+  );
+
+  const refreshEventTypes = useCallback(async () => {
+    return fetchEventTypes();
+  }, [fetchEventTypes]);
+
+  const createEventType = useCallback(
+    async (data: {
+      code: string;
+      label: string;
+      color: string;
+      sort_order: number;
+    }) => {
+      const response = await eventTypesApi.create(data);
+      setEventTypes((current) =>
+        [...current.filter((type) => type.code !== response.data.code), response.data].sort(
+          (a, b) => a.sort_order - b.sort_order || a.label.localeCompare(b.label)
+        )
+      );
+      return response.data;
+    },
+    []
+  );
+
+  const updateEventType = useCallback(
+    async (
+      code: string,
+      data: Partial<{
+        label: string;
+        color: string;
+        sort_order: number;
+      }>
+    ) => {
+      const response = await eventTypesApi.update(code, data);
+      setEventTypes((current) =>
+        current
+          .map((type) => (type.code === code ? response.data : type))
+          .sort(
+            (a, b) => a.sort_order - b.sort_order || a.label.localeCompare(b.label)
+          )
+      );
+      return response.data;
+    },
+    []
+  );
+
+  const deleteEventType = useCallback(async (code: string) => {
+    await eventTypesApi.delete(code);
+    setEventTypes((current) => current.filter((type) => type.code !== code));
+  }, []);
+
+  const findAndReplaceEvent = useCallback(
+    (next: Event) => {
+      setEvents((current) => {
+        const updated = current.some(
+          (event) => String(event.id) === String(next.id)
+        )
+          ? current.map((event) =>
+              String(event.id) === String(next.id) ? next : event
+            )
+          : [...current, next];
+        setCalendarEvents(buildCalendarOccurrences(updated));
+        return updated;
+      });
+    },
+    [buildCalendarOccurrences]
+  );
+
+  const createEvent = useCallback(
+    async (eventData: Partial<Event>) => {
+      const response = await eventsApi.create(eventData);
+      findAndReplaceEvent(response.data);
+      return response.data;
+    },
+    [findAndReplaceEvent]
+  );
+
+  const updateEvent = useCallback(
+    async (id: string, eventData: Partial<Event>) => {
+      const response = await eventsApi.update(id, eventData);
+      findAndReplaceEvent(response.data);
+      return response.data;
+    },
+    [findAndReplaceEvent]
+  );
+
+  const deleteEvent = useCallback(
+    async (id: string) => {
+      await eventsApi.delete(id);
+      setEvents((current) => {
+        const remaining = current.filter(
+          (event) => String(event.id) !== String(id)
+        );
+        setCalendarEvents(buildCalendarOccurrences(remaining));
+        return remaining;
+      });
+    },
+    [buildCalendarOccurrences]
+  );
+
+  const excludeOccurrence = useCallback(
+    async (id: string, date: string) => {
+      const response = await eventsApi.excludeOccurrence(id, { date });
+      findAndReplaceEvent(response.data);
+      return response.data;
+    },
+    [findAndReplaceEvent]
+  );
+
+  const endRecurrence = useCallback(
+    async (id: string, date: string) => {
+      const response = await eventsApi.endRecurrence(id, { date });
+      findAndReplaceEvent(response.data);
+      return response.data;
+    },
+    [findAndReplaceEvent]
+  );
+
+  const approveEvent = useCallback(
+    async (id: string, payload?: { review_note?: string }) => {
+      const response = await eventsApi.approve(id, payload);
+      findAndReplaceEvent(response.data);
+      return response.data;
+    },
+    [findAndReplaceEvent]
+  );
+
+  const rejectEvent = useCallback(
+    async (id: string, payload?: { review_note?: string }) => {
+      const response = await eventsApi.reject(id, payload);
+      setEvents((current) => {
+        const remaining = current.filter(
+          (event) => String(event.id) !== String(id)
+        );
+        setCalendarEvents(buildCalendarOccurrences(remaining));
+        return remaining;
+      });
+      return response.data;
+    },
+    [buildCalendarOccurrences]
+  );
+
+  const splitEdit = useCallback(
+    async (
+      id: string,
+      payload: Partial<Event> & { scope: "occurrence" | "following"; date: string }
+    ) => {
+      const response = await eventsApi.splitEdit(id, payload);
+      findAndReplaceEvent(response.data.event);
+      findAndReplaceEvent(response.data.created_event);
+      return response.data;
+    },
+    [findAndReplaceEvent]
+  );
+
+  const getEvent = useCallback(
+    async (
+      id: string,
+      params?: { include_attendance?: boolean; attendance_date?: string }
+    ) => {
+      try {
+        const response = await eventsApi.getById(id, params);
+        findAndReplaceEvent(response.data);
+        return response.data;
+      } catch (err) {
+        throw new Error("Failed to fetch event details");
+      }
+    },
+    [findAndReplaceEvent]
+  );
+
+  const listAttendance = useCallback(
+    async (id: string, params?: { occurrence_date?: string }) => {
+      const response = await eventsApi.listAttendance(id, params);
+      return response.data;
+    },
+    []
+  );
+
+  const addAttendance = useCallback(
+    async (
+      id: string,
+      payload: {
+        person_id: string;
+        occurrence_date: string;
+        status?: AttendanceStatus;
+        notes?: string;
+        attendance_mode?: AttendanceMode;
+        attendance_venue?: string | null;
+      }
+    ) => {
+      const response = await eventsApi.addAttendance(id, payload);
+      const { event } = response.data;
+      findAndReplaceEvent(event);
+      return response.data;
+    },
+    [findAndReplaceEvent]
+  );
+
+  const removeAttendance = useCallback(
+    async (id: string, attendanceId: number | string) => {
+      const response = await eventsApi.removeAttendance(id, attendanceId);
+      findAndReplaceEvent(response.data.event);
+      return response.data;
+    },
+    [findAndReplaceEvent]
+  );
+
+  const updateAttendance = useCallback(
+    async (
+      id: string,
+      attendanceId: number | string,
+      payload: {
+        attendance_mode?: AttendanceMode;
+        attendance_venue?: string | null;
+        status?: AttendanceStatus;
+        notes?: string;
+      }
+    ) => {
+      const response = await eventsApi.updateAttendance(
+        id,
+        attendanceId,
+        payload
+      );
+      findAndReplaceEvent(response.data.event);
+      return response.data;
+    },
+    [findAndReplaceEvent]
+  );
+
+  useEffect(() => {
+    fetchEvents();
+  }, [fetchEvents]);
+
+  return {
+    events,
+    eventTypes,
+    calendarEvents,
+    loading,
+    error,
+    createEvent,
+    updateEvent,
+    deleteEvent,
+    excludeOccurrence,
+    endRecurrence,
+    splitEdit,
+    approveEvent,
+    rejectEvent,
+    getEvent,
+    listAttendance,
+    addAttendance,
+    removeAttendance,
+    updateAttendance,
+    refreshEvents: fetchEvents,
+    refreshEventTypes,
+    createEventType,
+    updateEventType,
+    deleteEventType,
+  };
+};

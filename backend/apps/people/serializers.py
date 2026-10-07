@@ -1,0 +1,2110 @@
+import secrets
+
+from rest_framework import serializers
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.utils import timezone
+
+from core.datetime_utils import church_today
+from .models import (
+    Branch,
+    Family,
+    Journey,
+    Person,
+    PersonStatusChange,
+    MemberCareCase,
+    ModuleCoordinator,
+    ModuleSetting,
+    PeopleAutomationSetting,
+    REQUIRED_MANUAL_REASON_STATUSES,
+)
+from apps.people.utils import record_person_status_change
+from apps.clusters.branch_membership import prune_person_from_mismatched_branch_clusters
+from apps.clusters.models import Cluster
+from apps.authentication.password_validators import PasswordStrengthValidator
+from apps.events.models import EventType
+from apps.people.coordinator_assignment_validation import (
+    user_can_add_person,
+    user_can_add_visitor,
+    user_has_people_write_coordinator_assignment,
+    validate_module_coordinator_assignment,
+)
+from apps.people.vital_dates import (
+    strip_vital_date_attrs,
+    user_can_edit_vital_dates,
+)
+from apps.people.baptism_verifiers import (
+    BAPTISM_JOURNEY_TYPE,
+    SPIRIT_JOURNEY_TYPE,
+    UNSET as BAPTISM_VERIFIER_UNSET,
+    apply_verifier_fields,
+    baptism_verifier_queryset,
+    historical_verifier_names,
+    journey_verified_by,
+    journey_verifier_display_name,
+    person_verifier_display_name,
+    stash_baptism_verifiers,
+    validate_historical_name_pair,
+)
+from apps.people.name_formatting import (
+    PERSON_NAME_FIELDS,
+    apply_title_case_name_fields,
+    format_person_display_name,
+    nickname_matches_first_name,
+)
+from apps.people.photo_validators import validate_person_photo
+from apps.people.usernames import (
+    generate_unique_username,
+    normalize_and_validate_username,
+)
+from apps.people.family_counts import count_family_members, count_family_visitors
+
+
+def delete_person_photo_if_cleared(instance, validated_data):
+    if (
+        "photo" in validated_data
+        and validated_data["photo"] is None
+        and instance.photo
+    ):
+        instance.photo.delete(save=False)
+
+
+def format_cluster_export_label(cluster) -> str:
+    code = (getattr(cluster, "code", None) or "").strip()
+    name = (getattr(cluster, "name", None) or "").strip()
+    if code and name:
+        return f"({code}) {name}"
+    if code:
+        return f"({code})"
+    return name
+
+
+def cluster_export_labels(person) -> list[str]:
+    # Use .all() so prefetched clusters are reused (avoids N+1 on list).
+    labels = []
+    for cluster in person.clusters.all():
+        label = format_cluster_export_label(cluster)
+        if label:
+            labels.append(label)
+    return labels
+
+
+def cluster_membership_payloads(person) -> list[dict]:
+    # Use .all() so prefetched clusters are reused (avoids N+1).
+    return [
+        {
+            "id": cluster.id,
+            "name": (cluster.name or "").strip(),
+            "code": (cluster.code or "").strip() or None,
+        }
+        for cluster in person.clusters.all()
+    ]
+
+
+class ModuleCoordinatorSerializer(serializers.ModelSerializer):
+    module_display = serializers.CharField(source="get_module_display", read_only=True)
+    level_display = serializers.CharField(source="get_level_display", read_only=True)
+    person_name = serializers.SerializerMethodField()
+    resource_scope_label = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ModuleCoordinator
+        fields = [
+            "id",
+            "person",
+            "person_name",
+            "module",
+            "module_display",
+            "level",
+            "level_display",
+            "resource_id",
+            "resource_type",
+            "resource_scope_label",
+            "created_at",
+        ]
+        read_only_fields = ["created_at"]
+
+    def get_person_name(self, obj):
+        return obj.person.get_full_name() or obj.person.username
+
+    def get_resource_scope_label(self, obj):
+        """Human-readable scope: senior module-wide oversight, cluster code, or None."""
+        person = obj.person
+
+        if (
+            obj.level == ModuleCoordinator.CoordinatorLevel.SENIOR_COORDINATOR
+            and obj.resource_id is None
+        ):
+            base = f"All {obj.get_module_display()} (oversight)"
+            if person.branch_id and not person.can_see_all_branches():
+                try:
+                    branch_name = Branch.objects.only("name").get(
+                        pk=person.branch_id
+                    ).name
+                    if branch_name:
+                        return f"{base} — {branch_name.strip()}"
+                except Branch.DoesNotExist:
+                    pass
+            return base
+
+        if (
+            obj.module == ModuleCoordinator.ModuleType.EVANGELISM
+            and obj.level == ModuleCoordinator.CoordinatorLevel.BIBLE_SHARER
+            and obj.resource_id is None
+        ):
+            return "Module-wide (roster)"
+
+        if obj.resource_id is None:
+            return None
+        if obj.module == ModuleCoordinator.ModuleType.CLUSTER:
+            try:
+                from apps.clusters.models import Cluster
+
+                c = Cluster.objects.only("code", "name").get(pk=obj.resource_id)
+                if c.code:
+                    return c.code.strip()
+                if c.name:
+                    return c.name.strip()
+                return f"Cluster {c.id}"
+            except Cluster.DoesNotExist:
+                return None
+        if obj.module == ModuleCoordinator.ModuleType.EVANGELISM:
+            try:
+                from apps.evangelism.models import EvangelismGroup
+
+                g = EvangelismGroup.objects.only("name").get(pk=obj.resource_id)
+                return (g.name or "").strip() or f"Group {g.id}"
+            except EvangelismGroup.DoesNotExist:
+                return None
+        return None
+
+    def validate(self, attrs):
+        person = attrs.get("person") or getattr(self.instance, "person", None)
+        module = attrs.get("module") or getattr(self.instance, "module", None)
+        level = attrs.get("level") or getattr(self.instance, "level", None)
+        resource_id = attrs.get("resource_id")
+        if resource_id is None and "resource_id" not in attrs and self.instance:
+            resource_id = self.instance.resource_id
+        resource_type = attrs.get("resource_type")
+        if resource_type is None and self.instance:
+            resource_type = self.instance.resource_type
+
+        if person and module and level:
+            normalized = validate_module_coordinator_assignment(
+                person=person,
+                module=module,
+                level=level,
+                resource_id=resource_id,
+                resource_type=resource_type or "",
+            )
+            attrs["resource_id"] = normalized["resource_id"]
+            attrs["resource_type"] = normalized["resource_type"]
+        return attrs
+
+
+class ModuleSettingSerializer(serializers.ModelSerializer):
+    module_display = serializers.CharField(source="get_module_display", read_only=True)
+    updated_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ModuleSetting
+        fields = [
+            "id",
+            "module",
+            "module_display",
+            "is_enabled",
+            "updated_at",
+            "updated_by",
+            "updated_by_name",
+        ]
+        read_only_fields = ["id", "module", "updated_at", "updated_by", "updated_by_name"]
+
+    def get_updated_by_name(self, obj):
+        if not obj.updated_by:
+            return None
+        return obj.updated_by.get_full_name() or obj.updated_by.username
+
+
+class PeopleAutomationSettingSerializer(serializers.ModelSerializer):
+    updated_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PeopleAutomationSetting
+        fields = [
+            "id",
+            "auto_status_updates_enabled",
+            "updated_at",
+            "updated_by",
+            "updated_by_name",
+        ]
+        read_only_fields = ["id", "updated_at", "updated_by", "updated_by_name"]
+
+    def get_updated_by_name(self, obj):
+        if not obj.updated_by:
+            return None
+        return obj.updated_by.get_full_name() or obj.updated_by.username
+
+
+class ModuleCoordinatorBulkCreateSerializer(serializers.Serializer):
+    """
+    Serializer for bulk creating multiple module coordinator assignments.
+    Validates all assignments before creating any (atomic operation).
+    """
+
+    assignments = serializers.ListField(
+        child=serializers.DictField(),
+        min_length=1,
+        help_text="List of assignment objects to create",
+    )
+
+    def validate_assignments(self, value):
+        """
+        Validate all assignments before creating any.
+        """
+        if not value:
+            raise serializers.ValidationError("At least one assignment is required.")
+
+        validated_assignments = []
+        seen_combinations = set()
+
+        for idx, assignment in enumerate(value):
+            # Validate required fields
+            if "person" not in assignment:
+                raise serializers.ValidationError(
+                    f"Assignment {idx + 1}: 'person' field is required."
+                )
+            if "module" not in assignment:
+                raise serializers.ValidationError(
+                    f"Assignment {idx + 1}: 'module' field is required."
+                )
+            if "level" not in assignment:
+                raise serializers.ValidationError(
+                    f"Assignment {idx + 1}: 'level' field is required."
+                )
+
+            person_id = assignment["person"]
+            module = assignment["module"]
+            level = assignment["level"]
+            resource_id = assignment.get("resource_id")
+            resource_type = assignment.get("resource_type", "")
+
+            # Validate person exists
+            try:
+                person = Person.objects.get(id=person_id)
+            except Person.DoesNotExist:
+                raise serializers.ValidationError(
+                    f"Assignment {idx + 1}: Person with ID {person_id} does not exist."
+                )
+
+            # Validate module and level choices
+            if module not in [
+                choice[0] for choice in ModuleCoordinator.ModuleType.choices
+            ]:
+                raise serializers.ValidationError(
+                    f"Assignment {idx + 1}: Invalid module '{module}'."
+                )
+            if level not in [
+                choice[0] for choice in ModuleCoordinator.CoordinatorLevel.choices
+            ]:
+                raise serializers.ValidationError(
+                    f"Assignment {idx + 1}: Invalid level '{level}'."
+                )
+
+            # Check for duplicates within the request
+            combination_key = (person_id, module, resource_id)
+            if combination_key in seen_combinations:
+                raise serializers.ValidationError(
+                    f"Assignment {idx + 1}: Duplicate assignment (person={person_id}, module={module}, resource_id={resource_id})."
+                )
+            seen_combinations.add(combination_key)
+
+            # Check for existing assignments (respect unique_together constraint)
+            existing = ModuleCoordinator.objects.filter(
+                person_id=person_id, module=module, resource_id=resource_id
+            )
+            if existing.exists():
+                raise serializers.ValidationError(
+                    f"Assignment {idx + 1}: Assignment already exists for person {person_id}, module {module}, resource_id {resource_id}."
+                )
+
+            normalized = validate_module_coordinator_assignment(
+                person=person,
+                module=module,
+                level=level,
+                resource_id=resource_id,
+                resource_type=resource_type,
+            )
+
+            validated_assignments.append(
+                {
+                    "person": person,
+                    "module": module,
+                    "level": level,
+                    "resource_id": normalized["resource_id"],
+                    "resource_type": normalized["resource_type"],
+                }
+            )
+
+        return validated_assignments
+
+    def create(self, validated_data):
+        """
+        Create all assignments atomically.
+        """
+        assignments_data = validated_data["assignments"]
+        created_assignments = []
+
+        for assignment_data in assignments_data:
+            assignment = ModuleCoordinator.objects.create(**assignment_data)
+            created_assignments.append(assignment)
+
+        return {"created": created_assignments}
+
+
+class JourneyVerifierIdField(serializers.PrimaryKeyRelatedField):
+    """Person PK stored on a BAPTISM/SPIRIT journey's verified_by."""
+
+    def __init__(self, journey_type: str, **kwargs):
+        self.journey_type = journey_type
+        kwargs.setdefault("queryset", baptism_verifier_queryset())
+        kwargs.setdefault("required", False)
+        kwargs.setdefault("allow_null", True)
+        super().__init__(**kwargs)
+
+    def get_attribute(self, instance):
+        return journey_verified_by(instance, self.journey_type)
+
+
+class JourneyHistoricalNameField(serializers.CharField):
+    """First/last name stored on a BAPTISM/SPIRIT journey for people not in the directory."""
+
+    def __init__(self, journey_type: str, name_index: int, **kwargs):
+        self.journey_type = journey_type
+        self.name_index = name_index
+        kwargs.setdefault("required", False)
+        kwargs.setdefault("allow_blank", True)
+        kwargs.setdefault("max_length", 150)
+        super().__init__(**kwargs)
+
+    def get_attribute(self, instance):
+        person = instance if isinstance(instance, Person) else getattr(instance, "person", None)
+        first, last = historical_verifier_names(person, self.journey_type)
+        return first if self.name_index == 0 else last
+
+
+class JourneySerializer(serializers.ModelSerializer):
+    type_display = serializers.CharField(source="get_type_display", read_only=True)
+    user = serializers.PrimaryKeyRelatedField(queryset=Person.objects.all())
+    verified_by = serializers.PrimaryKeyRelatedField(
+        queryset=baptism_verifier_queryset(), allow_null=True, required=False
+    )
+    verified_by_display_name = serializers.SerializerMethodField()
+    historical_verified_first_name = serializers.CharField(
+        required=False, allow_blank=True, max_length=150
+    )
+    historical_verified_last_name = serializers.CharField(
+        required=False, allow_blank=True, max_length=150
+    )
+
+    class Meta:
+        model = Journey
+        fields = [
+            "id",
+            "user",
+            "title",
+            "date",
+            "type",
+            "description",
+            "type_display",
+            "verified_by",
+            "verified_by_display_name",
+            "historical_verified_first_name",
+            "historical_verified_last_name",
+            "created_at",
+        ]
+        read_only_fields = ["created_at", "verified_by_display_name"]
+
+    def get_verified_by_display_name(self, obj: Journey):
+        return journey_verifier_display_name(obj)
+
+    def validate(self, attrs):
+        first = attrs.get(
+            "historical_verified_first_name",
+            getattr(self.instance, "historical_verified_first_name", ""),
+        )
+        last = attrs.get(
+            "historical_verified_last_name",
+            getattr(self.instance, "historical_verified_last_name", ""),
+        )
+        if "historical_verified_first_name" in attrs or "historical_verified_last_name" in attrs:
+            validate_historical_name_pair(
+                first, last, first_field="historical_verified_first_name"
+            )
+        apply_title_case_name_fields(
+            attrs,
+            ("historical_verified_first_name", "historical_verified_last_name"),
+        )
+        return attrs
+
+    def create(self, validated_data):
+        journey = Journey(**validated_data)
+        apply_verifier_fields(
+            journey,
+            verified_by=validated_data.get("verified_by", BAPTISM_VERIFIER_UNSET),
+            first_name=validated_data.get(
+                "historical_verified_first_name", BAPTISM_VERIFIER_UNSET
+            ),
+            last_name=validated_data.get(
+                "historical_verified_last_name", BAPTISM_VERIFIER_UNSET
+            ),
+        )
+        journey.save()
+        return journey
+
+    def update(self, instance, validated_data):
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        apply_verifier_fields(
+            instance,
+            verified_by=validated_data["verified_by"]
+            if "verified_by" in validated_data
+            else BAPTISM_VERIFIER_UNSET,
+            first_name=validated_data["historical_verified_first_name"]
+            if "historical_verified_first_name" in validated_data
+            else BAPTISM_VERIFIER_UNSET,
+            last_name=validated_data["historical_verified_last_name"]
+            if "historical_verified_last_name" in validated_data
+            else BAPTISM_VERIFIER_UNSET,
+        )
+        instance.save()
+        return instance
+
+
+class PersonStatusChangeSerializer(serializers.ModelSerializer):
+    needs_follow_up = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = PersonStatusChange
+        fields = [
+            "id",
+            "from_status",
+            "to_status",
+            "reason",
+            "source",
+            "changed_by",
+            "created_at",
+            "needs_follow_up",
+        ]
+        read_only_fields = fields
+
+
+class MemberCareCasePersonSerializer(serializers.ModelSerializer):
+    full_name = serializers.SerializerMethodField()
+    cluster_ids = serializers.SerializerMethodField()
+    cluster_labels = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Person
+        fields = [
+            "id",
+            "first_name",
+            "last_name",
+            "full_name",
+            "role",
+            "status",
+            "cluster_ids",
+            "cluster_labels",
+        ]
+
+    def get_full_name(self, obj):
+        return format_person_display_name(obj) or obj.username
+
+    def get_cluster_ids(self, obj):
+        return [c.id for c in obj.clusters.all()]
+
+    def get_cluster_labels(self, obj):
+        return cluster_export_labels(obj)
+
+
+class MemberCareCaseAssigneeSerializer(serializers.ModelSerializer):
+    full_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Person
+        fields = ["id", "full_name"]
+
+    def get_full_name(self, obj):
+        return format_person_display_name(obj) or obj.username
+
+
+class MemberCareCaseSerializer(serializers.ModelSerializer):
+    person = MemberCareCasePersonSerializer(read_only=True)
+    assigned_to = serializers.PrimaryKeyRelatedField(
+        many=True,
+        queryset=Person.objects.exclude(role="VISITOR"),
+        required=False,
+    )
+    assigned_to_details = MemberCareCaseAssigneeSerializer(
+        source="assigned_to", many=True, read_only=True
+    )
+    recommended_action_display = serializers.CharField(
+        source="get_recommended_action_display", read_only=True
+    )
+    case_status_display = serializers.CharField(
+        source="get_case_status_display", read_only=True
+    )
+    needs_attention = serializers.SerializerMethodField()
+
+    class Meta:
+        model = MemberCareCase
+        fields = [
+            "id",
+            "person",
+            "details",
+            "recommended_action",
+            "recommended_action_display",
+            "recommended_action_other",
+            "assigned_to",
+            "assigned_to_details",
+            "assigned_to_label",
+            "due_date",
+            "case_status",
+            "case_status_display",
+            "remarks",
+            "source_status_change",
+            "opened_at",
+            "updated_at",
+            "updated_by",
+            "needs_attention",
+        ]
+        read_only_fields = [
+            "person",
+            "source_status_change",
+            "opened_at",
+            "updated_at",
+            "updated_by",
+            "needs_attention",
+            "recommended_action_display",
+            "case_status_display",
+            "assigned_to_details",
+        ]
+
+    def get_needs_attention(self, obj):
+        if obj.case_status not in (
+            MemberCareCase.CaseStatus.OPEN,
+            MemberCareCase.CaseStatus.IN_PROGRESS,
+        ):
+            return False
+        if not (obj.recommended_action or "").strip():
+            return True
+        if obj.due_date and obj.due_date < church_today():
+            return True
+        return False
+
+    def validate(self, attrs):
+        action = attrs.get(
+            "recommended_action",
+            getattr(self.instance, "recommended_action", "") if self.instance else "",
+        )
+        if action == MemberCareCase.RecommendedAction.OTHER:
+            other = attrs.get(
+                "recommended_action_other",
+                getattr(self.instance, "recommended_action_other", "")
+                if self.instance
+                else "",
+            )
+            other = (other or "").strip()
+            if not other:
+                raise serializers.ValidationError(
+                    {
+                        "recommended_action_other": (
+                            "Describe the other recommended action."
+                        )
+                    }
+                )
+            attrs["recommended_action_other"] = other
+        else:
+            attrs["recommended_action_other"] = ""
+        return attrs
+
+    def update(self, instance, validated_data):
+        action = validated_data.get("recommended_action", instance.recommended_action)
+        if action == MemberCareCase.RecommendedAction.NO_ACTION:
+            validated_data["case_status"] = MemberCareCase.CaseStatus.NO_ACTION
+        elif (
+            action
+            and instance.case_status == MemberCareCase.CaseStatus.NO_ACTION
+            and "case_status" not in validated_data
+        ):
+            validated_data["case_status"] = MemberCareCase.CaseStatus.IN_PROGRESS
+        request = self.context.get("request")
+        if request and getattr(request, "user", None) and request.user.is_authenticated:
+            instance.updated_by = request.user
+        return super().update(instance, validated_data)
+
+
+class BranchSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Branch
+        fields = [
+            "id",
+            "name",
+            "code",
+            "address",
+            "phone",
+            "email",
+            "is_headquarters",
+            "is_active",
+            "created_at",
+        ]
+        read_only_fields = ["created_at"]
+
+
+class PersonSerializer(serializers.ModelSerializer):
+    inviter = serializers.PrimaryKeyRelatedField(
+        queryset=Person.objects.all(), allow_null=True, required=False
+    )
+    inviter_display_name = serializers.SerializerMethodField()
+    branch = serializers.PrimaryKeyRelatedField(
+        queryset=Branch.objects.filter(is_active=True),
+        allow_null=True,
+        required=False,
+    )
+    photo = serializers.ImageField(
+        required=False,
+        allow_null=True,
+        validators=[validate_person_photo],
+    )
+    note = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    status_change_reason = serializers.CharField(
+        write_only=True, required=False, allow_blank=True
+    )
+    latest_status_change = serializers.SerializerMethodField()
+    open_care_case = serializers.SerializerMethodField()
+    journeys = JourneySerializer(many=True, read_only=True)
+    cluster_codes = serializers.SerializerMethodField()
+    cluster_labels = serializers.SerializerMethodField()
+    cluster_memberships = serializers.SerializerMethodField()
+    branch_code = serializers.SerializerMethodField()
+    family_names = serializers.SerializerMethodField()
+    family_ids = serializers.PrimaryKeyRelatedField(
+        source="families",
+        many=True,
+        queryset=Family.objects.all(),
+        required=False,
+    )
+    cluster_ids = serializers.PrimaryKeyRelatedField(
+        source="clusters",
+        many=True,
+        queryset=Cluster.objects.all(),
+        required=False,
+    )
+    module_coordinator_assignments = ModuleCoordinatorSerializer(
+        many=True, read_only=True
+    )
+    can_view_journey_timeline = serializers.SerializerMethodField()
+    can_view_profile = serializers.SerializerMethodField()
+    # Writable on create/update (write-through to LessonStudentEnrollment).
+    # Representation is overwritten from enrollment in to_representation.
+    commitment_form_signed = serializers.BooleanField(required=False)
+    commitment_signed_at = serializers.DateField(required=False, allow_null=True)
+    lesson_teacher_id = serializers.PrimaryKeyRelatedField(
+        queryset=Person.objects.exclude(role="VISITOR").exclude(role="ADMIN"),
+        required=False,
+        allow_null=True,
+        write_only=True,
+    )
+    historical_teacher_first_name = serializers.CharField(
+        required=False, allow_blank=True, write_only=True, max_length=150
+    )
+    historical_teacher_last_name = serializers.CharField(
+        required=False, allow_blank=True, write_only=True, max_length=150
+    )
+    has_lesson_enrollment = serializers.SerializerMethodField()
+    lesson_teacher_display_name = serializers.SerializerMethodField()
+    initial_password = serializers.CharField(
+        write_only=True, required=False, allow_blank=True
+    )
+    generate_temporary_password = serializers.BooleanField(
+        write_only=True, required=False, default=True
+    )
+    temporary_password = serializers.CharField(read_only=True, required=False)
+    first_activity_attended = serializers.SlugRelatedField(
+        slug_field="code",
+        queryset=EventType.activity_queryset(),
+        allow_null=True,
+        required=False,
+    )
+    baptized_by = JourneyVerifierIdField(BAPTISM_JOURNEY_TYPE)
+    baptized_by_display_name = serializers.SerializerMethodField()
+    baptized_by_first_name = JourneyHistoricalNameField(BAPTISM_JOURNEY_TYPE, 0)
+    baptized_by_last_name = JourneyHistoricalNameField(BAPTISM_JOURNEY_TYPE, 1)
+    hg_witnessed_by = JourneyVerifierIdField(SPIRIT_JOURNEY_TYPE)
+    hg_witnessed_by_display_name = serializers.SerializerMethodField()
+    hg_witnessed_by_first_name = JourneyHistoricalNameField(SPIRIT_JOURNEY_TYPE, 0)
+    hg_witnessed_by_last_name = JourneyHistoricalNameField(SPIRIT_JOURNEY_TYPE, 1)
+
+    class Meta:
+        model = Person
+        fields = [
+            "id",
+            "username",
+            "email",
+            "first_name",
+            "last_name",
+            "middle_name",
+            "suffix",
+            "nickname",
+            "maiden_name",
+            "gender",
+            "facebook_name",
+            "photo",
+            "role",
+            "phone",
+            "address",
+            "country",
+            "date_of_birth",
+            "date_first_invited",
+            "date_first_attended",
+            "first_activity_attended",
+            "water_baptism_date",
+            "spirit_baptism_date",
+            "baptized_by",
+            "baptized_by_display_name",
+            "baptized_by_first_name",
+            "baptized_by_last_name",
+            "hg_witnessed_by",
+            "hg_witnessed_by_display_name",
+            "hg_witnessed_by_first_name",
+            "hg_witnessed_by_last_name",
+            "has_finished_lessons",
+            "lessons_started_at",
+            "lessons_finished_at",
+            "commitment_form_signed",
+            "commitment_signed_at",
+            "lesson_teacher_id",
+            "historical_teacher_first_name",
+            "historical_teacher_last_name",
+            "has_lesson_enrollment",
+            "lesson_teacher_display_name",
+            "inviter",
+            "inviter_display_name",
+            "branch",
+            "branch_code",
+            "member_id",
+            "status",
+            "status_change_reason",
+            "latest_status_change",
+            "open_care_case",
+            "note",
+            "journeys",
+            "cluster_codes",
+            "cluster_labels",
+            "cluster_memberships",
+            "family_names",
+            "family_ids",
+            "cluster_ids",
+            "module_coordinator_assignments",
+            "can_view_journey_timeline",
+            "can_view_profile",
+            "initial_password",
+            "generate_temporary_password",
+            "temporary_password",
+        ]
+        extra_kwargs = {
+            "username": {"required": False, "allow_blank": True},
+        }
+
+    _BLANKABLE_DATE_FIELDS = (
+        "date_of_birth",
+        "date_first_invited",
+        "date_first_attended",
+        "water_baptism_date",
+        "spirit_baptism_date",
+        "lessons_started_at",
+        "lessons_finished_at",
+        "commitment_signed_at",
+    )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._temporary_password = None
+
+    def to_internal_value(self, data):
+        # JSON payloads may send "" for cleared dates. DRF DateField accepts
+        # null but not blank strings. Skip QueryDict (multipart) so many=True
+        # fields like family_ids keep getlist().
+        request = self.context.get("request")
+        instance = getattr(self, "instance", None)
+        is_admin = bool(
+            request
+            and getattr(request, "user", None)
+            and request.user.is_authenticated
+            and request.user.role == "ADMIN"
+        )
+        if isinstance(data, dict):
+            if hasattr(data, "getlist"):
+                data = data.copy()
+            else:
+                data = dict(data)
+            # Username is generated on create and ADMIN-only on update.
+            # Drop it before field validators so non-admins can save people
+            # whose existing username would fail UnicodeUsernameValidator.
+            if not instance or not is_admin:
+                data.pop("username", None)
+            if not hasattr(data, "getlist"):
+                for field_name in self._BLANKABLE_DATE_FIELDS:
+                    if data.get(field_name) == "":
+                        data[field_name] = None
+                for field_name in ("baptized_by", "hg_witnessed_by"):
+                    if data.get(field_name) == "":
+                        data[field_name] = None
+        return super().to_internal_value(data)
+
+    def _apply_memberships(self, person, families=None, clusters=None):
+        # Apply from the forward M2M side so family/cluster member signals
+        # receive Family/Cluster as instance (not Person).
+        if families is not None:
+            desired_ids = {f.pk for f in families}
+            for family in list(person.families.all()):
+                if family.pk not in desired_ids:
+                    family.members.remove(person)
+            for family in families:
+                family.members.add(person)
+        if clusters is not None:
+            desired_ids = {c.pk for c in clusters}
+            for cluster in list(person.clusters.all()):
+                if cluster.pk not in desired_ids:
+                    cluster.members.remove(person)
+            for cluster in clusters:
+                cluster.members.add(person)
+
+    def validate(self, attrs):
+        request = self.context.get("request")
+        instance = getattr(self, "instance", None)
+        self._water_baptism_role_promotion = False
+        self._water_baptism_role_demotion = False
+        self._water_baptism_cleared = False
+
+        # A "plain member" is a MEMBER with no ModuleCoordinator assignments.
+        is_plain_member = bool(
+            request
+            and request.user
+            and request.user.is_authenticated
+            and request.user.role == "MEMBER"
+            and not user_has_people_write_coordinator_assignment(request.user)
+        )
+        visitor_only_create = bool(
+            request
+            and request.user
+            and request.user.is_authenticated
+            and not instance
+            and user_can_add_visitor(request.user)
+            and not user_can_add_person(request.user)
+        )
+
+        # Plain members editing themselves may not change staff-controlled fields.
+        if (
+            is_plain_member
+            and instance
+            and request
+            and instance.pk == request.user.pk
+        ):
+            for field in (
+                "role",
+                "status",
+                "branch",
+                "families",
+                "clusters",
+                "member_id",
+                "username",
+                "inviter",
+            ):
+                attrs.pop(field, None)
+
+        # Vital dates: cluster coordinator+ only (strip for everyone else on update).
+        if (
+            instance
+            and request
+            and request.user
+            and request.user.is_authenticated
+            and not user_can_edit_vital_dates(request.user, instance)
+        ):
+            strip_vital_date_attrs(attrs)
+
+        # Evangelism staff may create visitors only (not Members).
+        if visitor_only_create:
+            role = attrs.get("role")
+            baptism = attrs.get("water_baptism_date")
+            if role and role != "VISITOR":
+                # Form may send MEMBER after a baptism date is filled; still
+                # create as Visitor. The baptism signal promotes after save.
+                if not (role == "MEMBER" and baptism):
+                    raise serializers.ValidationError(
+                        {"role": "You can only add visitors."}
+                    )
+            attrs["role"] = "VISITOR"
+            if not request.user.branch:
+                raise serializers.ValidationError(
+                    {
+                        "branch": (
+                            "Your account must have a branch assigned before adding visitors."
+                        )
+                    }
+                )
+
+        requested_role = attrs.get("role")
+        if requested_role is not None and request and request.user.is_authenticated:
+            user = request.user
+            if requested_role == "ADMIN" and user.role != "ADMIN":
+                raise serializers.ValidationError(
+                    {"role": "Only admins can assign the Admin role."}
+                )
+            if requested_role == "PASTOR" and user.role != "ADMIN":
+                if not instance or instance.role != "PASTOR":
+                    raise serializers.ValidationError(
+                        {"role": "Only admins can assign the Pastor role."}
+                    )
+            if (
+                user.role == "MEMBER"
+                and user_can_add_person(user)
+                and requested_role not in ("MEMBER", "VISITOR")
+            ):
+                raise serializers.ValidationError(
+                    {"role": "Cluster coordinators can only assign Member or Visitor roles."}
+                )
+
+        # Water baptism ↔ MEMBER: baptized people cannot remain visitors;
+        # MEMBER requires water_baptism_date (except visitor-only create,
+        # which forces VISITOR above; the baptism signal promotes after save).
+        if not visitor_only_create:
+            merged_baptism = (
+                attrs["water_baptism_date"]
+                if "water_baptism_date" in attrs
+                else (instance.water_baptism_date if instance else None)
+            )
+            if not instance and "role" not in attrs:
+                attrs["role"] = "MEMBER" if merged_baptism else "VISITOR"
+            merged_role = (
+                attrs["role"]
+                if "role" in attrs
+                else (instance.role if instance else None)
+            )
+            if merged_baptism and merged_role == "VISITOR":
+                attrs["role"] = "MEMBER"
+                self._water_baptism_role_promotion = True
+                merged_status = (
+                    attrs["status"]
+                    if "status" in attrs
+                    else (instance.status if instance else None)
+                )
+                if merged_status in ("ONGOING", "NO_RESPONSE"):
+                    attrs["status"] = "ACTIVE"
+            elif not merged_baptism and merged_role == "MEMBER":
+                attrs["role"] = "VISITOR"
+                self._water_baptism_role_demotion = True
+                self._water_baptism_cleared = bool(
+                    instance
+                    and instance.water_baptism_date
+                    and "water_baptism_date" in attrs
+                    and attrs.get("water_baptism_date") is None
+                )
+                merged_status = (
+                    attrs["status"]
+                    if "status" in attrs
+                    else (instance.status if instance else None)
+                )
+                merged_attended = (
+                    attrs["date_first_attended"]
+                    if "date_first_attended" in attrs
+                    else (instance.date_first_attended if instance else None)
+                )
+                if merged_status != "DECEASED":
+                    if merged_status not in ("ONGOING", "NO_RESPONSE"):
+                        attrs["status"] = (
+                            "ONGOING" if merged_attended else "NO_RESPONSE"
+                        )
+
+        # App-layer required branch (DB column may still be null for legacy rows)
+        branch_in_attrs = "branch" in attrs
+
+        if not instance:
+            if not attrs.get("branch"):
+                raise serializers.ValidationError(
+                    {"branch": "Branch is required."}
+                )
+        else:
+            if branch_in_attrs and attrs.get("branch") is None:
+                raise serializers.ValidationError(
+                    {"branch": "Branch cannot be cleared."}
+                )
+
+        has_finished_lessons = attrs.get(
+            "has_finished_lessons",
+            instance.has_finished_lessons if instance else False,
+        )
+        lessons_finished_at = attrs.get(
+            "lessons_finished_at",
+            instance.lessons_finished_at if instance else None,
+        )
+        toggling_lessons_complete_on = (
+            bool(instance)
+            and attrs.get("has_finished_lessons") is True
+            and not instance.has_finished_lessons
+        )
+
+        if (not instance and has_finished_lessons) or toggling_lessons_complete_on:
+            if not lessons_finished_at:
+                raise serializers.ValidationError(
+                    {
+                        "lessons_finished_at": (
+                            "Set lessons finished date when marking lessons as finished."
+                        )
+                    }
+                )
+
+        lesson_teacher_keys = (
+            "lesson_teacher_id",
+            "historical_teacher_first_name",
+            "historical_teacher_last_name",
+            "has_finished_lessons",
+        )
+        should_validate_lesson_teacher = (
+            not instance
+            or toggling_lessons_complete_on
+            or any(key in attrs for key in lesson_teacher_keys)
+        )
+        if should_validate_lesson_teacher:
+            existing_enrollment = None
+            if instance is not None:
+                existing_enrollment = getattr(instance, "lesson_enrollment", None)
+            self._validate_lesson_teacher_write(
+                attrs,
+                instance=instance,
+                existing_enrollment=existing_enrollment,
+                has_finished_lessons=has_finished_lessons,
+            )
+
+        commitment_in_payload = "commitment_form_signed" in attrs
+        if commitment_in_payload:
+            commitment_signed = bool(attrs.get("commitment_form_signed"))
+            commitment_signed_at = attrs.get("commitment_signed_at")
+            if commitment_signed:
+                if not has_finished_lessons or not lessons_finished_at:
+                    raise serializers.ValidationError(
+                        {
+                            "commitment_form_signed": (
+                                "Mark lessons finished (with a finished date) before "
+                                "recording commitment form signed."
+                            )
+                        }
+                    )
+                if not commitment_signed_at:
+                    raise serializers.ValidationError(
+                        {
+                            "commitment_signed_at": (
+                                "Set commitment signed date when marking the form as signed."
+                            )
+                        }
+                    )
+            elif commitment_signed_at is not None:
+                raise serializers.ValidationError(
+                    {
+                        "commitment_signed_at": (
+                            "Clear commitment signed date when the form is not signed."
+                        )
+                    }
+                )
+
+        if not instance and request and request.user.role == "ADMIN":
+            role = attrs.get("role", "MEMBER")
+            if role != "VISITOR":
+                initial_password = (attrs.get("initial_password") or "").strip()
+                generate_temp = attrs.get("generate_temporary_password", True)
+                if initial_password:
+                    PasswordStrengthValidator()(initial_password)
+                elif not generate_temp:
+                    raise serializers.ValidationError(
+                        {
+                            "initial_password": (
+                                "Login-capable roles require a password. "
+                                "Enable auto-generate or provide initial_password."
+                            )
+                        }
+                    )
+        elif not instance:
+            attrs.pop("initial_password", None)
+            attrs.pop("generate_temporary_password", None)
+
+        if attrs.get("first_activity_attended") == "":
+            attrs["first_activity_attended"] = None
+
+        today = church_today()
+        person_date_fields = (
+            "date_of_birth",
+            "date_first_invited",
+            "date_first_attended",
+            "water_baptism_date",
+            "spirit_baptism_date",
+            "lessons_started_at",
+            "lessons_finished_at",
+            "commitment_signed_at",
+        )
+        future_date_errors = {}
+        for field_name in person_date_fields:
+            if field_name not in attrs:
+                continue
+            value = attrs.get(field_name)
+            if value is not None and value > today:
+                future_date_errors[field_name] = "Cannot be in the future."
+        if future_date_errors:
+            raise serializers.ValidationError(future_date_errors)
+
+        apply_title_case_name_fields(attrs, PERSON_NAME_FIELDS)
+        apply_title_case_name_fields(
+            attrs,
+            (
+                "baptized_by_first_name",
+                "baptized_by_last_name",
+                "hg_witnessed_by_first_name",
+                "hg_witnessed_by_last_name",
+            ),
+        )
+        if "nickname" in attrs:
+            first_name = attrs.get(
+                "first_name",
+                getattr(instance, "first_name", None) if instance else None,
+            )
+            if nickname_matches_first_name(first_name, attrs.get("nickname")):
+                raise serializers.ValidationError(
+                    {
+                        "nickname": (
+                            "Leave nickname blank if they go by their first name."
+                        )
+                    }
+                )
+        if "baptized_by_first_name" in attrs or "baptized_by_last_name" in attrs:
+            validate_historical_name_pair(
+                attrs.get("baptized_by_first_name"),
+                attrs.get("baptized_by_last_name"),
+                first_field="baptized_by_first_name",
+            )
+        if "hg_witnessed_by_first_name" in attrs or "hg_witnessed_by_last_name" in attrs:
+            validate_historical_name_pair(
+                attrs.get("hg_witnessed_by_first_name"),
+                attrs.get("hg_witnessed_by_last_name"),
+                first_field="hg_witnessed_by_first_name",
+            )
+
+        gender = attrs.get(
+            "gender",
+            getattr(instance, "gender", None) if instance else None,
+        )
+        if gender == "MALE":
+            attrs["maiden_name"] = ""
+
+        if not instance:
+            attrs.pop("username", None)
+        elif "username" in attrs:
+            is_admin = bool(
+                request
+                and request.user
+                and request.user.is_authenticated
+                and request.user.role == "ADMIN"
+            )
+            if not is_admin:
+                attrs.pop("username", None)
+            else:
+                try:
+                    attrs["username"] = normalize_and_validate_username(
+                        attrs.get("username"),
+                        exclude_pk=instance.pk,
+                    )
+                except DjangoValidationError as exc:
+                    raise serializers.ValidationError(
+                        {"username": list(exc.messages)}
+                    )
+
+        if instance and "status" in attrs:
+            new_status = attrs.get("status") or ""
+            if (
+                new_status != (instance.status or "")
+                and new_status in REQUIRED_MANUAL_REASON_STATUSES
+            ):
+                reason = (attrs.get("status_change_reason") or "").strip()
+                if not reason:
+                    raise serializers.ValidationError(
+                        {
+                            "status_change_reason": (
+                                "A reason is required when changing status to "
+                                "Semi-active, Inactive, Dormant, Fall Away, or Deceased."
+                            )
+                        }
+                    )
+
+        return attrs
+
+    def get_baptized_by_display_name(self, obj: Person):
+        return person_verifier_display_name(obj, BAPTISM_JOURNEY_TYPE)
+
+    def get_hg_witnessed_by_display_name(self, obj: Person):
+        return person_verifier_display_name(obj, SPIRIT_JOURNEY_TYPE)
+
+    def _trigger_legacy_lessons_backfill(
+        self,
+        *,
+        person: Person,
+        previous_has_finished_lessons: bool,
+        previous_lessons_finished_at,
+    ) -> None:
+        if not person.has_finished_lessons or not person.lessons_finished_at:
+            return
+
+        should_backfill = (
+            not previous_has_finished_lessons
+            or previous_lessons_finished_at != person.lessons_finished_at
+        )
+        if not should_backfill:
+            return
+
+        request = self.context.get("request")
+        completed_by = request.user if request and isinstance(request.user, Person) else None
+
+        from apps.lessons.services import backfill_missing_completed_lessons_for_person
+
+        backfill_missing_completed_lessons_for_person(
+            person,
+            lessons_finished_at=person.lessons_finished_at,
+            completed_by=completed_by,
+        )
+
+    def _validate_live_lesson_teacher(self, teacher, attrs, instance) -> None:
+        from apps.lessons.services import student_cannot_be_own_teacher_error
+        from apps.ministries.ncc import ensure_ncc_ministry, person_on_ncc_roster
+
+        branch = attrs.get("branch", instance.branch if instance else None)
+        if branch is None:
+            raise serializers.ValidationError(
+                {
+                    "lesson_teacher_id": (
+                        "Person must have a branch before assigning "
+                        "a lessons teacher."
+                    )
+                }
+            )
+        ensure_ncc_ministry(branch)
+        if not person_on_ncc_roster(teacher, branch):
+            raise serializers.ValidationError(
+                {
+                    "lesson_teacher_id": (
+                        "Select a teacher from this branch's NCC / "
+                        "Lessons roster."
+                    )
+                }
+            )
+        if instance is not None:
+            reason = student_cannot_be_own_teacher_error(instance, teacher)
+            if reason:
+                raise serializers.ValidationError({"lesson_teacher_id": reason})
+
+    def _validate_lesson_teacher_write(
+        self,
+        attrs,
+        *,
+        instance,
+        existing_enrollment,
+        has_finished_lessons,
+    ) -> None:
+        if existing_enrollment is not None:
+            return
+
+        teacher = attrs.get("lesson_teacher_id")
+        hist_first = (attrs.get("historical_teacher_first_name") or "").strip()
+        hist_last = (attrs.get("historical_teacher_last_name") or "").strip()
+        has_hist = bool(hist_first and hist_last)
+
+        if teacher is not None and (hist_first or hist_last):
+            raise serializers.ValidationError(
+                {
+                    "historical_teacher_first_name": (
+                        "Provide either a lessons teacher or historical "
+                        "teacher names, not both."
+                    )
+                }
+            )
+
+        if has_finished_lessons:
+            if teacher is None and not has_hist:
+                raise serializers.ValidationError(
+                    {
+                        "lesson_teacher_id": (
+                            "Select a lessons teacher, or enter former/unknown "
+                            "teacher first and last name."
+                        )
+                    }
+                )
+        elif hist_first or hist_last:
+            raise serializers.ValidationError(
+                {
+                    "historical_teacher_first_name": (
+                        "Former / unknown teacher names can only be used when "
+                        "marking lessons as finished."
+                    )
+                }
+            )
+
+        if teacher is not None:
+            self._validate_live_lesson_teacher(teacher, attrs, instance)
+
+    @staticmethod
+    def _pop_baptism_verifier_fields(validated_data: dict):
+        return {
+            "baptized_by": validated_data.pop("baptized_by", BAPTISM_VERIFIER_UNSET),
+            "hg_witnessed_by": validated_data.pop(
+                "hg_witnessed_by", BAPTISM_VERIFIER_UNSET
+            ),
+            "baptized_by_first_name": validated_data.pop(
+                "baptized_by_first_name", BAPTISM_VERIFIER_UNSET
+            ),
+            "baptized_by_last_name": validated_data.pop(
+                "baptized_by_last_name", BAPTISM_VERIFIER_UNSET
+            ),
+            "hg_witnessed_by_first_name": validated_data.pop(
+                "hg_witnessed_by_first_name", BAPTISM_VERIFIER_UNSET
+            ),
+            "hg_witnessed_by_last_name": validated_data.pop(
+                "hg_witnessed_by_last_name", BAPTISM_VERIFIER_UNSET
+            ),
+        }
+
+    @staticmethod
+    def _pop_commitment_write_fields(validated_data: dict) -> dict:
+        return {
+            "commitment_form_signed": validated_data.pop(
+                "commitment_form_signed", serializers.empty
+            ),
+            "commitment_signed_at": validated_data.pop(
+                "commitment_signed_at", serializers.empty
+            ),
+            "lesson_teacher_id": validated_data.pop(
+                "lesson_teacher_id", serializers.empty
+            ),
+            "historical_teacher_first_name": validated_data.pop(
+                "historical_teacher_first_name", serializers.empty
+            ),
+            "historical_teacher_last_name": validated_data.pop(
+                "historical_teacher_last_name", serializers.empty
+            ),
+        }
+
+    @staticmethod
+    def _teacher_write_values(write_fields: dict):
+        teacher = write_fields.get("lesson_teacher_id")
+        if teacher is serializers.empty:
+            teacher = None
+        hist_first = write_fields.get("historical_teacher_first_name")
+        if hist_first is serializers.empty:
+            hist_first = ""
+        hist_last = write_fields.get("historical_teacher_last_name")
+        if hist_last is serializers.empty:
+            hist_last = ""
+        return teacher, (hist_first or "").strip(), (hist_last or "").strip()
+
+    def _ensure_enrollment_from_write_fields(self, person: Person, write_fields: dict):
+        from apps.lessons.services import ensure_lesson_enrollment
+
+        enrollment = getattr(person, "lesson_enrollment", None)
+        if enrollment is not None:
+            return enrollment
+
+        teacher, hist_first, hist_last = self._teacher_write_values(write_fields)
+        if teacher is None and not (hist_first and hist_last):
+            return None
+
+        request = self.context.get("request")
+        actor = request.user if request and isinstance(request.user, Person) else None
+        return ensure_lesson_enrollment(
+            person,
+            teacher,
+            assigned_by=actor,
+            historical_teacher_first_name=hist_first,
+            historical_teacher_last_name=hist_last,
+        )
+
+    def _apply_commitment_write(self, person: Person, write_fields: dict) -> None:
+        from apps.lessons.services import (
+            _as_aware_datetime,
+            clear_enrollment_commitment_signed,
+            set_enrollment_commitment_signed,
+        )
+
+        request = self.context.get("request")
+        actor = request.user if request and isinstance(request.user, Person) else None
+
+        enrollment = self._ensure_enrollment_from_write_fields(person, write_fields)
+
+        commitment_value = write_fields.get("commitment_form_signed")
+        if commitment_value is serializers.empty:
+            return
+
+        if not commitment_value:
+            if enrollment and enrollment.commitment_signed:
+                clear_enrollment_commitment_signed(enrollment)
+            return
+
+        if enrollment is None:
+            enrollment = self._ensure_enrollment_from_write_fields(
+                person, write_fields
+            )
+        if enrollment is None:
+            raise serializers.ValidationError(
+                {
+                    "lesson_teacher_id": (
+                        "Select a lessons teacher, or enter former/unknown "
+                        "teacher first and last name."
+                    )
+                }
+            )
+
+        signed_at = write_fields.get("commitment_signed_at")
+        if signed_at is serializers.empty or signed_at is None:
+            raise serializers.ValidationError(
+                {
+                    "commitment_signed_at": (
+                        "Set commitment signed date when marking the form as signed."
+                    )
+                }
+            )
+        set_enrollment_commitment_signed(
+            enrollment,
+            signed_by=actor,
+            signed_at=_as_aware_datetime(signed_at),
+        )
+
+    def create(self, validated_data):
+        request = self.context.get("request")
+        visitor_only_create = bool(
+            request
+            and request.user
+            and user_can_add_visitor(request.user)
+            and not user_can_add_person(request.user)
+        )
+        if visitor_only_create:
+            validated_data["role"] = "VISITOR"
+            validated_data["inviter"] = request.user
+            if not validated_data.get("branch"):
+                validated_data["branch"] = request.user.branch
+
+        commitment_write = self._pop_commitment_write_fields(validated_data)
+        verifier_write = self._pop_baptism_verifier_fields(validated_data)
+
+        note = validated_data.pop("note", "").strip() if "note" in validated_data else ""
+        validated_data.pop("status_change_reason", None)
+        initial_password = (validated_data.pop("initial_password", None) or "").strip()
+        generate_temporary_password = validated_data.pop(
+            "generate_temporary_password", True
+        )
+        families = (
+            validated_data.pop("families") if "families" in validated_data else None
+        )
+        clusters = (
+            validated_data.pop("clusters") if "clusters" in validated_data else None
+        )
+
+        first_name = validated_data.get("first_name", "")
+        last_name = validated_data.get("last_name", "")
+
+        if not first_name or not last_name:
+            raise serializers.ValidationError(
+                "Both first name and last name are required to generate username."
+            )
+
+        validated_data.pop("username", None)
+        validated_data["username"] = generate_unique_username(
+            first_name, last_name
+        )
+        person = Person(**validated_data)
+        stash_baptism_verifiers(person, **verifier_write)
+        person.save()
+        self._apply_memberships(person, families=families, clusters=clusters)
+
+        if (
+            request
+            and request.user.role == "ADMIN"
+            and person.role != "VISITOR"
+        ):
+            password = None
+            if initial_password:
+                password = initial_password
+            elif generate_temporary_password:
+                password = secrets.token_urlsafe(10)
+                self._temporary_password = password
+
+            if password:
+                person.set_password(password)
+                person.must_change_password = True
+                person.first_login = True
+                person.save(
+                    update_fields=["password", "must_change_password", "first_login"]
+                )
+
+        self._trigger_legacy_lessons_backfill(
+            person=person,
+            previous_has_finished_lessons=False,
+            previous_lessons_finished_at=None,
+        )
+        self._apply_commitment_write(person, commitment_write)
+
+        if note:
+            Journey.objects.create(
+                user=person,
+                type="NOTE",
+                title="Visitor note",
+                description=note,
+                date=person.date_first_attended or church_today(),
+                verified_by=None,
+            )
+
+        self._sync_evangelism_pipeline_after_save(person, note=note or None)
+        return person
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if self._temporary_password:
+            data["temporary_password"] = self._temporary_password
+        enrollment = self._lesson_enrollment(instance)
+        data["commitment_form_signed"] = bool(
+            enrollment and enrollment.commitment_signed
+        )
+        data["commitment_signed_at"] = (
+            enrollment.commitment_signed_at
+            if enrollment and enrollment.commitment_signed
+            else None
+        )
+        data["has_lesson_enrollment"] = enrollment is not None
+        data["lesson_teacher_display_name"] = (
+            enrollment.teacher_display_name() if enrollment else None
+        )
+        return data
+
+    def update(self, instance, validated_data):
+        """Update person and track branch transfers"""
+        previous_has_finished_lessons = instance.has_finished_lessons
+        previous_lessons_finished_at = instance.lessons_finished_at
+        # Store old branch value before update
+        old_branch = instance.branch
+        old_status = instance.status
+        status_change_reason = (
+            validated_data.pop("status_change_reason", None) or ""
+        ).strip()
+
+        commitment_write = self._pop_commitment_write_fields(validated_data)
+        verifier_write = self._pop_baptism_verifier_fields(validated_data)
+        stash_baptism_verifiers(instance, **verifier_write)
+
+        families = (
+            validated_data.pop("families") if "families" in validated_data else None
+        )
+        clusters = (
+            validated_data.pop("clusters") if "clusters" in validated_data else None
+        )
+
+        delete_person_photo_if_cleared(instance, validated_data)
+
+        # Perform the update
+        updated_instance = super().update(instance, validated_data)
+        self._apply_memberships(
+            updated_instance, families=families, clusters=clusters
+        )
+        self._trigger_legacy_lessons_backfill(
+            person=updated_instance,
+            previous_has_finished_lessons=previous_has_finished_lessons,
+            previous_lessons_finished_at=previous_lessons_finished_at,
+        )
+        self._apply_commitment_write(updated_instance, commitment_write)
+        updated_instance.refresh_from_db()
+
+        new_branch = updated_instance.branch
+        if old_branch != new_branch:
+            prune_person_from_mismatched_branch_clusters(updated_instance)
+
+        # Check if branch changed (named transfers logged as journeys)
+        if (
+            old_branch != new_branch
+            and old_branch is not None
+            and new_branch is not None
+        ):
+            # Create Journey entry for branch transfer
+            Journey.objects.create(
+                user=updated_instance,
+                type="BRANCH_TRANSFER",
+                title="Branch Transfer",
+                description=f"Transferred from {old_branch.name} to {new_branch.name}",
+                date=church_today(),
+                verified_by=None,
+            )
+
+        if old_status != updated_instance.status:
+            request = self.context.get("request")
+            baptism_promotion = getattr(self, "_water_baptism_role_promotion", False)
+            baptism_demotion = getattr(self, "_water_baptism_role_demotion", False)
+            if baptism_promotion:
+                record_person_status_change(
+                    person=updated_instance,
+                    from_status=old_status,
+                    to_status=updated_instance.status,
+                    source=PersonStatusChange.Source.SYSTEM,
+                    reason="Status set after water baptism.",
+                )
+            elif baptism_demotion:
+                reason = (
+                    "Status set after water baptism date was cleared."
+                    if getattr(self, "_water_baptism_cleared", False)
+                    else "Status set because Member requires water baptism date."
+                )
+                record_person_status_change(
+                    person=updated_instance,
+                    from_status=old_status,
+                    to_status=updated_instance.status,
+                    source=PersonStatusChange.Source.SYSTEM,
+                    reason=reason,
+                )
+            else:
+                changed_by = (
+                    request.user
+                    if request and getattr(request, "user", None) and request.user.is_authenticated
+                    else None
+                )
+                record_person_status_change(
+                    person=updated_instance,
+                    from_status=old_status,
+                    to_status=updated_instance.status,
+                    source=PersonStatusChange.Source.MANUAL,
+                    reason=status_change_reason,
+                    changed_by=changed_by,
+                )
+
+        self._sync_evangelism_pipeline_after_save(
+            updated_instance, note=None
+        )
+        return updated_instance
+
+    def _sync_evangelism_pipeline_after_save(self, person, *, note=None):
+        try:
+            from apps.evangelism.services import sync_person_evangelism_pipeline
+        except ImportError:
+            return
+        sync_person_evangelism_pipeline(person, notes=note)
+
+    def get_cluster_codes(self, obj: Person):
+        # Use .all() so prefetched clusters are reused (avoids N+1 on list).
+        return [c.code for c in obj.clusters.all() if c.code]
+
+    def get_cluster_labels(self, obj: Person):
+        return cluster_export_labels(obj)
+
+    def get_cluster_memberships(self, obj: Person):
+        return cluster_membership_payloads(obj)
+
+    def get_branch_code(self, obj: Person):
+        branch = getattr(obj, "branch", None)
+        if branch and branch.code:
+            return branch.code
+        return None
+
+    def get_family_names(self, obj: Person):
+        return [f.name for f in obj.families.all()]
+
+    def get_latest_status_change(self, obj: Person):
+        change = obj.status_changes.order_by("-created_at", "-id").first()
+        if not change:
+            return None
+        return PersonStatusChangeSerializer(change).data
+
+    def get_open_care_case(self, obj: Person):
+        from apps.clusters.permissions import (
+            can_access_member_care,
+            filter_care_cases_for_user,
+        )
+
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        if not user or not can_access_member_care(user):
+            return None
+        case = MemberCareCase.objects.filter(person=obj).first()
+        if case is None or not case.is_open_caseload:
+            return None
+        scoped = filter_care_cases_for_user(
+            user, MemberCareCase.objects.filter(pk=case.pk)
+        )
+        if not scoped.exists():
+            return None
+        return MemberCareCaseSerializer(case, context=self.context).data
+
+    def _lesson_enrollment(self, obj: Person):
+        # Reverse OneToOne raises DoesNotExist (also AttributeError); getattr
+        # with default yields None when the person has no enrollment.
+        return getattr(obj, "lesson_enrollment", None)
+
+    def get_has_lesson_enrollment(self, obj: Person) -> bool:
+        return self._lesson_enrollment(obj) is not None
+
+    def get_lesson_teacher_display_name(self, obj: Person):
+        enrollment = self._lesson_enrollment(obj)
+        if not enrollment:
+            return None
+        return enrollment.teacher_display_name()
+
+    def get_inviter_display_name(self, obj: Person):
+        inviter = getattr(obj, "inviter", None)
+        if not inviter:
+            return None
+        return format_person_display_name(inviter) or None
+
+    def get_can_view_journey_timeline(self, obj: Person):
+        """
+        Check if the current user can view the journey timeline for this person.
+        Permission rules:
+        1. Always allowed if viewing own profile
+        2. ADMIN and PASTOR roles have full access
+        3. Senior Coordinators in CLUSTER, EVANGELISM, SUNDAY_SCHOOL, or LESSONS modules
+        4. Cluster Coordinators can see journey timelines for members of their assigned cluster(s)
+        """
+        request = self.context.get("request")
+        if not request or not request.user or not request.user.is_authenticated:
+            return False
+
+        user = request.user
+
+        # 1. Own profile - always allowed
+        if user.id == obj.id:
+            return True
+
+        # 2. ADMIN and PASTOR roles - full access
+        if user.role in ["ADMIN", "PASTOR"]:
+            return True
+
+        # 3. Senior Coordinators in allowed modules
+        allowed_modules = [
+            ModuleCoordinator.ModuleType.CLUSTER,
+            ModuleCoordinator.ModuleType.EVANGELISM,
+            ModuleCoordinator.ModuleType.SUNDAY_SCHOOL,
+            ModuleCoordinator.ModuleType.LESSONS,
+        ]
+        for module in allowed_modules:
+            if user.is_senior_coordinator(module):
+                return True
+
+        # 4. Cluster Coordinator - check if person is in their cluster(s)
+        if user.is_module_coordinator(
+            ModuleCoordinator.ModuleType.CLUSTER,
+            level=ModuleCoordinator.CoordinatorLevel.COORDINATOR,
+        ):
+            from apps.clusters.permissions import managed_cluster_ids_for_coordinator
+
+            cluster_ids = managed_cluster_ids_for_coordinator(user)
+            if not cluster_ids:
+                return False
+            return obj.clusters.filter(id__in=cluster_ids).exists()
+
+        return False
+
+    def get_can_view_profile(self, obj: Person):
+        """
+        Whether the requester may open this person's profile (retrieve).
+
+        Cluster coordinators can list/search same-branch people, but profile
+        access stays limited to managed-cluster scope (and other module scopes).
+        """
+        request = self.context.get("request")
+        if not request or not request.user or not request.user.is_authenticated:
+            return False
+
+        user = request.user
+        if user.id == obj.id:
+            return True
+
+        if self.context.get("profile_all_visible"):
+            return True
+
+        profile_visible_ids = self.context.get("profile_visible_ids")
+        if profile_visible_ids is not None:
+            return obj.pk in profile_visible_ids
+
+        # retrieve/create/update responses: if the object was returned, allow.
+        view = self.context.get("view")
+        if view is not None and hasattr(view, "_scoped_people_queryset"):
+            return (
+                view._scoped_people_queryset(for_profile=True)
+                .filter(pk=obj.pk)
+                .exists()
+            )
+
+        return True
+
+
+class PersonListSerializer(serializers.ModelSerializer):
+    """Slim read-only serializer for paginated directory / search list responses."""
+
+    cluster_codes = serializers.SerializerMethodField()
+    cluster_labels = serializers.SerializerMethodField()
+    branch_code = serializers.SerializerMethodField()
+    family_names = serializers.SerializerMethodField()
+    can_view_profile = serializers.SerializerMethodField()
+    cluster_ids = serializers.PrimaryKeyRelatedField(
+        source="clusters", many=True, read_only=True
+    )
+    first_activity_attended = serializers.SlugRelatedField(
+        slug_field="code", read_only=True
+    )
+
+    class Meta:
+        model = Person
+        fields = [
+            "id",
+            "username",
+            "email",
+            "first_name",
+            "last_name",
+            "middle_name",
+            "suffix",
+            "nickname",
+            "maiden_name",
+            "gender",
+            "facebook_name",
+            "photo",
+            "role",
+            "phone",
+            "address",
+            "country",
+            "status",
+            "branch",
+            "branch_code",
+            "member_id",
+            "date_of_birth",
+            "date_first_attended",
+            "water_baptism_date",
+            "spirit_baptism_date",
+            "first_activity_attended",
+            "cluster_codes",
+            "cluster_labels",
+            "cluster_ids",
+            "family_names",
+            "can_view_profile",
+        ]
+
+    def get_cluster_codes(self, obj: Person):
+        return [c.code for c in obj.clusters.all() if c.code]
+
+    def get_cluster_labels(self, obj: Person):
+        return cluster_export_labels(obj)
+
+    def get_branch_code(self, obj: Person):
+        branch = getattr(obj, "branch", None)
+        if branch and branch.code:
+            return branch.code
+        return None
+
+    def get_family_names(self, obj: Person):
+        return [f.name for f in obj.families.all()]
+
+    def get_can_view_profile(self, obj: Person):
+        request = self.context.get("request")
+        if not request or not request.user or not request.user.is_authenticated:
+            return False
+
+        user = request.user
+        if user.id == obj.id:
+            return True
+
+        if self.context.get("profile_all_visible"):
+            return True
+
+        profile_visible_ids = self.context.get("profile_visible_ids")
+        if profile_visible_ids is not None:
+            return obj.pk in profile_visible_ids
+
+        view = self.context.get("view")
+        if view is not None and hasattr(view, "_scoped_people_queryset"):
+            return (
+                view._scoped_people_queryset(for_profile=True)
+                .filter(pk=obj.pk)
+                .exists()
+            )
+
+        return True
+
+
+def _family_member_preview_rows(members, limit=None):
+    """Slim household rows for list/detail; admins are never shown."""
+    rows = []
+    for member in members:
+        if member.role == "ADMIN":
+            continue
+        rows.append(
+            {
+                "id": member.id,
+                "first_name": member.first_name or "",
+                "last_name": member.last_name or "",
+                "role": member.role or "",
+                "photo": member.photo.url if member.photo else None,
+            }
+        )
+        if limit is not None and len(rows) >= limit:
+            break
+    return rows
+
+
+class FamilyMemberPreviewSerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    first_name = serializers.CharField(allow_blank=True)
+    last_name = serializers.CharField(allow_blank=True)
+    role = serializers.CharField(allow_blank=True)
+    photo = serializers.ImageField(allow_null=True, required=False)
+
+
+class FamilyListSerializer(serializers.ModelSerializer):
+    """Slim read-only serializer for paginated families directory."""
+
+    member_count = serializers.IntegerField(read_only=True)
+    visitor_count = serializers.IntegerField(read_only=True)
+    member_preview = serializers.SerializerMethodField()
+    leader = serializers.PrimaryKeyRelatedField(read_only=True)
+
+    class Meta:
+        model = Family
+        fields = [
+            "id",
+            "name",
+            "leader",
+            "branch",
+            "notes",
+            "is_active",
+            "created_at",
+            "member_count",
+            "visitor_count",
+            "member_preview",
+        ]
+
+    def get_member_preview(self, obj: Family):
+        return _family_member_preview_rows(obj.members.all(), limit=5)
+
+
+class FamilySerializer(serializers.ModelSerializer):
+    leader = serializers.PrimaryKeyRelatedField(
+        queryset=Person.objects.exclude(role="ADMIN"), allow_null=True
+    )
+    members = serializers.PrimaryKeyRelatedField(
+        many=True, queryset=Person.objects.exclude(role="ADMIN")
+    )
+    members_details = serializers.SerializerMethodField()
+    member_count = serializers.SerializerMethodField()
+    visitor_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Family
+        fields = [
+            "id",
+            "name",
+            "leader",
+            "members",
+            "members_details",
+            "member_count",
+            "visitor_count",
+            "branch",
+            "address",
+            "notes",
+            "is_active",
+            "created_at",
+        ]
+        read_only_fields = [
+            "created_at",
+            "members_details",
+            "member_count",
+            "visitor_count",
+        ]
+
+    def get_members_details(self, obj: Family):
+        return _family_member_preview_rows(obj.members.all())
+
+    def get_member_count(self, obj: Family):
+        annotated = obj.__dict__.get("member_count")
+        if isinstance(annotated, int):
+            return annotated
+        return count_family_members(obj)
+
+    def get_visitor_count(self, obj: Family):
+        annotated = obj.__dict__.get("visitor_count")
+        if isinstance(annotated, int):
+            return annotated
+        return count_family_visitors(obj)
+
+    def _get_person_label(self, person: Person) -> str:
+        return person.get_full_name() or person.username
+
+    def _create_family_journeys(self, people, title: str, description: str) -> None:
+        if not people:
+            return
+        journey_date = church_today()
+        Journey.objects.bulk_create(
+            [
+                Journey(
+                    user=person,
+                    title=title,
+                    description=description,
+                    date=journey_date,
+                    type="NOTE",
+                )
+                for person in people
+            ]
+        )
+
+    def _build_family_created_description(self, family: Family) -> str:
+        leader_name = (
+            self._get_person_label(family.leader) if family.leader else "Unassigned"
+        )
+        member_count = family.members.count()
+        return f"Leader: {leader_name}. Members: {member_count}."
+
+    def _build_member_added_description(self, family: Family) -> str:
+        leader_name = self._get_person_label(family.leader) if family.leader else None
+        if leader_name:
+            return f"Added to family led by {leader_name}."
+        return "Added to family."
+
+    def _build_address_updated_description(
+        self, old_address: str, new_address: str
+    ) -> str:
+        old_value = old_address or "Not set"
+        new_value = new_address or "Not set"
+        return f'Address updated from "{old_value}" to "{new_value}".'
+
+    def create(self, validated_data):
+        members = validated_data.pop("members", [])
+        family = super().create(validated_data)
+        family._suppress_member_journeys = True
+        if members:
+            family.members.set(members)
+        family._suppress_member_journeys = False
+        people = list(family.members.all())
+        if family.leader and family.leader not in people:
+            people.append(family.leader)
+        title = f"Family created: {family.name}"
+        description = self._build_family_created_description(family)
+        self._create_family_journeys(people, title, description)
+        return family
+
+    def update(self, instance, validated_data):
+        previous_address = instance.address
+        family = super().update(instance, validated_data)
+
+        if previous_address != family.address:
+            people = list(family.members.all())
+            if family.leader and family.leader not in people:
+                people.append(family.leader)
+            title = f"Family address updated: {family.name}"
+            description = self._build_address_updated_description(
+                previous_address, family.address
+            )
+            self._create_family_journeys(people, title, description)
+
+        return family

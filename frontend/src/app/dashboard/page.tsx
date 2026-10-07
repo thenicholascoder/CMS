@@ -1,0 +1,1405 @@
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import DashboardLayout from "@/src/components/layout/DashboardLayout";
+import ProtectedRoute from "@/src/components/auth/ProtectedRoute";
+import Card from "@/src/components/ui/Card";
+import LoadingSpinner from "@/src/components/ui/LoadingSpinner";
+import ErrorMessage from "@/src/components/ui/ErrorMessage";
+import Button from "@/src/components/ui/Button";
+import {
+  attendanceApi,
+  clustersApi,
+  clusterReportsApi,
+  evangelismApi,
+  eventsApi,
+  lessonsApi,
+  sundaySchoolApi,
+} from "@/src/lib/api";
+import {
+  LessonProgressSummary,
+  LessonProgressSummaryByLesson,
+} from "@/src/types/lesson";
+import { usePeople } from "@/src/hooks/usePeople";
+import { useModuleSettings } from "@/src/hooks/useModuleSettings";
+import { canWriteLessons } from "@/src/lib/lessons/lessonsPermissions";
+import { Person } from "@/src/types/person";
+import { ArrowDownRight, ArrowUpRight, Minus } from "lucide-react";
+import QuickActions from "@/src/components/dashboard/QuickActions";
+import RecentActivity, {
+  Activity as RecentActivityItem,
+} from "@/src/components/dashboard/RecentActivity";
+import { useAuth } from "@/src/contexts/AuthContext";
+import { Event } from "@/src/types/event";
+import { EvangelismPeopleTallyRow } from "@/src/types/evangelism";
+import { SundaySchoolSummary } from "@/src/types/sundaySchool";
+import Modal from "@/src/components/ui/Modal";
+import ClusterWeeklyReportForm from "@/src/components/reports/ClusterWeeklyReportForm";
+import SundaySelfCheckInBanner from "@/src/components/events/SundaySelfCheckInBanner";
+import { Cluster, ClusterWeeklyReport } from "@/src/types/cluster";
+import { formatPersonName } from "@/src/lib/name";
+
+type UpcomingEvent = {
+  id: string;
+  title: string;
+  schedule: string;
+  location: string;
+  date: Date;
+};
+
+type EventActivity = {
+  id: string;
+  title: string;
+  date: Date;
+};
+
+const formatEventSchedule = (date: Date) =>
+  date.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+
+const formatApiDate = (date: Date) => date.toISOString().slice(0, 10);
+
+/** Sunday Service occurrences from API events that fall within [monthStart, throughDate] (month-to-date). */
+function collectSundayServiceOccurrencesThroughDate(
+  events: Event[],
+  monthStart: Date,
+  throughDate: Date,
+): { eventId: string; occurrenceDate: Date }[] {
+  const monthEnd = new Date(
+    throughDate.getFullYear(),
+    throughDate.getMonth() + 1,
+    0,
+    23,
+    59,
+    59,
+    999,
+  );
+  const windowEnd = new Date(
+    Math.min(monthEnd.getTime(), throughDate.getTime()),
+  );
+  const out: { eventId: string; occurrenceDate: Date }[] = [];
+
+  for (const event of events) {
+    if (event.type !== "SUNDAY_SERVICE") continue;
+    if (event.occurrences && event.occurrences.length > 0) {
+      for (const occ of event.occurrences) {
+        const d = new Date(occ.start_date);
+        if (d >= monthStart && d <= windowEnd && !Number.isNaN(d.getTime())) {
+          out.push({ eventId: String(event.id), occurrenceDate: d });
+        }
+      }
+    } else {
+      const d = new Date(event.start_date);
+      if (d >= monthStart && d <= windowEnd && !Number.isNaN(d.getTime())) {
+        out.push({ eventId: String(event.id), occurrenceDate: d });
+      }
+    }
+  }
+  return out.sort(
+    (a, b) => a.occurrenceDate.getTime() - b.occurrenceDate.getTime(),
+  );
+}
+
+const formatRelativeTime = (date: Date) => {
+  const now = new Date();
+  const diffMs = date.getTime() - now.getTime();
+  const diffSeconds = Math.round(diffMs / 1000);
+  const diffMinutes = Math.round(diffSeconds / 60);
+  const diffHours = Math.round(diffMinutes / 60);
+  const diffDays = Math.round(diffHours / 24);
+
+  if (Math.abs(diffSeconds) < 60) {
+    return "Just now";
+  }
+  if (Math.abs(diffMinutes) < 60) {
+    return new Intl.RelativeTimeFormat(undefined, {
+      numeric: "auto",
+    }).format(diffMinutes, "minute");
+  }
+  if (Math.abs(diffHours) < 24) {
+    return new Intl.RelativeTimeFormat(undefined, {
+      numeric: "auto",
+    }).format(diffHours, "hour");
+  }
+  return new Intl.RelativeTimeFormat(undefined, {
+    numeric: "auto",
+  }).format(diffDays, "day");
+};
+
+type TrendDirection = "up" | "down" | "flat";
+
+type MetricTrend = {
+  direction: TrendDirection;
+  label: string;
+};
+
+// TODO: Remove dummy fallback when Sunday Service MTD attendance is consistently sourced from events — placeholder used when no eligible occurrences exist or the Events API fails.
+const DUMMY_SUNDAY_SERVICE_MTD_AVG = 48;
+
+/** Previous calendar month (handles January → December). */
+function getPriorCalendarMonth(now: Date): { year: number; month: number } {
+  const d = new Date(now.getFullYear(), now.getMonth() - 1, 15);
+  return { year: d.getFullYear(), month: d.getMonth() + 1 };
+}
+
+/** Same calendar day mapped into prior month, capped to that month's last day (MTD parity). */
+function getPriorMonthMtdThroughDate(now: Date): Date {
+  const dom = now.getDate();
+  const lastPrev = new Date(now.getFullYear(), now.getMonth(), 0);
+  const cap = Math.min(dom, lastPrev.getDate());
+  return new Date(now.getFullYear(), now.getMonth() - 1, cap, 23, 59, 59, 999);
+}
+
+async function computeSundayServiceMtdAverageHeadcount(
+  eventsList: Event[],
+  monthStart: Date,
+  throughDate: Date,
+): Promise<number | null> {
+  const occs = collectSundayServiceOccurrencesThroughDate(
+    eventsList,
+    monthStart,
+    throughDate,
+  );
+  if (occs.length === 0) return null;
+  const counts: number[] = [];
+  for (const o of occs) {
+    try {
+      const att = await attendanceApi.byEvent(o.eventId, {
+        occurrence_date: formatApiDate(o.occurrenceDate),
+      });
+      const list = att.data ?? [];
+      counts.push(list.filter((rec) => rec.status === "PRESENT").length);
+    } catch {
+      counts.push(0);
+    }
+  }
+  const sum = counts.reduce((a, b) => a + b, 0);
+  return counts.length ? Math.round((sum / counts.length) * 10) / 10 : null;
+}
+
+function countMomTrend(
+  current: number | null | undefined,
+  previous: number | null | undefined,
+  loading: boolean,
+): { direction: TrendDirection; label: string } | undefined {
+  if (loading) return undefined;
+  const cur = current ?? 0;
+  if (previous === null || previous === undefined) {
+    return { direction: "flat", label: "No data last month" };
+  }
+  if (cur === previous) {
+    return { direction: "flat", label: "Same as last month" };
+  }
+  const delta = cur - previous;
+  return delta > 0
+    ? { direction: "up", label: `+${delta} from last month` }
+    : { direction: "down", label: `${delta} from last month` };
+}
+
+function percentPointsMomTrend(
+  current: number | null | undefined,
+  previous: number | null | undefined,
+  loading: boolean,
+): { direction: TrendDirection; label: string } | undefined {
+  if (loading) return undefined;
+  if (current === null || current === undefined) {
+    return { direction: "flat", label: "No data this month" };
+  }
+  if (previous === null || previous === undefined) {
+    return { direction: "flat", label: "No data last month" };
+  }
+  const delta = Math.round((current - previous) * 10) / 10;
+  if (delta === 0) {
+    return { direction: "flat", label: "Same as last month" };
+  }
+  return delta > 0
+    ? { direction: "up", label: `+${delta} pts from last month` }
+    : { direction: "down", label: `${delta} pts from last month` };
+}
+
+function avgAttendeesMomTrend(
+  current: number | null,
+  previous: number | null,
+  loading: boolean,
+  placeholder: boolean,
+): { direction: TrendDirection; label: string } | undefined {
+  if (loading || placeholder) return undefined;
+  if (current === null || previous === null) {
+    return { direction: "flat", label: "Insufficient data to compare" };
+  }
+  const delta = Math.round((current - previous) * 10) / 10;
+  if (delta === 0) {
+    return {
+      direction: "flat",
+      label: "Same avg. as last month (MTD)",
+    };
+  }
+  return delta > 0
+    ? {
+        direction: "up",
+        label: `+${delta} avg attendees vs last month (MTD)`,
+      }
+    : {
+        direction: "down",
+        label: `${delta} avg attendees vs last month (MTD)`,
+      };
+}
+
+function averageClusterMemberRates(
+  results: Pick<ClusterWeeklyReport, "member_attendance_rate">[],
+): number | null {
+  const rates = results
+    .map((r) => r.member_attendance_rate)
+    .filter((n): n is number => typeof n === "number" && !Number.isNaN(n));
+  return rates.length
+    ? Math.round((rates.reduce((a, b) => a + b, 0) / rates.length) * 10) / 10
+    : null;
+}
+
+export default function Dashboard() {
+  const { user, isModuleCoordinator, isSeniorCoordinator } = useAuth();
+  const { moduleEnabled } = useModuleSettings();
+  const [lessonSummary, setLessonSummary] =
+    useState<LessonProgressSummary | null>(null);
+  const [lessonSummaryLoading, setLessonSummaryLoading] = useState(true);
+  const [lessonSummaryError, setLessonSummaryError] = useState<string | null>(
+    null,
+  );
+  const [upcomingEvents, setUpcomingEvents] = useState<UpcomingEvent[]>([]);
+  const [eventsLoading, setEventsLoading] = useState(false);
+  const [eventsError, setEventsError] = useState<string | null>(null);
+  const [eventActivity, setEventActivity] = useState<EventActivity[]>([]);
+  const [showReportForm, setShowReportForm] = useState(false);
+  const [peopleTallyMonth, setPeopleTallyMonth] =
+    useState<EvangelismPeopleTallyRow | null>(null);
+  const [peopleTallyPrevMonth, setPeopleTallyPrevMonth] =
+    useState<EvangelismPeopleTallyRow | null>(null);
+  const [sundaySchoolSummary, setSundaySchoolSummary] =
+    useState<SundaySchoolSummary | null>(null);
+  const [sundaySchoolSummaryPrev, setSundaySchoolSummaryPrev] =
+    useState<SundaySchoolSummary | null>(null);
+  const [clusterAttendanceAvgPct, setClusterAttendanceAvgPct] = useState<
+    number | null
+  >(null);
+  const [clusterAttendanceAvgPctPrev, setClusterAttendanceAvgPctPrev] =
+    useState<number | null>(null);
+  const [sundayServiceMtdAvg, setSundayServiceMtdAvg] = useState<number | null>(
+    null,
+  );
+  const [sundayServiceMtdAvgPrev, setSundayServiceMtdAvgPrev] = useState<
+    number | null
+  >(null);
+  const [sundayServicePlaceholder, setSundayServicePlaceholder] =
+    useState(false);
+  const [extendedMetricsLoading, setExtendedMetricsLoading] = useState(false);
+  const [sundayServiceLoading, setSundayServiceLoading] = useState(false);
+  const [extendedMetricsError, setExtendedMetricsError] = useState<
+    string | null
+  >(null);
+  const [reportClusters, setReportClusters] = useState<Cluster[]>([]);
+  const [reportClustersLoading, setReportClustersLoading] = useState(false);
+  const [reportSelectedCluster, setReportSelectedCluster] =
+    useState<Cluster | null>(null);
+
+  const isCoordinatorPlus = useMemo(() => {
+    if (!user) return false;
+    return user.role !== "MEMBER";
+  }, [user]);
+
+  const canViewPeople = useMemo(() => {
+    if (!user) return false;
+    return (
+      ["MEMBER", "PASTOR", "ADMIN"].includes(user.role) ||
+      isSeniorCoordinator()
+    );
+  }, [user, isSeniorCoordinator]);
+
+  /** Matches backend HasModuleAccess('LESSONS','write') including NCC ministry coordinators. */
+  const canViewLessons = useMemo(
+    () => canWriteLessons({ user, moduleEnabled }),
+    [user, moduleEnabled],
+  );
+
+  const canViewEvents = useMemo(() => {
+    if (!user) return false;
+    return (
+      ["MEMBER", "PASTOR", "ADMIN"].includes(user.role) ||
+      isModuleCoordinator("EVENTS") ||
+      isSeniorCoordinator()
+    );
+  }, [user, isModuleCoordinator, isSeniorCoordinator]);
+
+  const canSubmitClusterReport = useMemo(() => {
+    if (!user) return false;
+    return (
+      user.role === "PASTOR" ||
+      user.role === "ADMIN" ||
+      isModuleCoordinator("CLUSTER") ||
+      isSeniorCoordinator("CLUSTER")
+    );
+  }, [isModuleCoordinator, isSeniorCoordinator, user]);
+
+  const allowPeopleMetrics = isCoordinatorPlus && canViewPeople;
+  const allowEventsWidgets = canViewEvents;
+  const allowLessonWidgets = canViewLessons;
+  /** Coordinators and above: extra ministry metric tiles (evangelism, clusters, Sunday School, Sunday Service). */
+  const allowExtendedDashboardMetrics = isCoordinatorPlus;
+
+  const {
+    people,
+    loading: peopleLoading,
+    error: peopleError,
+  } = usePeople(allowPeopleMetrics);
+
+  useEffect(() => {
+    if (!allowLessonWidgets) {
+      setLessonSummary(null);
+      setLessonSummaryError(null);
+      setLessonSummaryLoading(false);
+      return;
+    }
+    const fetchLessonSummary = async () => {
+      try {
+        setLessonSummaryLoading(true);
+        const response = await lessonsApi.summary();
+        setLessonSummary(response.data);
+        setLessonSummaryError(null);
+      } catch (error) {
+        setLessonSummaryError("Unable to load lesson analytics.");
+      } finally {
+        setLessonSummaryLoading(false);
+      }
+    };
+
+    fetchLessonSummary();
+  }, [allowLessonWidgets]);
+
+  useEffect(() => {
+    if (!allowEventsWidgets) {
+      setUpcomingEvents([]);
+      setEventActivity([]);
+      setEventsError(null);
+      setEventsLoading(false);
+      return;
+    }
+
+    const fetchEvents = async () => {
+      try {
+        setEventsLoading(true);
+        const now = new Date();
+        const end = new Date(now);
+        end.setDate(end.getDate() + 60);
+        const response = await eventsApi.getAll({
+          start: formatApiDate(now),
+          end: formatApiDate(end),
+        });
+        const events = response.data ?? [];
+        const occurrences = events.flatMap((event: Event) => {
+          if (event.occurrences && event.occurrences.length > 0) {
+            return event.occurrences.map((occurrence) => ({
+              id:
+                occurrence.occurrence_id ||
+                `${event.id}:${occurrence.start_date}`,
+              title: event.title,
+              location: event.location,
+              startDate: new Date(occurrence.start_date),
+            }));
+          }
+          return [
+            {
+              id: `${event.id}:${event.start_date}`,
+              title: event.title,
+              location: event.location,
+              startDate: new Date(event.start_date),
+            },
+          ];
+        });
+
+        const upcoming = occurrences
+          .filter((occurrence) => occurrence.startDate >= now)
+          .sort((a, b) => a.startDate.getTime() - b.startDate.getTime())
+          .slice(0, 3)
+          .map((occurrence) => ({
+            id: occurrence.id,
+            title: occurrence.title,
+            schedule: formatEventSchedule(occurrence.startDate),
+            location: occurrence.location,
+            date: occurrence.startDate,
+          }));
+
+        const recentCutoff = new Date();
+        recentCutoff.setDate(recentCutoff.getDate() - 7);
+        const recentActivity = occurrences
+          .filter(
+            (occurrence) =>
+              occurrence.startDate >= recentCutoff &&
+              occurrence.startDate <= now,
+          )
+          .sort((a, b) => b.startDate.getTime() - a.startDate.getTime())
+          .slice(0, 5)
+          .map((occurrence) => ({
+            id: occurrence.id,
+            title: occurrence.title,
+            date: occurrence.startDate,
+          }));
+
+        setUpcomingEvents(upcoming);
+        setEventActivity(recentActivity);
+        setEventsError(null);
+      } catch (error) {
+        setEventsError("Unable to load events.");
+        setUpcomingEvents([]);
+        setEventActivity([]);
+      } finally {
+        setEventsLoading(false);
+      }
+    };
+
+    fetchEvents();
+  }, [allowEventsWidgets]);
+
+  useEffect(() => {
+    if (!allowExtendedDashboardMetrics) {
+      setPeopleTallyMonth(null);
+      setPeopleTallyPrevMonth(null);
+      setSundaySchoolSummary(null);
+      setSundaySchoolSummaryPrev(null);
+      setClusterAttendanceAvgPct(null);
+      setClusterAttendanceAvgPctPrev(null);
+      setExtendedMetricsLoading(false);
+      setExtendedMetricsError(null);
+      return;
+    }
+
+    let cancelled = false;
+    const load = async () => {
+      try {
+        setExtendedMetricsLoading(true);
+        const now = new Date();
+        const year = now.getFullYear();
+        const month = now.getMonth() + 1;
+        const { year: prevYear, month: prevMonth } = getPriorCalendarMonth(now);
+
+        const tallyRequests = [
+          evangelismApi.getPeopleTally({ year }),
+          ...(prevYear !== year
+            ? [evangelismApi.getPeopleTally({ year: prevYear })]
+            : []),
+        ];
+        const tallyResponses = await Promise.all(tallyRequests);
+        const tallyRows = tallyResponses.flatMap((r) => r.data ?? []);
+
+        const [ssCurrentRes, ssPrevRes, clusterCurrentRes, clusterPrevRes] =
+          await Promise.all([
+            sundaySchoolApi.summary({ year, month }),
+            sundaySchoolApi.summary({ year: prevYear, month: prevMonth }),
+            clusterReportsApi.getAll({
+              year,
+              month,
+              page_size: 500,
+            }),
+            clusterReportsApi.getAll({
+              year: prevYear,
+              month: prevMonth,
+              page_size: 500,
+            }),
+          ]);
+
+        if (cancelled) return;
+
+        const rowCurrent =
+          tallyRows.find((r) => r.month === month && r.year === year) ?? null;
+        const rowPrev =
+          tallyRows.find((r) => r.month === prevMonth && r.year === prevYear) ??
+          null;
+        setPeopleTallyMonth(rowCurrent);
+        setPeopleTallyPrevMonth(rowPrev);
+
+        setSundaySchoolSummary(ssCurrentRes.data ?? null);
+        setSundaySchoolSummaryPrev(ssPrevRes.data ?? null);
+
+        const curResults = clusterCurrentRes.data?.results ?? [];
+        const prevResults = clusterPrevRes.data?.results ?? [];
+        setClusterAttendanceAvgPct(averageClusterMemberRates(curResults));
+        setClusterAttendanceAvgPctPrev(averageClusterMemberRates(prevResults));
+
+        setExtendedMetricsError(null);
+      } catch {
+        if (!cancelled) {
+          setExtendedMetricsError("Unable to load some ministry metrics.");
+          setPeopleTallyMonth(null);
+          setPeopleTallyPrevMonth(null);
+          setSundaySchoolSummary(null);
+          setSundaySchoolSummaryPrev(null);
+          setClusterAttendanceAvgPct(null);
+          setClusterAttendanceAvgPctPrev(null);
+        }
+      } finally {
+        if (!cancelled) {
+          setExtendedMetricsLoading(false);
+        }
+      }
+    };
+
+    load();
+    return () => {
+      cancelled = true;
+    };
+  }, [allowExtendedDashboardMetrics]);
+
+  useEffect(() => {
+    if (!allowExtendedDashboardMetrics || !allowEventsWidgets) {
+      setSundayServiceMtdAvg(null);
+      setSundayServiceMtdAvgPrev(null);
+      setSundayServicePlaceholder(false);
+      setSundayServiceLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    const loadSunday = async () => {
+      try {
+        setSundayServiceLoading(true);
+        const now = new Date();
+        const y = now.getFullYear();
+        const m = now.getMonth();
+        const monthStart = new Date(y, m, 1);
+        const responseCurrent = await eventsApi.getAll({
+          start: formatApiDate(monthStart),
+          end: formatApiDate(new Date(y, m + 1, 0)),
+        });
+        if (cancelled) return;
+        const eventsCurrent = responseCurrent.data ?? [];
+        const avgCurrent = await computeSundayServiceMtdAverageHeadcount(
+          eventsCurrent,
+          monthStart,
+          now,
+        );
+
+        const prevMonthStart = new Date(y, m - 1, 1);
+        const prevMonthEnd = new Date(y, m, 0);
+        const throughPrior = getPriorMonthMtdThroughDate(now);
+        const responsePrev = await eventsApi.getAll({
+          start: formatApiDate(prevMonthStart),
+          end: formatApiDate(prevMonthEnd),
+        });
+        if (cancelled) return;
+        const eventsPrev = responsePrev.data ?? [];
+        const avgPrev = await computeSundayServiceMtdAverageHeadcount(
+          eventsPrev,
+          prevMonthStart,
+          throughPrior,
+        );
+
+        if (cancelled) return;
+
+        setSundayServiceMtdAvgPrev(avgPrev);
+
+        if (avgCurrent === null) {
+          setSundayServiceMtdAvg(null);
+          setSundayServicePlaceholder(true);
+        } else {
+          setSundayServiceMtdAvg(avgCurrent);
+          setSundayServicePlaceholder(false);
+        }
+      } catch {
+        if (!cancelled) {
+          setSundayServiceMtdAvg(null);
+          setSundayServiceMtdAvgPrev(null);
+          setSundayServicePlaceholder(true);
+        }
+      } finally {
+        if (!cancelled) {
+          setSundayServiceLoading(false);
+        }
+      }
+    };
+
+    loadSunday();
+    return () => {
+      cancelled = true;
+    };
+  }, [allowExtendedDashboardMetrics, allowEventsWidgets]);
+
+  const lessonMetrics = useMemo(() => {
+    const overall = lessonSummary?.overall;
+    const total = lessonSummary?.total_participants ?? 0;
+    const completed = overall?.COMPLETED ?? 0;
+    const inProgress = overall?.IN_PROGRESS ?? 0;
+    const assigned = overall?.ASSIGNED ?? 0;
+    const outstanding = inProgress + assigned;
+    const completionRate =
+      total > 0 ? Math.round((completed / total) * 100) : 0;
+
+    return {
+      total,
+      completed,
+      inProgress,
+      assigned,
+      outstanding,
+      completionRate,
+    };
+  }, [lessonSummary]);
+
+  const peopleMetrics = useMemo(() => {
+    const metrics = {
+      total: people.length,
+      members: 0,
+      attendedVisitors: 0,
+      invitedVisitors: 0,
+      pastors: 0,
+      newVisitorsThisMonth: 0,
+    };
+
+    if (people.length === 0) {
+      return metrics;
+    }
+
+    const now = new Date();
+    const currentMonth = now.getMonth();
+    const currentYear = now.getFullYear();
+
+    const isAdminPerson = (person: Person) =>
+      (person.role ?? "").toUpperCase() === "ADMIN" ||
+      (person.username ?? "").toLowerCase() === "admin";
+
+    const isDashboardPerson = (person: Person) =>
+      !isAdminPerson(person) &&
+      ((person.first_name ?? "") !== "" || (person.last_name ?? "") !== "");
+
+    const countsAsActiveMember = (person: Person) => {
+      if (isAdminPerson(person)) {
+        return false;
+      }
+      if (person.status === "DECEASED") {
+        return false;
+      }
+      // Leaders are always included; regular members use attendance status.
+      if (person.role === "PASTOR") {
+        return true;
+      }
+      return person.status === "ACTIVE";
+    };
+
+    people.forEach((person) => {
+      if (!isDashboardPerson(person)) {
+        return;
+      }
+
+      if (person.role === "VISITOR") {
+        if (person.date_first_attended) {
+          metrics.attendedVisitors += 1;
+          const attendedDate = new Date(person.date_first_attended);
+          if (
+            !Number.isNaN(attendedDate.getTime()) &&
+            attendedDate.getMonth() === currentMonth &&
+            attendedDate.getFullYear() === currentYear
+          ) {
+            metrics.newVisitorsThisMonth += 1;
+          }
+        } else if (person.status !== "DECEASED") {
+          metrics.invitedVisitors += 1;
+        }
+      } else {
+        if (countsAsActiveMember(person)) {
+          metrics.members += 1;
+        }
+        if (person.role === "PASTOR") {
+          metrics.pastors += 1;
+        }
+      }
+    });
+
+    return metrics;
+  }, [people]);
+
+  const memberTrend = useMemo(() => {
+    if (peopleMetrics.total === 0) {
+      return { direction: "flat" as const, label: "No people records yet" };
+    }
+    const difference = peopleMetrics.members - peopleMetrics.attendedVisitors;
+    if (difference > 0) {
+      return {
+        direction: "up" as const,
+        label: `${difference} more active members than attended visitors`,
+      };
+    }
+    if (difference < 0) {
+      return {
+        direction: "down" as const,
+        label: `${Math.abs(difference)} fewer active members than attended visitors`,
+      };
+    }
+    return {
+      direction: "flat" as const,
+      label: "Active members equal attended visitors",
+    };
+  }, [
+    peopleMetrics.members,
+    peopleMetrics.attendedVisitors,
+    peopleMetrics.total,
+  ]);
+
+  const visitorsTrend = useMemo(() => {
+    if (peopleMetrics.total === 0) {
+      return { direction: "flat" as const, label: "No people records yet" };
+    }
+    if (peopleMetrics.newVisitorsThisMonth > 0) {
+      return {
+        direction: "up" as const,
+        label: `+${peopleMetrics.newVisitorsThisMonth} this month`,
+      };
+    }
+    return {
+      direction: "down" as const,
+      label: "No new visitors this month",
+    };
+  }, [peopleMetrics.total, peopleMetrics.newVisitorsThisMonth]);
+
+  const lessonCompletionTrend = useMemo(() => {
+    if (lessonMetrics.total === 0) {
+      return {
+        direction: "flat" as const,
+        label: "No NCC assignments yet",
+      };
+    }
+    if (lessonMetrics.completionRate >= 50) {
+      return {
+        direction: "up" as const,
+        label: "On track for conversions",
+      };
+    }
+    return {
+      direction: "down" as const,
+      label: "Encourage more completions",
+    };
+  }, [lessonMetrics.total, lessonMetrics.completionRate]);
+
+  const outstandingTrend = useMemo(() => {
+    if (lessonMetrics.total === 0) {
+      return { direction: "flat" as const, label: "No NCC assignments yet" };
+    }
+    if (lessonMetrics.outstanding === 0) {
+      return { direction: "flat" as const, label: "All assignments completed" };
+    }
+    return {
+      direction: "down" as const,
+      label: `${lessonMetrics.outstanding} pending follow-ups`,
+    };
+  }, [lessonMetrics.total, lessonMetrics.outstanding]);
+
+  const nextSteps = useMemo(() => {
+    const steps: string[] = [];
+    if (allowLessonWidgets && lessonMetrics.outstanding > 0) {
+      steps.push(
+        "Review members with outstanding NCC assignments and schedule follow-ups.",
+      );
+    }
+    if (allowPeopleMetrics && peopleMetrics.newVisitorsThisMonth > 0) {
+      steps.push(
+        "Welcome new visitors and connect them with a coordinator this week.",
+      );
+    }
+    if (allowEventsWidgets && upcomingEvents.length > 0) {
+      steps.push("Confirm attendance teams for upcoming events.");
+    }
+    if (steps.length === 0) {
+      steps.push("Review this week’s ministry goals and plan next actions.");
+    }
+    return steps.slice(0, 3);
+  }, [
+    allowEventsWidgets,
+    allowLessonWidgets,
+    allowPeopleMetrics,
+    lessonMetrics.outstanding,
+    peopleMetrics.newVisitorsThisMonth,
+    upcomingEvents.length,
+  ]);
+
+  const recentActivities = useMemo<RecentActivityItem[]>(() => {
+    const items: Array<{
+      id: string;
+      type: "people" | "event";
+      description: string;
+      date: Date;
+    }> = [];
+
+    if (allowPeopleMetrics) {
+      const recentPeople = people
+        .filter((person) => person.date_first_attended)
+        .map((person) => ({
+          person,
+          date: new Date(person.date_first_attended as string),
+        }))
+        .filter(({ date }) => !Number.isNaN(date.getTime()))
+        .sort((a, b) => b.date.getTime() - a.date.getTime())
+        .slice(0, 3);
+
+      recentPeople.forEach(({ person, date }) => {
+        const name =
+          person.full_name || formatPersonName(person);
+        items.push({
+          id: `person-${person.id}`,
+          type: "people",
+          description: `${name} attended for the first time.`,
+          date,
+        });
+      });
+    }
+
+    if (allowEventsWidgets) {
+      eventActivity.forEach((event) => {
+        items.push({
+          id: `event-${event.id}`,
+          type: "event",
+          description: `Event recorded: ${event.title}.`,
+          date: event.date,
+        });
+      });
+    }
+
+    return items
+      .sort((a, b) => b.date.getTime() - a.date.getTime())
+      .slice(0, 5)
+      .map((item) => ({
+        id: item.id,
+        type: item.type,
+        description: item.description,
+        timestamp: formatRelativeTime(item.date),
+      }));
+  }, [allowEventsWidgets, allowPeopleMetrics, eventActivity, people]);
+
+  const activityEmptyMessage =
+    allowPeopleMetrics || allowEventsWidgets
+      ? "No recent activity for your accessible modules."
+      : "Activity isn't available for your access level.";
+
+  const openReportForm = async () => {
+    setShowReportForm(true);
+    if (reportClusters.length > 0 || reportClustersLoading) {
+      return;
+    }
+    try {
+      setReportClustersLoading(true);
+      const response = await clustersApi.getAll();
+      setReportClusters(response.data);
+    } catch (error) {
+      setReportClusters([]);
+    } finally {
+      setReportClustersLoading(false);
+    }
+  };
+
+  const topLessons: LessonProgressSummaryByLesson[] = useMemo(() => {
+    if (!lessonSummary || !canViewLessons) {
+      return [];
+    }
+    return [...lessonSummary.lessons].sort((a, b) => {
+      if (a.order === b.order) {
+        return a.version_label.localeCompare(b.version_label);
+      }
+      return a.order - b.order;
+    });
+  }, [lessonSummary, canViewLessons]);
+
+  const sundayServiceMetricValue = useMemo(() => {
+    if (sundayServicePlaceholder) return DUMMY_SUNDAY_SERVICE_MTD_AVG;
+    if (sundayServiceMtdAvg !== null) return sundayServiceMtdAvg;
+    return "—";
+  }, [sundayServicePlaceholder, sundayServiceMtdAvg]);
+
+  const sundayServiceMetricSubtitle = sundayServicePlaceholder
+    ? "Placeholder — replace with live attendance when wired"
+    : sundayServiceMtdAvg !== null
+      ? "Avg. attendees per Sunday Service occurrence (MTD)"
+      : "No Sunday Service occurrences recorded yet this month";
+
+  const waterBaptismTrend = useMemo(
+    () =>
+      countMomTrend(
+        peopleTallyMonth?.baptized_count,
+        peopleTallyPrevMonth?.baptized_count,
+        extendedMetricsLoading,
+      ),
+    [
+      extendedMetricsLoading,
+      peopleTallyMonth?.baptized_count,
+      peopleTallyPrevMonth?.baptized_count,
+    ],
+  );
+
+  const receivedHolyGhostTrend = useMemo(
+    () =>
+      countMomTrend(
+        peopleTallyMonth?.received_hg_count,
+        peopleTallyPrevMonth?.received_hg_count,
+        extendedMetricsLoading,
+      ),
+    [
+      extendedMetricsLoading,
+      peopleTallyMonth?.received_hg_count,
+      peopleTallyPrevMonth?.received_hg_count,
+    ],
+  );
+
+  const clusterAttendanceTrend = useMemo(
+    () =>
+      percentPointsMomTrend(
+        clusterAttendanceAvgPct,
+        clusterAttendanceAvgPctPrev,
+        extendedMetricsLoading,
+      ),
+    [
+      clusterAttendanceAvgPct,
+      clusterAttendanceAvgPctPrev,
+      extendedMetricsLoading,
+    ],
+  );
+
+  const sundaySchoolTrend = useMemo(
+    () =>
+      percentPointsMomTrend(
+        sundaySchoolSummary?.average_attendance_rate,
+        sundaySchoolSummaryPrev?.average_attendance_rate,
+        extendedMetricsLoading,
+      ),
+    [
+      extendedMetricsLoading,
+      sundaySchoolSummary?.average_attendance_rate,
+      sundaySchoolSummaryPrev?.average_attendance_rate,
+    ],
+  );
+
+  const sundayServiceMomTrend = useMemo(
+    () =>
+      avgAttendeesMomTrend(
+        sundayServicePlaceholder ? null : sundayServiceMtdAvg,
+        sundayServiceMtdAvgPrev,
+        sundayServiceLoading || extendedMetricsLoading,
+        sundayServicePlaceholder,
+      ),
+    [
+      extendedMetricsLoading,
+      sundayServiceMtdAvg,
+      sundayServiceMtdAvgPrev,
+      sundayServicePlaceholder,
+      sundayServiceLoading,
+    ],
+  );
+
+  return (
+    <ProtectedRoute>
+      <DashboardLayout>
+        <div className="space-y-6">
+          <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+            <div>
+              <h1 className="text-2xl font-bold text-foreground">
+                Dashboard Overview
+              </h1>
+              <p className="text-sm text-gray-600 mt-1">
+                Monitor key ministry metrics, NCC progress, and quick actions
+                for the week.
+              </p>
+            </div>
+            {canSubmitClusterReport && (
+              <Button
+                variant="primary"
+                className="w-full md:w-auto"
+                onClick={openReportForm}
+              >
+                Submit Report
+              </Button>
+            )}
+          </div>
+
+          <SundaySelfCheckInBanner />
+
+          {(extendedMetricsError ||
+            (allowLessonWidgets && lessonSummaryError) ||
+            (allowPeopleMetrics && peopleError) ||
+            (allowEventsWidgets && eventsError)) && (
+            <div className="space-y-2">
+              {allowLessonWidgets && lessonSummaryError && (
+                <ErrorMessage message={lessonSummaryError} />
+              )}
+              {extendedMetricsError && (
+                <ErrorMessage message={extendedMetricsError} />
+              )}
+              {allowPeopleMetrics && peopleError && (
+                <ErrorMessage message={peopleError} />
+              )}
+              {allowEventsWidgets && eventsError && (
+                <ErrorMessage message={eventsError} />
+              )}
+            </div>
+          )}
+
+          {(allowPeopleMetrics ||
+            allowLessonWidgets ||
+            allowExtendedDashboardMetrics) && (
+            <div className="grid grid-cols-1 tablet:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
+              {allowPeopleMetrics && (
+                <MetricCard
+                  title="Active Members"
+                  value={peopleMetrics.members}
+                  subtitle={`${peopleMetrics.pastors} pastor${peopleMetrics.pastors === 1 ? "" : "s"}`}
+                  loading={peopleLoading}
+                  trend={memberTrend}
+                />
+              )}
+              {allowPeopleMetrics && (
+                <MetricCard
+                  title="Attended Visitors"
+                  value={peopleMetrics.attendedVisitors}
+                  note={`${peopleMetrics.invitedVisitors} invited visitor${peopleMetrics.invitedVisitors === 1 ? "" : "s"}`}
+                  subtitle={`${peopleMetrics.newVisitorsThisMonth} newcomers this month`}
+                  loading={peopleLoading}
+                  trend={visitorsTrend}
+                />
+              )}
+              {allowLessonWidgets && (
+                <MetricCard
+                  title="NCC Completion Rate"
+                  value={`${lessonMetrics.completionRate}%`}
+                  subtitle={
+                    lessonSummaryLoading
+                      ? ""
+                      : lessonMetrics.total > 0
+                        ? `${lessonMetrics.completed}/${lessonMetrics.total} completed`
+                        : "No NCC assignments yet"
+                  }
+                  loading={lessonSummaryLoading}
+                  trend={lessonCompletionTrend}
+                />
+              )}
+              {allowLessonWidgets && (
+                <MetricCard
+                  title="Outstanding NCC Assignments"
+                  value={lessonMetrics.outstanding}
+                  subtitle="Not started or currently in progress"
+                  loading={lessonSummaryLoading}
+                  trend={outstandingTrend}
+                />
+              )}
+              {allowExtendedDashboardMetrics && (
+                <MetricCard
+                  title="Water Baptism"
+                  value={peopleTallyMonth?.baptized_count ?? "—"}
+                  subtitle="This month (people tally)"
+                  loading={extendedMetricsLoading}
+                  trend={waterBaptismTrend}
+                />
+              )}
+              {allowExtendedDashboardMetrics && (
+                <MetricCard
+                  title="Received Holy Ghost"
+                  value={peopleTallyMonth?.received_hg_count ?? "—"}
+                  subtitle="This month (people tally)"
+                  loading={extendedMetricsLoading}
+                  trend={receivedHolyGhostTrend}
+                />
+              )}
+              {allowExtendedDashboardMetrics && (
+                <MetricCard
+                  title="Cluster Attendance (Avg)"
+                  value={
+                    clusterAttendanceAvgPct !== null
+                      ? `${clusterAttendanceAvgPct}%`
+                      : "—"
+                  }
+                  subtitle="Avg. member attendance rate — weekly reports (MTD)"
+                  loading={extendedMetricsLoading}
+                  trend={clusterAttendanceTrend}
+                />
+              )}
+              {allowExtendedDashboardMetrics && (
+                <MetricCard
+                  title="Sunday School Attendance"
+                  value={
+                    sundaySchoolSummary?.average_attendance_rate != null
+                      ? `${Math.round(sundaySchoolSummary.average_attendance_rate)}%`
+                      : "—"
+                  }
+                  subtitle="Average rate across classes (this month)"
+                  loading={extendedMetricsLoading}
+                  trend={sundaySchoolTrend}
+                />
+              )}
+              {allowExtendedDashboardMetrics && (
+                <MetricCard
+                  title="Sunday Service Attendees"
+                  value={sundayServiceMetricValue}
+                  subtitle={sundayServiceMetricSubtitle}
+                  loading={extendedMetricsLoading || sundayServiceLoading}
+                  trend={sundayServiceMomTrend}
+                />
+              )}
+            </div>
+          )}
+
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            {allowLessonWidgets && (
+              <Card>
+                <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4 mb-4">
+                  <div>
+                    <h3 className="text-lg font-semibold text-foreground">
+                      NCC Completion Pipeline
+                    </h3>
+                    <p className="text-sm text-gray-500">
+                      Track lesson status across current and superseded
+                      versions.
+                    </p>
+                  </div>
+                  <Button
+                    variant="tertiary"
+                    className="text-xs w-full sm:w-auto"
+                    onClick={() => {
+                      window.location.href = "/lessons";
+                    }}
+                  >
+                    Manage Lessons
+                  </Button>
+                </div>
+                {lessonSummaryLoading ? (
+                  <LoadingSpinner />
+                ) : topLessons.length === 0 ? (
+                  <p className="text-sm text-gray-500">
+                    No NCC assignments recorded yet.
+                  </p>
+                ) : (
+                  <div className="space-y-3">
+                    {topLessons.map((lesson) => (
+                      <div
+                        key={`${lesson.lesson_id}-${lesson.version_label}`}
+                        className="border rounded-lg px-4 py-3"
+                      >
+                        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+                          <div className="flex-1 min-w-0">
+                            <h4 className="text-sm font-semibold text-foreground break-words">
+                              {lesson.lesson_title}
+                            </h4>
+                            <p className="text-xs text-gray-500">
+                              Step {lesson.order} • {lesson.version_label}{" "}
+                              {lesson.is_latest ? "(Latest)" : "(Superseded)"}
+                            </p>
+                          </div>
+                          <span className="text-sm font-semibold text-primary flex-shrink-0">
+                            {lesson.completed}/{lesson.total} completed
+                          </span>
+                        </div>
+                        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 mt-3 text-xs text-gray-600">
+                          <div>
+                            <span className="block font-semibold text-gray-700">
+                              Not started
+                            </span>
+                            {lesson.assigned}
+                          </div>
+                          <div>
+                            <span className="block font-semibold text-gray-700">
+                              In Progress
+                            </span>
+                            {lesson.in_progress}
+                          </div>
+                          <div>
+                            <span className="block font-semibold text-gray-700">
+                              Completed
+                            </span>
+                            {lesson.completed}
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </Card>
+            )}
+
+            <QuickActions />
+            <RecentActivity
+              activities={recentActivities}
+              isLoading={
+                (allowPeopleMetrics && peopleLoading) ||
+                (allowEventsWidgets && eventsLoading)
+              }
+              emptyMessage={activityEmptyMessage}
+            />
+          </div>
+
+          <div className="grid grid-cols-1 tablet:grid-cols-2 gap-6">
+            {allowEventsWidgets ? (
+              <Card>
+                <h3 className="text-lg font-semibold text-foreground mb-4">
+                  Upcoming Events
+                </h3>
+                <p className="text-xs text-gray-500 mb-3">
+                  Next 60 days of upcoming gatherings.
+                </p>
+                {eventsLoading ? (
+                  <LoadingSpinner />
+                ) : upcomingEvents.length === 0 ? (
+                  <p className="text-sm text-gray-500">
+                    No upcoming events found.
+                  </p>
+                ) : (
+                  <div className="space-y-3">
+                    {upcomingEvents.map((event) => (
+                      <div
+                        key={event.id}
+                        className="border border-gray-200 rounded-lg p-3 text-sm text-gray-600"
+                      >
+                        <p className="font-semibold text-foreground">
+                          {event.title}
+                        </p>
+                        <p>{event.schedule}</p>
+                        <p className="text-xs text-gray-500">
+                          Location: {event.location}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </Card>
+            ) : (
+              <Card>
+                <h3 className="text-lg font-semibold text-foreground mb-4">
+                  Upcoming Events
+                </h3>
+                <p className="text-sm text-gray-500">
+                  Events data is not available for your access level.
+                </p>
+              </Card>
+            )}
+
+            <Card>
+              <h3 className="text-lg font-semibold text-foreground mb-4">
+                Next Steps
+              </h3>
+              <div className="space-y-3 text-sm text-gray-600">
+                {nextSteps.map((step) => (
+                  <p key={step}>• {step}</p>
+                ))}
+              </div>
+            </Card>
+          </div>
+
+          {showReportForm && (
+            <Modal
+              isOpen={showReportForm}
+              onClose={() => {
+                setShowReportForm(false);
+                setReportSelectedCluster(null);
+              }}
+              title="Submit Report"
+              className="!mt-0"
+              closeOnOutsideClick={false}
+            >
+              <ClusterWeeklyReportForm
+                cluster={reportSelectedCluster}
+                clusters={reportClusters}
+                isOpen={showReportForm}
+                onClose={() => {
+                  setShowReportForm(false);
+                  setReportSelectedCluster(null);
+                }}
+                onSubmit={async (data) => {
+                  await clusterReportsApi.create(data as any);
+                  setShowReportForm(false);
+                  setReportSelectedCluster(null);
+                }}
+              />
+              {reportClustersLoading && (
+                <p className="text-xs text-gray-500 mt-2">
+                  Loading clusters for report submission...
+                </p>
+              )}
+              {!reportClustersLoading && reportClusters.length === 0 && (
+                <p className="text-xs text-gray-500 mt-2">
+                  No clusters available for reporting.
+                </p>
+              )}
+            </Modal>
+          )}
+        </div>
+      </DashboardLayout>
+    </ProtectedRoute>
+  );
+}
+
+interface MetricCardProps {
+  title: string;
+  value: number | string;
+  /** Shown directly under the main value (e.g. invited visitors count). */
+  note?: string;
+  subtitle?: string;
+  loading?: boolean;
+  trend?: MetricTrend;
+}
+
+function MetricCard({
+  title,
+  value,
+  note,
+  subtitle,
+  loading,
+  trend,
+}: MetricCardProps) {
+  const renderTrend = () => {
+    if (!trend) return null;
+    const commonClasses = "flex items-center gap-1 text-xs font-medium mt-3";
+    if (trend.direction === "up") {
+      return (
+        <p className={`${commonClasses} text-green-600`}>
+          <ArrowUpRight className="h-4 w-4" aria-hidden="true" />
+          {trend.label}
+        </p>
+      );
+    }
+    if (trend.direction === "down") {
+      return (
+        <p className={`${commonClasses} text-red-600`}>
+          <ArrowDownRight className="h-4 w-4" aria-hidden="true" />
+          {trend.label}
+        </p>
+      );
+    }
+    return (
+      <p className={`${commonClasses} text-gray-500`}>
+        <Minus className="h-4 w-4" aria-hidden="true" />
+        {trend.label}
+      </p>
+    );
+  };
+
+  return (
+    <Card>
+      <div className="flex flex-col">
+        <p className="text-sm text-gray-600">{title}</p>
+        {loading ? (
+          <div className="mt-4">
+            <LoadingSpinner />
+          </div>
+        ) : (
+          <>
+            <p className="text-3xl font-bold text-primary mt-1">{value}</p>
+            {note && (
+              <p className="text-xs text-gray-500 mt-2 leading-snug">{note}</p>
+            )}
+            {subtitle && (
+              <p
+                className={`text-xs text-gray-500 leading-snug ${note ? "mt-1" : "mt-2"}`}
+              >
+                {subtitle}
+              </p>
+            )}
+            {renderTrend()}
+          </>
+        )}
+      </div>
+    </Card>
+  );
+}

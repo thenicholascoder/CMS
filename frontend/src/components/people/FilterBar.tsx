@@ -1,0 +1,602 @@
+import React, { useMemo, useState, useRef } from "react";
+import { Branch } from "@/src/types/branch";
+import { Cluster } from "@/src/types/cluster";
+import FilterDropdown, { FilterField } from "./FilterDropdown";
+import FilterCard, { FilterCardField } from "./FilterCard";
+
+/**
+ * - `string`: typical scalar filter value
+ * - `[string, string]`: date/number "between"
+ * - `string[]`: branch id list for `field === "branch"` with `is` / `is_not` only
+ */
+export type FilterConditionValue = string | [string, string] | string[];
+
+export interface FilterCondition {
+  id: string;
+  field: string;
+  operator: string;
+  value: FilterConditionValue;
+  label: string;
+  /** Human-readable chip text; used for branch filters to hide raw IDs */
+  chipDisplay?: string;
+}
+
+/** Stable operator order for grouped branch chips */
+const BRANCH_OPERATOR_ORDER = ["is", "is_not"] as const;
+
+function dedupePreserveOrder(ids: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const id of ids) {
+    if (!seen.has(id)) {
+      seen.add(id);
+      out.push(id);
+    }
+  }
+  return out;
+}
+
+/** Flatten branch id strings from one condition value (branch filters only). */
+export function branchValueToIds(value: FilterConditionValue): string[] {
+  if (typeof value === "string") {
+    const t = value.trim();
+    return t ? [t] : [];
+  }
+  if (Array.isArray(value)) {
+    return value.map((x) => String(x).trim()).filter(Boolean);
+  }
+  return [];
+}
+
+/** All branch ids from filters (e.g. all `is` or all `is_not`), deduped in encounter order. */
+export function flattenBranchFilterIds(filters: FilterCondition[]): string[] {
+  const ids = filters.flatMap((f) => branchValueToIds(f.value));
+  return dedupePreserveOrder(ids);
+}
+
+function branchIdToDisplayName(id: string, branches: Branch[]): string {
+  if (/^\d+$/.test(id)) {
+    const name = branches.find((b) => String(b.id) === id)?.name;
+    return name ?? "Unknown branch";
+  }
+  return id || "Unknown branch";
+}
+
+function branchGroupChipParts(
+  op: (typeof BRANCH_OPERATOR_ORDER)[number],
+  names: string[],
+): { prefix: string; value: string } {
+  const n = names.length;
+  const value = names.join(", ");
+  if (n === 0) return { prefix: "Branch", value: "" };
+  if (op === "is") {
+    return {
+      prefix: n === 1 ? "Branch is" : "Branches are",
+      value,
+    };
+  }
+  return {
+    prefix: n === 1 ? "Branch is not" : "Branches are not",
+    value,
+  };
+}
+
+function FilterChipText({
+  prefix,
+  operator,
+  value,
+}: {
+  prefix: string;
+  operator?: string;
+  value: string;
+}) {
+  return (
+    <>
+      {prefix}
+      {operator ? ` ${operator}` : null}
+      {value ? (
+        <>
+          {" "}
+          <span className="font-semibold">{value}</span>
+        </>
+      ) : null}
+    </>
+  );
+}
+
+function clusterDisplayName(cluster: Cluster): string {
+  const name = (cluster.name || "").trim() || "Untitled Cluster";
+  const code = (cluster.code || "").trim();
+  return code ? `${name} (${code})` : name;
+}
+
+function clusterChipParts(names: string[]): { prefix: string; value: string } {
+  if (names.length <= 1) {
+    return { prefix: "Cluster is", value: names[0] ?? "" };
+  }
+  return { prefix: "Clusters are", value: names.join(", ") };
+}
+
+interface FilterBarProps {
+  searchQuery: string;
+  onSearchChange: (query: string) => void;
+  activeFilters: FilterCondition[];
+  onRemoveFilter: (filterId: string) => void;
+  /** Removes every branch filter whose id is listed (used by grouped branch chips). */
+  onRemoveFilterIds?: (filterIds: string[]) => void;
+  onClearAllFilters: () => void;
+  onApplyFilter: (filter: FilterCondition) => void;
+  isSearching?: boolean;
+  branches?: Branch[];
+  canChangeBranchFilter?: boolean;
+  /** Filter chip ids that cannot be removed (e.g. locked default branch). */
+  lockedFilterIds?: string[];
+  /** Cluster membership options for Filter → Cluster. */
+  clusters?: Cluster[];
+  clusterFilter?: string[];
+  onClusterFilterChange?: (ids: string[]) => void;
+}
+
+export default function FilterBar({
+  searchQuery,
+  onSearchChange,
+  activeFilters,
+  onRemoveFilter,
+  onRemoveFilterIds,
+  onClearAllFilters,
+  onApplyFilter,
+  isSearching = false,
+  branches = [],
+  canChangeBranchFilter = true,
+  lockedFilterIds = [],
+  clusters = [],
+  clusterFilter = [],
+  onClusterFilterChange,
+}: FilterBarProps) {
+  const [showFilterDropdown, setShowFilterDropdown] = useState(false);
+  const [showFilterCard, setShowFilterCard] = useState(false);
+  const [selectedField, setSelectedField] = useState<FilterCardField | null>(
+    null,
+  );
+  const filterButtonRef = useRef<HTMLButtonElement>(null);
+  const getFilterChipColor = (field: string) => {
+    switch (field) {
+      case "status":
+        return "bg-green-100 text-green-800 border-green-200";
+      case "role":
+        return "bg-blue-100 text-blue-800 border-blue-200";
+      case "cluster":
+        return "bg-indigo-100 text-indigo-800 border-indigo-200";
+      case "date_first_attended":
+        return "bg-purple-100 text-purple-800 border-purple-200";
+      case "email":
+        return "bg-orange-100 text-orange-800 border-orange-200";
+      case "phone":
+        return "bg-pink-100 text-pink-800 border-pink-200";
+      case "member_id":
+        return "bg-teal-100 text-teal-800 border-teal-200";
+      default:
+        return "bg-gray-100 text-gray-800 border-gray-200";
+    }
+  };
+
+  const getOperatorLabel = (operator: string) => {
+    switch (operator) {
+      case "is":
+        return "is";
+      case "is_not":
+        return "is not";
+      case "contains":
+        return "contains";
+      case "between":
+        return "between";
+      case "before":
+        return "before";
+      case "after":
+        return "after";
+      case "is_empty":
+        return "is empty";
+      case "is_not_empty":
+        return "is not empty";
+      default:
+        return operator;
+    }
+  };
+
+  const formatFilterValue = (filter: FilterCondition) => {
+    if (filter.operator === "is_empty" || filter.operator === "is_not_empty") {
+      return "";
+    }
+    if (filter.field === "branch" && Array.isArray(filter.value)) {
+      const ids = branchValueToIds(filter.value);
+      return ids.map((id) => branchIdToDisplayName(id, branches)).join(", ");
+    }
+    if (Array.isArray(filter.value)) {
+      return `${filter.value[0]} - ${filter.value[1]}`;
+    }
+    return filter.value;
+  };
+
+  const nonBranchFilters = activeFilters.filter((f) => f.field !== "branch");
+  const branchFilters = activeFilters.filter((f) => f.field === "branch");
+
+  const branchChipGroups = BRANCH_OPERATOR_ORDER.map((op) => {
+    const group = branchFilters.filter((f) => f.operator === op);
+    if (group.length === 0) return null;
+    const ids = flattenBranchFilterIds(group);
+    const names = ids.map((id) => branchIdToDisplayName(id, branches));
+    const filterRowIds = group.map((f) => f.id);
+    const { prefix, value } = branchGroupChipParts(op, names);
+    return { op, ids: filterRowIds, prefix, value };
+  }).filter(Boolean) as {
+    op: string;
+    ids: string[];
+    prefix: string;
+    value: string;
+  }[];
+
+  const orphanBranchFilters = branchFilters.filter(
+    (f) =>
+      !(BRANCH_OPERATOR_ORDER as readonly string[]).includes(f.operator),
+  );
+
+  const removeBranchGroup = (ids: string[]) => {
+    const removable = ids.filter((id) => !lockedFilterIds.includes(id));
+    if (removable.length === 0) return;
+    if (onRemoveFilterIds) {
+      onRemoveFilterIds(removable);
+    } else {
+      removable.forEach((id) => onRemoveFilter(id));
+    }
+  };
+
+  const isFilterLocked = (filterId: string) => lockedFilterIds.includes(filterId);
+
+  const selectedClusterIds = useMemo(
+    () => clusterFilter.map(String).filter(Boolean),
+    [clusterFilter],
+  );
+  const hasClusterFilter = selectedClusterIds.length > 0;
+  const showClearAll = activeFilters.length > 0 || hasClusterFilter;
+  const selectedClusterChip = useMemo(() => {
+    if (!hasClusterFilter) return { prefix: "Cluster is", value: "" };
+    const names = selectedClusterIds.map((id) => {
+      const cluster = clusters.find((c) => String(c.id) === id);
+      return cluster ? clusterDisplayName(cluster) : "Cluster";
+    });
+    return clusterChipParts(names);
+  }, [clusters, hasClusterFilter, selectedClusterIds]);
+
+  return (
+    <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-4 md:p-6 mb-6">
+      {/* Search Bar */}
+      <div className="mb-4">
+        <div className="relative">
+          <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+            <svg
+              className="h-5 w-5 text-gray-400"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth={2}
+                d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"
+              />
+            </svg>
+          </div>
+          <input
+            type="text"
+            placeholder="Search by name, nickname, maiden name, email, or phone..."
+            value={searchQuery}
+            onChange={(e) => onSearchChange(e.target.value)}
+            className={`block w-full pl-10 py-2.5 md:py-3 border border-gray-300 rounded-lg leading-5 bg-white placeholder-gray-500 focus:outline-none focus:placeholder-gray-400 focus:ring-2 focus:ring-ring focus:border-transparent text-base md:text-sm min-h-[44px] md:min-h-0 ${
+              searchQuery ? "pr-10" : "pr-3"
+            }`}
+          />
+          {isSearching ? (
+            <div className="absolute right-3 top-1/2 transform -translate-y-1/2">
+              <svg
+                className="w-4 h-4 animate-spin text-gray-400"
+                fill="none"
+                viewBox="0 0 24 24"
+              >
+                <circle
+                  className="opacity-25"
+                  cx="12"
+                  cy="12"
+                  r="10"
+                  stroke="currentColor"
+                  strokeWidth="4"
+                />
+                <path
+                  className="opacity-75"
+                  fill="currentColor"
+                  d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+                />
+              </svg>
+            </div>
+          ) : searchQuery ? (
+            <button
+              type="button"
+              onClick={() => onSearchChange("")}
+              className="absolute right-3 top-1/2 transform -translate-y-1/2 text-gray-400 hover:text-gray-600"
+            >
+              <svg
+                className="w-4 h-4"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M6 18L18 6M6 6l12 12"
+                />
+              </svg>
+            </button>
+          ) : null}
+        </div>
+      </div>
+
+      {/* Filter Section */}
+      <div className="flex flex-col tablet:flex-row tablet:items-center tablet:justify-between gap-4">
+        <div className="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3 flex-1 min-w-0">
+          <span className="text-sm font-medium text-gray-700 flex-shrink-0">
+            Filters:
+          </span>
+
+          {activeFilters.length === 0 && !hasClusterFilter ? (
+            <span className="text-sm text-gray-500 italic">
+              No filters applied
+            </span>
+          ) : (
+            <div className="flex flex-wrap gap-2">
+              {hasClusterFilter && (
+                <div
+                  className={`inline-flex items-center px-3 py-1.5 rounded-full text-xs font-medium border min-h-[32px] ${getFilterChipColor(
+                    "cluster",
+                  )}`}
+                >
+                  <span className="mr-1 break-words">
+                    <FilterChipText
+                      prefix={selectedClusterChip.prefix}
+                      value={selectedClusterChip.value}
+                    />
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => onClusterFilterChange?.([])}
+                    className="ml-1 hover:opacity-75 transition-opacity min-w-[20px] min-h-[20px] flex items-center justify-center"
+                    aria-label="Remove cluster filter"
+                  >
+                    <svg
+                      className="w-3 h-3"
+                      fill="none"
+                      stroke="currentColor"
+                      viewBox="0 0 24 24"
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth={2}
+                        d="M6 18L18 6M6 6l12 12"
+                      />
+                    </svg>
+                  </button>
+                </div>
+              )}
+              {nonBranchFilters.map((filter) => (
+                <div
+                  key={filter.id}
+                  className={`inline-flex items-center px-3 py-1.5 rounded-full text-xs font-medium border min-h-[32px] ${getFilterChipColor(
+                    filter.field,
+                  )}`}
+                >
+                  <span className="mr-1 break-words">
+                    <FilterChipText
+                      prefix={filter.label}
+                      operator={getOperatorLabel(filter.operator)}
+                      value={formatFilterValue(filter)}
+                    />
+                  </span>
+                  {!isFilterLocked(filter.id) && (
+                    <button
+                      type="button"
+                      onClick={() => onRemoveFilter(filter.id)}
+                      className="ml-1 hover:opacity-75 transition-opacity min-w-[20px] min-h-[20px] flex items-center justify-center"
+                      aria-label="Remove filter"
+                    >
+                      <svg
+                        className="w-3 h-3"
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={2}
+                          d="M6 18L18 6M6 6l12 12"
+                        />
+                      </svg>
+                    </button>
+                  )}
+                </div>
+              ))}
+              {branchChipGroups.map((group) => (
+                <div
+                  key={`branch-group-${group.op}`}
+                  className={`inline-flex items-center px-3 py-1.5 rounded-full text-xs font-medium border min-h-[32px] ${getFilterChipColor(
+                    "branch",
+                  )}`}
+                >
+                  <span className="mr-1 break-words">
+                    <FilterChipText prefix={group.prefix} value={group.value} />
+                  </span>
+                  {group.ids.some((id) => !isFilterLocked(id)) && (
+                    <button
+                      type="button"
+                      onClick={() => removeBranchGroup(group.ids)}
+                      className="ml-1 hover:opacity-75 transition-opacity min-w-[20px] min-h-[20px] flex items-center justify-center"
+                      aria-label="Remove branch filters"
+                    >
+                      <svg
+                        className="w-3 h-3"
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={2}
+                          d="M6 18L18 6M6 6l12 12"
+                        />
+                      </svg>
+                    </button>
+                  )}
+                </div>
+              ))}
+              {orphanBranchFilters.map((filter) => (
+                <div
+                  key={filter.id}
+                  className={`inline-flex items-center px-3 py-1.5 rounded-full text-xs font-medium border min-h-[32px] ${getFilterChipColor(
+                    "branch",
+                  )}`}
+                >
+                  <span className="mr-1 break-words">
+                    <FilterChipText
+                      prefix="Branch"
+                      operator={getOperatorLabel(filter.operator)}
+                      value={formatFilterValue(filter)}
+                    />
+                  </span>
+                  {!isFilterLocked(filter.id) && (
+                    <button
+                      type="button"
+                      onClick={() => onRemoveFilter(filter.id)}
+                      className="ml-1 hover:opacity-75 transition-opacity min-w-[20px] min-h-[20px] flex items-center justify-center"
+                      aria-label="Remove filter"
+                    >
+                      <svg
+                        className="w-3 h-3"
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={2}
+                          d="M6 18L18 6M6 6l12 12"
+                        />
+                      </svg>
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div className="flex w-full flex-wrap items-stretch gap-2 tablet:w-auto tablet:flex-nowrap tablet:flex-shrink-0">
+          {showClearAll && (
+            <button
+              type="button"
+              onClick={onClearAllFilters}
+              className="inline-flex h-11 min-w-0 flex-1 items-center justify-center px-2 text-sm text-primary hover:text-primary font-medium transition-colors tablet:flex-none tablet:justify-start tablet:px-2 md:px-0"
+            >
+              Clear All
+            </button>
+          )}
+
+          <div
+            className={`relative min-w-0 h-11 ${
+              showClearAll ? "flex-1" : "w-full"
+            } tablet:w-auto tablet:flex-none`}
+          >
+            <button
+              ref={filterButtonRef}
+              type="button"
+              aria-expanded={showFilterDropdown || showFilterCard}
+              aria-haspopup="menu"
+              onClick={() => {
+                if (showFilterDropdown || showFilterCard) {
+                  setShowFilterDropdown(false);
+                  setShowFilterCard(false);
+                  setSelectedField(null);
+                } else {
+                  setShowFilterDropdown(true);
+                }
+              }}
+              className={`inline-flex h-11 w-full items-center justify-center px-3 border border-gray-300 shadow-sm text-sm leading-4 font-medium rounded-lg text-gray-700 transition-colors tablet:w-auto tablet:justify-start focus:outline-none ${
+                showFilterDropdown || showFilterCard
+                  ? "bg-gray-100"
+                  : "bg-white hover:bg-gray-50 active:bg-gray-100"
+              }`}
+            >
+              <svg
+                className="w-4 h-4 mr-1"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M12 6v6m0 0v6m0-6h6m-6 0H6"
+                />
+              </svg>
+              Filter
+            </button>
+
+            <FilterDropdown
+              isOpen={showFilterDropdown}
+              onClose={() => setShowFilterDropdown(false)}
+              onSelectField={(field: FilterField) => {
+                setShowFilterDropdown(false);
+                setSelectedField(field);
+                setShowFilterCard(true);
+              }}
+              branches={branches}
+              clusters={clusters}
+              canChangeBranchFilter={canChangeBranchFilter}
+            />
+
+            {selectedField && (
+              <FilterCard
+                key={selectedField.key}
+                field={selectedField}
+                isOpen={showFilterCard}
+                onClose={() => {
+                  setShowFilterCard(false);
+                  setSelectedField(null);
+                }}
+                onApplyFilter={(filter) => {
+                  if (filter.field === "cluster") {
+                    const ids = Array.isArray(filter.value)
+                      ? filter.value.map(String).filter(Boolean)
+                      : filter.value
+                        ? [String(filter.value)]
+                        : [];
+                    onClusterFilterChange?.(ids);
+                  } else {
+                    onApplyFilter(filter);
+                  }
+                  setShowFilterCard(false);
+                  setSelectedField(null);
+                }}
+                initialClusterIds={selectedClusterIds}
+              />
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

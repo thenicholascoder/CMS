@@ -1,0 +1,238 @@
+"use client";
+
+import { useCallback, useEffect, useState } from "react";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import { useAuth } from "@/src/contexts/AuthContext";
+import DashboardLayout from "@/src/components/layout/DashboardLayout";
+import ProtectedRoute from "@/src/components/auth/ProtectedRoute";
+import PersonProfile from "@/src/components/people/PersonProfile";
+import PersonForm from "@/src/components/people/PersonForm";
+import { Person } from "@/src/types/person";
+import { Cluster } from "@/src/types/cluster";
+import { clustersApi, peopleApi } from "@/src/lib/api";
+import { usePeople } from "@/src/hooks/usePeople";
+import { useFamilies } from "@/src/hooks/useFamilies";
+import SundaySelfCheckInBanner from "@/src/components/events/SundaySelfCheckInBanner";
+
+export default function MePage() {
+  return (
+    <ProtectedRoute>
+      <MePageContent />
+    </ProtectedRoute>
+  );
+}
+
+function MePageContent() {
+  const { user, hasAnyModuleCoordinatorAssignment } = useAuth();
+  const router = useRouter();
+  const { people, updatePerson } = usePeople(true);
+  const { families, refreshFamilies } = useFamilies();
+
+  const [person, setPerson] = useState<Person | null>(null);
+  const [clusters, setClusters] = useState<Cluster[]>([]);
+  const [viewMode, setViewMode] = useState<"view" | "edit">("view");
+  const [startOnTimelineTab, setStartOnTimelineTab] = useState(false);
+  const [profileStartOnTimelineTab, setProfileStartOnTimelineTab] =
+    useState(false);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!user?.role) return;
+    if (user.role === "VISITOR") {
+      router.replace("/profile");
+    }
+  }, [user?.role, router]);
+
+  const loadData = useCallback(async () => {
+    if (!user?.id || user.role === "VISITOR") return;
+    setLoading(true);
+    setError(null);
+    try {
+      const personId = String(user.id);
+      const [personRes, clustersRes] = await Promise.all([
+        peopleApi.getById(personId),
+        clustersApi.getAll(),
+      ]);
+      setPerson({
+        ...personRes.data,
+        journeys: Array.isArray(personRes.data.journeys)
+          ? personRes.data.journeys
+          : [],
+      });
+      setClusters(clustersRes.data as unknown as Cluster[]);
+    } catch {
+      setError("Failed to load your record.");
+      setPerson(null);
+    } finally {
+      setLoading(false);
+    }
+  }, [user?.id, user?.role]);
+
+  useEffect(() => {
+    if (!user?.id || user.role === "VISITOR") return;
+    loadData();
+  }, [user?.id, user?.role, loadData]);
+
+  const refreshPersonJourneys = async (
+    personId: string,
+    nextJourneys?: Person["journeys"],
+  ) => {
+    const id = String(personId);
+    if (nextJourneys) {
+      setPerson((current) =>
+        current && String(current.id) === id
+          ? { ...current, journeys: nextJourneys }
+          : current,
+      );
+    }
+    try {
+      const personResponse = await peopleApi.getById(id);
+      setPerson({
+        ...personResponse.data,
+        journeys: Array.isArray(personResponse.data.journeys)
+          ? personResponse.data.journeys
+          : nextJourneys ?? [],
+      });
+    } catch (e) {
+      console.error("Failed to refresh person data:", e);
+    }
+  };
+
+  if (!user) {
+    return null;
+  }
+
+  if (user.role === "VISITOR") {
+    return (
+      <DashboardLayout>
+        <div className="flex items-center justify-center py-12 text-gray-600">
+          Redirecting…
+        </div>
+      </DashboardLayout>
+    );
+  }
+
+  const isMember = user.role === "MEMBER";
+  const canManageAssignments =
+    user.role === "PASTOR" ||
+    user.role === "ADMIN" ||
+    hasAnyModuleCoordinatorAssignment();
+
+  return (
+    <DashboardLayout>
+      <div className="max-w-4xl mx-auto space-y-3 px-3 sm:px-4 md:px-0 pb-8">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+          <h1 className="text-2xl font-bold text-foreground">My record</h1>
+          <Link
+            href="/profile"
+            className="text-sm font-medium text-primary hover:text-primary"
+          >
+            Account settings
+          </Link>
+        </div>
+        <SundaySelfCheckInBanner />
+        {isMember && (
+          <p className="text-sm text-gray-600">
+            You can edit your profile here. Vital dates, role, status, branch,
+            and membership are managed by your cluster coordinator — contact
+            them to request changes. Account login details (password) are under
+            Account settings.
+          </p>
+        )}
+        {loading && (
+          <div className="text-gray-600 py-8 text-center">Loading…</div>
+        )}
+        {error && !loading && (
+          <div className="rounded-lg border border-red-200 bg-red-50 text-red-800 px-4 py-3 text-sm space-y-2">
+            <p>{error}</p>
+            <button
+              type="button"
+              className="text-sm font-medium underline"
+              onClick={() => loadData()}
+            >
+              Try again
+            </button>
+          </div>
+        )}
+        {!loading && !error && person && viewMode === "view" && (
+          <div className="rounded-xl border border-gray-200 bg-white shadow-sm overflow-hidden">
+            <PersonProfile
+              person={person}
+              clusters={clusters}
+              families={families}
+              initialTab={
+                profileStartOnTimelineTab ? "timeline" : "overview"
+              }
+              hideDeleteButton
+              showTopHeader={false}
+              onViewFamily={() => router.push("/people/families")}
+              onViewCluster={() => router.push("/clusters")}
+              onNoFamilyClick={
+                canManageAssignments ? () => router.push("/people") : undefined
+              }
+              onNoClusterClick={
+                canManageAssignments ? () => router.push("/people") : undefined
+              }
+              onViewPerson={(id) => {
+                router.push(`/people?open=${id}`);
+              }}
+              onEdit={() => {
+                setStartOnTimelineTab(false);
+                setProfileStartOnTimelineTab(false);
+                setViewMode("edit");
+              }}
+              onDelete={() => {}}
+              onAddTimeline={() => {
+                setStartOnTimelineTab(true);
+                setProfileStartOnTimelineTab(false);
+                setViewMode("edit");
+              }}
+              onClose={() => router.push("/dashboard")}
+            />
+          </div>
+        )}
+        {!loading && !error && person && viewMode === "edit" && (
+          <div className="rounded-xl border border-gray-200 bg-white shadow-sm px-4 sm:px-6 md:px-8 pt-2 sm:pt-3 pb-4 sm:pb-6 md:pb-8">
+            <PersonForm
+              initialData={person}
+              isEditingFromProfile
+              startOnTimelineTab={startOnTimelineTab}
+              panelLayout={false}
+              peopleOptions={people}
+              familyOptions={families}
+              clusterOptions={clusters}
+              onJourneySaved={(personId, nextJourneys) =>
+                refreshPersonJourneys(personId, nextJourneys)
+              }
+              onClose={() => {
+                setViewMode("view");
+                setStartOnTimelineTab(false);
+                setProfileStartOnTimelineTab(false);
+              }}
+              onBackToProfile={(opts) => {
+                setViewMode("view");
+                setStartOnTimelineTab(false);
+                setProfileStartOnTimelineTab(Boolean(opts?.startOnTimeline));
+              }}
+              onSubmit={async (data) => {
+                const result = await updatePerson(person.id, data);
+                setViewMode("view");
+                setStartOnTimelineTab(false);
+                setProfileStartOnTimelineTab(false);
+                await refreshPersonJourneys(String(person.id));
+                const [clustersRes] = await Promise.all([
+                  clustersApi.getAll(),
+                  refreshFamilies(),
+                ]);
+                setClusters(clustersRes.data as unknown as Cluster[]);
+                return result;
+              }}
+            />
+          </div>
+        )}
+      </div>
+    </DashboardLayout>
+  );
+}

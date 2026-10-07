@@ -1,0 +1,46 @@
+from django.contrib import admin
+from django.urls import path, include, re_path
+from django.conf import settings
+from django.conf.urls.static import static
+from django.views.static import serve
+
+urlpatterns = [
+    path("admin/", admin.site.urls),
+    path("api/auth/", include("apps.authentication.urls", namespace="authentication")),
+    path("api/people/", include("apps.people.urls", namespace="people")),
+    path("api/clusters/", include("apps.clusters.urls", namespace="clusters")),
+    path("api/events/", include("apps.events.urls")),
+    path("api/event-types/", include(("apps.events.type_urls", "event_types"), namespace="event_types")),
+    path("api/event-rooms/", include(("apps.events.room_urls", "event_rooms"), namespace="event_rooms")),
+    path(
+        "api/attendance-venues/",
+        include(("apps.events.venue_urls", "attendance_venues"), namespace="attendance_venues"),
+    ),
+    path("api/attendance/", include("apps.attendance.urls", namespace="attendance")),
+    path("api/ministries/", include("apps.ministries.urls", namespace="ministries")),
+    path("api/lessons/", include("apps.lessons.urls", namespace="lessons")),
+    path(
+        "api/finance/", include(("apps.finance.urls", "finance"), namespace="finance")
+    ),
+    path("api/sunday-school/", include("apps.sunday_school.urls", namespace="sunday_school")),
+    path("api/evangelism/", include("apps.evangelism.urls", namespace="evangelism")),
+    path(
+        "api/notifications/",
+        include("apps.notifications.urls", namespace="notifications"),
+    ),
+    path("api/reports/", include("apps.reports.urls", namespace="reports")),
+]
+
+# Serve user uploads (profile photos, etc.).
+# django.conf.urls.static.static() only works when DEBUG=True; Waitress
+# production on Windows uses DEBUG=False, so add an explicit media route.
+if settings.DEBUG:
+    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+else:
+    urlpatterns += [
+        re_path(
+            r"^media/(?P<path>.*)$",
+            serve,
+            {"document_root": settings.MEDIA_ROOT},
+        ),
+    ]

@@ -1,0 +1,73 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+frontend/node_modules
+/.pnp
+.pnp.js
+package-lock.json
+
+# testing
+/coverage
+backend/test_db.sqlite3
+
+# next.js
+frontend/.next/
+.next/
+/out/
+frontend/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# local env files
+.env
+.env*.local
+.env.production
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# database
+db.sqlite3
+backend/test_db.sqlite3
+
+# venv
+backend/venv/
+backend/.venv/
+frontend/.next/server/vendor-chunks/axios.js
+
+# Django collected static files (run: python manage.py collectstatic)
+backend/staticfiles/
+
+# User-uploaded media (profile photos, lesson forms, etc.)
+backend/media/profiles/*
+!backend/media/profiles/.gitkeep
+backend/media/lessons/commitment_forms/*
+!backend/media/lessons/commitment_forms/.gitkeep
+backend/media/lessons/ncc_lessons/*
+!backend/media/lessons/ncc_lessons/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Server-only Docker overrides (see docker-compose.override.yml.example)
+docker-compose.override.yml
+
+# Frontend production env (copy from .env.production.example)
+frontend/.env.production
+

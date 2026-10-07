@@ -1,0 +1,1951 @@
+"use client";
+
+import { useState, useEffect, useMemo, useCallback } from "react";
+import toast from "react-hot-toast";
+import {
+  Event,
+  EventRegistrationTier,
+  RecurrencePattern,
+} from "@/src/types/event";
+import { useAuth } from "@/src/contexts/AuthContext";
+import { useBranches } from "@/src/hooks/useBranches";
+import { useEventRooms } from "@/src/hooks/useEventRooms";
+import { eventRegistrationApi } from "@/src/lib/api";
+import { formatApiErrorMessage } from "@/src/lib/apiErrors";
+import Button from "../ui/Button";
+import ConfirmationModal from "../ui/ConfirmationModal";
+import { findScheduleConflict } from "@/src/lib/events/scheduleConflicts";
+import {
+  RepeatOption,
+  buildRecurrencePattern,
+  formatRecurrenceSummary,
+  getRepeatOption,
+  monthlyDateOptionLabel,
+  monthlyWeekdayOptionLabel,
+} from "@/src/lib/events/recurrenceLabel";
+
+const OFFSITE_ROOM = "other";
+
+type EventTypeFormOption = {
+  value: string;
+  label: string;
+  counts_as_activity?: boolean;
+};
+
+interface EventFormProps {
+  onSubmit: (event: Partial<Event>) => Promise<Event | void>;
+  initialData?: Partial<Event>;
+  presetDate?: Date | null;
+  onClose?: () => void;
+  eventTypeOptions?: EventTypeFormOption[];
+  lockRecurrence?: boolean;
+  scopeHint?: string;
+  existingEvents?: Event[];
+  ignoreOccurrenceDate?: string | null;
+  ignoreDatesGte?: string | null;
+  isBookingRequest?: boolean;
+}
+
+/** Parse datetime-local (wall clock) and ISO strings without UTC shifting. */
+const parseLocalDateTime = (value: string): Date | null => {
+  if (!value) return null;
+  const trimmed = value.trim();
+
+  const localMatch = trimmed.match(
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/,
+  );
+  if (localMatch) {
+    const [, y, m, d, h, min, sec] = localMatch;
+    const parsed = new Date(
+      Number(y),
+      Number(m) - 1,
+      Number(d),
+      Number(h),
+      Number(min),
+      sec ? Number(sec) : 0,
+      0,
+    );
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+  }
+
+  const parsed = new Date(trimmed);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+};
+
+const formatDateOnly = (date: Date) => {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+};
+
+const toCalendarDateKey = (value?: string | null): string | null => {
+  if (!value) return null;
+  const parsed = parseLocalDateTime(value);
+  if (!parsed) return null;
+  return formatDateOnly(parsed);
+};
+
+const recordedAttendeeCount = (data?: Partial<Event>) => {
+  if (!data) return 0;
+  if (typeof data.attendance_count === "number") {
+    return data.attendance_count;
+  }
+  return data.attendance_records?.length ?? 0;
+};
+
+const getNextSundayAt9AM = () => {
+  const today = new Date();
+  const nextSunday = new Date(today);
+  const currentDay = today.getDay();
+
+  if (currentDay === 0) {
+    nextSunday.setHours(9, 0, 0, 0);
+    return nextSunday;
+  }
+
+  const daysUntilSunday = 7 - currentDay;
+  nextSunday.setDate(today.getDate() + daysUntilSunday);
+  nextSunday.setHours(9, 0, 0, 0);
+  return nextSunday;
+};
+
+const getNextSundayAt11AM = () => {
+  const nextSunday = getNextSundayAt9AM();
+  nextSunday.setHours(11, 0, 0, 0);
+  return nextSunday;
+};
+
+const formatDateForInput = (date: Date) => {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  return `${year}-${month}-${day}T${hours}:${minutes}`;
+};
+
+const toDateTimeLocalValue = (value: string): string => {
+  const date = parseLocalDateTime(value);
+  if (!date) return "";
+  return formatDateForInput(date);
+};
+
+const DEFAULT_EVENT_DURATION_HOURS = 2;
+
+function endDateFromStart(startValue: string): string {
+  const start = parseLocalDateTime(startValue);
+  if (!start) return "";
+  const end = new Date(start);
+  end.setTime(end.getTime() + DEFAULT_EVENT_DURATION_HOURS * 60 * 60 * 1000);
+  return formatDateForInput(end);
+}
+
+const getMaxThroughDate = (start: Date) => {
+  const endOfYear = new Date(start.getFullYear(), 11, 31);
+  const maxRange = new Date(start);
+  maxRange.setDate(maxRange.getDate() + 366);
+  return new Date(Math.min(endOfYear.getTime(), maxRange.getTime()));
+};
+
+const clampThroughDate = (start: Date, candidate?: Date | null) => {
+  const minDate = new Date(start);
+  minDate.setHours(0, 0, 0, 0);
+  const maxDate = getMaxThroughDate(start);
+
+  if (!candidate) {
+    return maxDate;
+  }
+
+  const normalized = new Date(candidate);
+  normalized.setHours(0, 0, 0, 0);
+
+  if (normalized < minDate) {
+    return minDate;
+  }
+
+  if (normalized > maxDate) {
+    return maxDate;
+  }
+
+  return normalized;
+};
+
+const buildPattern = (
+  startValue: string,
+  existing?: RecurrencePattern | null,
+  overrides?: Partial<RecurrencePattern>,
+): RecurrencePattern => {
+  const startDate = parseLocalDateTime(startValue) ?? new Date();
+
+  const throughCandidate = existing?.through
+    ? parseLocalDateTime(`${existing.through}T00:00:00`)
+    : null;
+
+  const throughDate = clampThroughDate(startDate, throughCandidate);
+
+  return buildRecurrencePattern(
+    startDate,
+    formatDateOnly(throughDate),
+    existing,
+    overrides,
+  );
+};
+
+const toUtcISOString = (value?: string | null) => {
+  if (!value) return undefined;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return undefined;
+  }
+  return date.toISOString();
+};
+
+type RoomSelection = number | typeof OFFSITE_ROOM | "";
+
+type FormDefaults = {
+  title: string;
+  description: string;
+  type: string;
+  location: string;
+  branch: number | "";
+  room: RoomSelection;
+  is_recurring: boolean;
+  start_date: string;
+  end_date: string;
+  expected_include_active: boolean;
+  expected_include_semiactive: boolean;
+  expected_include_inactive: boolean;
+  expected_include_ongoing_visitors: boolean;
+  track_expected_attendees: boolean;
+  allow_cross_branch_attendance: boolean;
+  tardy_grace_minutes: number;
+  self_checkin_enabled: boolean;
+  attendance_format: "hybrid" | "online_only" | "onsite_only";
+  registration_enabled: boolean;
+  onsite_registration_required: boolean;
+  online_registration_required: boolean;
+  onsite_capacity: number | "";
+  online_capacity: number | "";
+};
+
+type TierFormState = {
+  code: string;
+  label: string;
+  onsite_offered: boolean;
+  online_offered: boolean;
+  onsite_price: string;
+  online_price: string;
+  sort_order: number | "";
+};
+
+const EMPTY_TIER_FORM: TierFormState = {
+  code: "",
+  label: "",
+  onsite_offered: true,
+  online_offered: false,
+  onsite_price: "0.00",
+  online_price: "0.00",
+  sort_order: 0,
+};
+
+function withPlaceholders(
+  defaults: Omit<FormDefaults, "branch" | "room">,
+): FormDefaults {
+  return { ...defaults, branch: "", room: "" };
+}
+
+function withExpectedAttendeeDefaults(
+  defaults: Omit<
+    FormDefaults,
+    | "branch"
+    | "room"
+    | "expected_include_active"
+    | "expected_include_semiactive"
+    | "expected_include_inactive"
+    | "expected_include_ongoing_visitors"
+    | "track_expected_attendees"
+    | "allow_cross_branch_attendance"
+    | "tardy_grace_minutes"
+    | "self_checkin_enabled"
+    | "attendance_format"
+    | "registration_enabled"
+    | "onsite_registration_required"
+    | "online_registration_required"
+    | "onsite_capacity"
+    | "online_capacity"
+  >,
+): Omit<FormDefaults, "branch" | "room"> {
+  return {
+    ...defaults,
+    expected_include_active: true,
+    expected_include_semiactive: true,
+    expected_include_inactive: true,
+    expected_include_ongoing_visitors: true,
+    track_expected_attendees: defaults.type === "SUNDAY_SERVICE",
+    allow_cross_branch_attendance: false,
+    tardy_grace_minutes: 0,
+    self_checkin_enabled: true,
+    attendance_format: "hybrid",
+    registration_enabled: false,
+    onsite_registration_required: false,
+    online_registration_required: false,
+    onsite_capacity: "",
+    online_capacity: "",
+  };
+}
+
+function buildSundayTemplateDefaults(): FormDefaults {
+  const startDate = formatDateForInput(getNextSundayAt9AM());
+  const endDate = formatDateForInput(getNextSundayAt11AM());
+
+  return withPlaceholders(
+    withExpectedAttendeeDefaults({
+      title: "Sunday Service",
+      description: "",
+      type: "SUNDAY_SERVICE",
+      location: "",
+      is_recurring: false,
+      start_date: startDate,
+      end_date: endDate,
+    }),
+  );
+}
+
+function buildDefaultsFromDate(
+  date: Date,
+  eventTypeOptions: EventTypeFormOption[],
+): FormDefaults {
+  const start = new Date(date);
+  start.setHours(9, 0, 0, 0);
+  const startDate = formatDateForInput(start);
+  const endDate = endDateFromStart(startDate);
+
+  if (start.getDay() === 0) {
+    return withPlaceholders(
+      withExpectedAttendeeDefaults({
+        title: "Sunday Service",
+        description: "",
+        type: "SUNDAY_SERVICE",
+        location: "",
+        is_recurring: false,
+        start_date: startDate,
+        end_date: endDate,
+      }),
+    );
+  }
+
+  const type = eventTypeOptions[0]?.value ?? "SPECIAL_EVENT";
+  const title =
+    eventTypeOptions.find((option) => option.value === type)?.label ?? "";
+
+  return withPlaceholders(
+    withExpectedAttendeeDefaults({
+      title,
+      description: "",
+      type,
+      location: "",
+      is_recurring: false,
+      start_date: startDate,
+      end_date: endDate,
+    }),
+  );
+}
+
+function resolveRoomSelection(initialData?: Partial<Event>): RoomSelection {
+  if (initialData?.room != null) return Number(initialData.room);
+  if (initialData) return OFFSITE_ROOM;
+  return "";
+}
+
+export default function EventForm({
+  onSubmit,
+  initialData,
+  presetDate,
+  onClose,
+  eventTypeOptions = [],
+  lockRecurrence = false,
+  scopeHint,
+  existingEvents = [],
+  ignoreOccurrenceDate = null,
+  ignoreDatesGte = null,
+  isBookingRequest = false,
+}: EventFormProps) {
+  const { user } = useAuth();
+  const canManageNational = Boolean(user?.can_manage_national_events);
+  const canPickBranch = Boolean(user?.can_see_all_branches);
+  const { branches } = useBranches();
+  const userBranchId =
+    user?.branch != null && user.branch !== undefined
+      ? Number(user.branch)
+      : "";
+
+  const visibleTypeOptions = useMemo(() => {
+    return eventTypeOptions.filter(
+      (option) =>
+        option.value !== "AWTA" ||
+        canManageNational ||
+        initialData?.type === "AWTA",
+    );
+  }, [eventTypeOptions, canManageNational, initialData?.type]);
+
+  const isEditingNationalLocked =
+    Boolean(initialData) &&
+    (initialData?.type === "AWTA" || initialData?.branch == null) &&
+    !canManageNational;
+
+  const defaultFormData = useMemo(() => {
+    const defaultBranch =
+      initialData != null
+        ? initialData.branch != null
+          ? Number(initialData.branch)
+          : ""
+        : userBranchId;
+
+    if (initialData) {
+      return {
+        title: initialData.title || "",
+        description: initialData.description || "",
+        type: initialData.type || "SUNDAY_SERVICE",
+        location: initialData.location || "",
+        branch: defaultBranch,
+        room: resolveRoomSelection(initialData),
+        is_recurring: initialData.is_recurring || false,
+        start_date:
+          toDateTimeLocalValue(initialData.start_date || "") ||
+          initialData.start_date ||
+          "",
+        end_date:
+          toDateTimeLocalValue(initialData.end_date || "") ||
+          initialData.end_date ||
+          "",
+        expected_include_active: initialData.expected_include_active ?? true,
+        expected_include_semiactive:
+          initialData.expected_include_semiactive ?? true,
+        expected_include_inactive:
+          initialData.expected_include_inactive ?? true,
+        expected_include_ongoing_visitors:
+          initialData.expected_include_ongoing_visitors ?? true,
+        track_expected_attendees: initialData.track_expected_attendees ?? true,
+        allow_cross_branch_attendance:
+          initialData.allow_cross_branch_attendance ?? false,
+        tardy_grace_minutes: initialData.tardy_grace_minutes ?? 0,
+        self_checkin_enabled: initialData.self_checkin_enabled ?? true,
+        attendance_format: initialData.attendance_format ?? "hybrid",
+        registration_enabled: initialData.registration_enabled ?? false,
+        onsite_registration_required:
+          initialData.onsite_registration_required ?? false,
+        online_registration_required:
+          initialData.online_registration_required ?? false,
+        onsite_capacity:
+          initialData.onsite_capacity != null
+            ? Number(initialData.onsite_capacity)
+            : "",
+        online_capacity:
+          initialData.online_capacity != null
+            ? Number(initialData.online_capacity)
+            : "",
+      };
+    }
+
+    const base = presetDate
+      ? buildDefaultsFromDate(presetDate, eventTypeOptions)
+      : buildSundayTemplateDefaults();
+    return { ...base, branch: defaultBranch };
+  }, [initialData, presetDate, eventTypeOptions, userBranchId]);
+  const [formData, setFormData] = useState(defaultFormData);
+
+  const allowsChurchWide =
+    formData.type === "AWTA" && canManageNational && !isEditingNationalLocked;
+  const isChurchWide = allowsChurchWide && formData.branch === "";
+
+  const selectedBranchId =
+    formData.branch === "" ? null : Number(formData.branch);
+  const { rooms } = useEventRooms({
+    branchId: selectedBranchId,
+    enabled: selectedBranchId != null,
+  });
+  const roomChoices = useMemo(() => {
+    return rooms.filter(
+      (room) =>
+        room.is_active ||
+        (initialData?.room != null && Number(initialData.room) === room.id),
+    );
+  }, [rooms, initialData?.room]);
+  const isRoomHold = useMemo(
+    () =>
+      visibleTypeOptions.find((option) => option.value === formData.type)
+        ?.counts_as_activity === false ||
+      eventTypeOptions.find((option) => option.value === formData.type)
+        ?.counts_as_activity === false,
+    [visibleTypeOptions, eventTypeOptions, formData.type],
+  );
+  const isAdmin = user?.role === "ADMIN";
+  const showRegistrationSettings = isAdmin && !isRoomHold;
+
+  const [tiers, setTiers] = useState<EventRegistrationTier[]>([]);
+  const [tiersLoading, setTiersLoading] = useState(false);
+  const [tierSaving, setTierSaving] = useState(false);
+  const [editingTierId, setEditingTierId] = useState<number | null>(null);
+  const [tierForm, setTierForm] = useState<TierFormState>(EMPTY_TIER_FORM);
+
+  const loadTiers = useCallback(async () => {
+    if (!initialData?.id || !formData.registration_enabled) {
+      setTiers([]);
+      return;
+    }
+    setTiersLoading(true);
+    try {
+      const response = await eventRegistrationApi.listTiers(initialData.id);
+      setTiers(response.data);
+    } catch (error) {
+      toast.error(
+        formatApiErrorMessage(error, "Failed to load registration tiers."),
+      );
+    } finally {
+      setTiersLoading(false);
+    }
+  }, [initialData?.id, formData.registration_enabled]);
+
+  useEffect(() => {
+    if (
+      showRegistrationSettings &&
+      initialData?.id &&
+      formData.registration_enabled
+    ) {
+      void loadTiers();
+    } else {
+      setTiers([]);
+      setEditingTierId(null);
+      setTierForm(EMPTY_TIER_FORM);
+    }
+  }, [
+    showRegistrationSettings,
+    initialData?.id,
+    formData.registration_enabled,
+    loadTiers,
+  ]);
+
+  const initialRecurrence = useMemo<RecurrencePattern | null>(
+    () =>
+      initialData?.is_recurring
+        ? buildPattern(
+            initialData.start_date || defaultFormData.start_date,
+            initialData.recurrence_pattern || null,
+          )
+        : null,
+    [initialData, defaultFormData.start_date],
+  );
+
+  const [recurrencePattern, setRecurrencePattern] =
+    useState<RecurrencePattern | null>(initialRecurrence);
+  const [loading, setLoading] = useState(false);
+  const [conflictError, setConflictError] = useState<string | null>(null);
+  const [dateMoveConfirm, setDateMoveConfirm] = useState<{
+    isOpen: boolean;
+    payload: Partial<Event> | null;
+  }>({ isOpen: false, payload: null });
+
+  useEffect(() => {
+    setFormData(defaultFormData);
+    if (initialData?.is_recurring) {
+      setRecurrencePattern(
+        buildPattern(
+          initialData.start_date || defaultFormData.start_date,
+          initialData.recurrence_pattern || null,
+        ),
+      );
+    } else {
+      setRecurrencePattern(null);
+    }
+  }, [defaultFormData, initialData]);
+
+  useEffect(() => {
+    if (!isChurchWide) return;
+    if (formData.room === OFFSITE_ROOM) return;
+    setFormData((prev) => ({ ...prev, room: OFFSITE_ROOM }));
+  }, [isChurchWide, formData.room]);
+
+  const handleChange = (
+    e: React.ChangeEvent<
+      HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement
+    >,
+  ) => {
+    const { name, value, type } = e.target;
+    const checked = (e.target as HTMLInputElement).checked;
+
+    if (name === "is_recurring") {
+      const nextIsRecurring = type === "checkbox" ? checked : value === "true";
+      setFormData((prev) => ({ ...prev, is_recurring: nextIsRecurring }));
+
+      if (nextIsRecurring) {
+        const sourceStart = formData.start_date || defaultFormData.start_date;
+        setRecurrencePattern((current) => buildPattern(sourceStart, current));
+      } else {
+        setRecurrencePattern(null);
+      }
+
+      return;
+    }
+
+    if (name === "branch") {
+      const nextBranch = value ? Number(value) : "";
+      setFormData((prev) => ({
+        ...prev,
+        branch: nextBranch,
+        room: nextBranch === "" ? OFFSITE_ROOM : "",
+        location: nextBranch === "" ? prev.location : "",
+        allow_cross_branch_attendance:
+          nextBranch === "" ? false : prev.allow_cross_branch_attendance,
+      }));
+      return;
+    }
+
+    if (name === "room") {
+      if (value === OFFSITE_ROOM) {
+        setFormData((prev) => ({ ...prev, room: OFFSITE_ROOM }));
+        return;
+      }
+      const roomId = Number(value);
+      const selected = roomChoices.find((room) => room.id === roomId);
+      setFormData((prev) => ({
+        ...prev,
+        room: roomId,
+        location: selected?.name || prev.location,
+      }));
+      return;
+    }
+
+    if (name === "tardy_grace_minutes") {
+      const parsed = Number.parseInt(value, 10);
+      setFormData((prev) => ({
+        ...prev,
+        tardy_grace_minutes:
+          Number.isFinite(parsed) && parsed >= 0 ? parsed : 0,
+      }));
+      return;
+    }
+
+    if (name === "onsite_capacity" || name === "online_capacity") {
+      if (value === "") {
+        setFormData((prev) => ({ ...prev, [name]: "" }));
+        return;
+      }
+      const parsed = Number.parseInt(value, 10);
+      if (Number.isFinite(parsed) && parsed >= 0) {
+        setFormData((prev) => ({ ...prev, [name]: parsed }));
+      }
+      return;
+    }
+
+    let nextStartDate: string | null = null;
+
+    setFormData((prev) => {
+      const nextState = {
+        ...prev,
+        [name]: type === "checkbox" ? checked : value,
+      };
+
+      if (name === "type" && value === "SUNDAY_SERVICE") {
+        const startDate =
+          parseLocalDateTime(prev.start_date) || getNextSundayAt9AM();
+        startDate.setHours(9, 0, 0, 0);
+
+        const endDate =
+          parseLocalDateTime(prev.end_date) || getNextSundayAt11AM();
+        endDate.setHours(11, 0, 0, 0);
+
+        nextState.start_date = formatDateForInput(startDate);
+        nextState.end_date = formatDateForInput(endDate);
+      }
+
+      if (name === "type") {
+        const optionLabel =
+          visibleTypeOptions.find((option) => option.value === value)?.label ||
+          eventTypeOptions.find((option) => option.value === value)?.label ||
+          value;
+        nextState.title = optionLabel;
+        const nextIsRoomHold =
+          (
+            visibleTypeOptions.find((option) => option.value === value) ||
+            eventTypeOptions.find((option) => option.value === value)
+          )?.counts_as_activity === false;
+        if (nextIsRoomHold && prev.room === OFFSITE_ROOM) {
+          nextState.room = "";
+          nextState.location = "";
+        }
+        if (nextIsRoomHold) {
+          nextState.self_checkin_enabled = false;
+          nextState.attendance_format = "hybrid";
+          nextState.registration_enabled = false;
+          nextState.onsite_registration_required = false;
+          nextState.online_registration_required = false;
+          nextState.onsite_capacity = "";
+          nextState.online_capacity = "";
+        } else {
+          // Room holds can't self-check-in; restore the default when leaving them.
+          const prevWasRoomHold =
+            (
+              visibleTypeOptions.find((option) => option.value === prev.type) ||
+              eventTypeOptions.find((option) => option.value === prev.type)
+            )?.counts_as_activity === false;
+          if (prevWasRoomHold) {
+            nextState.self_checkin_enabled =
+              nextState.attendance_format !== "onsite_only";
+          }
+          if (value === "SUNDAY_SERVICE") {
+            nextState.attendance_format = "hybrid";
+          }
+        }
+        if (!initialData) {
+          nextState.track_expected_attendees = value === "SUNDAY_SERVICE";
+        }
+        if (value !== "AWTA" && prev.branch === "") {
+          nextState.branch = userBranchId === "" ? "" : userBranchId;
+          nextState.room = "";
+          nextState.location = "";
+        }
+      }
+
+      if (name === "attendance_format") {
+        if (value === "onsite_only") {
+          nextState.self_checkin_enabled = false;
+          nextState.online_registration_required = false;
+        } else if (value === "online_only") {
+          nextState.self_checkin_enabled = true;
+          nextState.onsite_registration_required = false;
+          nextState.room = OFFSITE_ROOM;
+          nextState.location = "Zoom";
+        }
+      }
+
+      nextStartDate = nextState.start_date;
+
+      return nextState;
+    });
+
+    if (
+      name === "type" &&
+      (formData.is_recurring || recurrencePattern) &&
+      nextStartDate
+    ) {
+      setRecurrencePattern((current) =>
+        buildPattern(nextStartDate as string, current),
+      );
+    }
+  };
+
+  const submitPayload = async (payload: Partial<Event>) => {
+    try {
+      setLoading(true);
+      await onSubmit(payload);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    let patternToSend = recurrencePattern;
+
+    if (formData.is_recurring) {
+      const baseStart = formData.start_date || defaultFormData.start_date;
+      if (!patternToSend) {
+        patternToSend = buildPattern(baseStart, null);
+        setRecurrencePattern(patternToSend);
+      } else {
+        patternToSend = buildPattern(baseStart, patternToSend);
+        setRecurrencePattern(patternToSend);
+      }
+    }
+
+    const startSource = formData.start_date || defaultFormData.start_date;
+    const endSource = formData.end_date || defaultFormData.end_date;
+
+    const startIso = toUtcISOString(startSource) ?? startSource;
+    const endIso = toUtcISOString(endSource) ?? endSource;
+    if (formData.room === "") {
+      const message =
+        formData.branch === "" && !allowsChurchWide
+          ? "Select a branch and room before creating the event."
+          : "Room is required.";
+      setConflictError(message);
+      toast.error(message);
+      return;
+    }
+    if (!allowsChurchWide && formData.branch === "") {
+      setConflictError("Branch is required.");
+      toast.error("Branch is required.");
+      return;
+    }
+    const isOffsite = formData.room === OFFSITE_ROOM;
+    if (isChurchWide && !isOffsite) {
+      setConflictError(
+        "Church-wide events must use Other / off-site with a dedicated venue location.",
+      );
+      return;
+    }
+    if (isRoomHold && isOffsite) {
+      setConflictError(
+        "Meeting events must use a room in the church building.",
+      );
+      return;
+    }
+    const selectedRoom = roomChoices.find(
+      (room) => room.id === Number(formData.room),
+    );
+
+    const payload: Partial<Event> = {
+      title: formData.title,
+      description: formData.description,
+      type: formData.type,
+      is_recurring: formData.is_recurring,
+      start_date: startIso,
+      end_date: endIso,
+      recurrence_pattern: formData.is_recurring ? patternToSend : null,
+      branch: formData.branch === "" ? null : Number(formData.branch),
+      room: isOffsite ? null : Number(formData.room),
+      location: isOffsite
+        ? formData.location.trim()
+        : selectedRoom?.name || formData.location,
+      expected_include_active: formData.expected_include_active,
+      expected_include_semiactive: formData.expected_include_semiactive,
+      expected_include_inactive: formData.expected_include_inactive,
+      expected_include_ongoing_visitors:
+        formData.expected_include_ongoing_visitors,
+      track_expected_attendees: isRoomHold
+        ? false
+        : formData.track_expected_attendees,
+      allow_cross_branch_attendance:
+        isRoomHold || formData.branch === ""
+          ? false
+          : formData.allow_cross_branch_attendance,
+      tardy_grace_minutes: formData.tardy_grace_minutes,
+      self_checkin_enabled: isRoomHold
+        ? false
+        : formData.attendance_format === "onsite_only"
+          ? false
+          : formData.self_checkin_enabled,
+      attendance_format: isRoomHold ? "hybrid" : formData.attendance_format,
+    };
+
+    if (isAdmin && !isRoomHold) {
+      payload.registration_enabled = formData.registration_enabled;
+      payload.onsite_registration_required =
+        formData.attendance_format === "online_only"
+          ? false
+          : formData.onsite_registration_required;
+      payload.online_registration_required =
+        formData.attendance_format === "onsite_only"
+          ? false
+          : formData.online_registration_required;
+      payload.onsite_capacity =
+        formData.onsite_capacity === ""
+          ? null
+          : Number(formData.onsite_capacity);
+      payload.online_capacity =
+        formData.online_capacity === ""
+          ? null
+          : Number(formData.online_capacity);
+    }
+
+    const conflict = findScheduleConflict({
+      payload,
+      events: existingEvents,
+      excludeEventId: initialData?.id,
+      ignoreOccurrenceDate,
+      ignoreDatesGte,
+    });
+    if (conflict) {
+      setConflictError(conflict.message);
+      toast.error(conflict.message);
+      return;
+    }
+    setConflictError(null);
+
+    const attendeeCount = recordedAttendeeCount(initialData);
+    const dateChanged =
+      Boolean(initialData) &&
+      toCalendarDateKey(initialData?.start_date) !==
+        toCalendarDateKey(formData.start_date);
+
+    if (initialData && attendeeCount > 0 && dateChanged) {
+      setDateMoveConfirm({ isOpen: true, payload });
+      return;
+    }
+
+    await submitPayload(payload);
+  };
+
+  const resetTierForm = () => {
+    setEditingTierId(null);
+    setTierForm(EMPTY_TIER_FORM);
+  };
+
+  const startEditTier = (tier: EventRegistrationTier) => {
+    setEditingTierId(tier.id);
+    setTierForm({
+      code: tier.code,
+      label: tier.label,
+      onsite_offered: tier.onsite_offered,
+      online_offered: tier.online_offered,
+      onsite_price: tier.onsite_price,
+      online_price: tier.online_price,
+      sort_order: tier.sort_order,
+    });
+  };
+
+  const handleTierFormChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const { name, value, type } = e.target;
+    const checked = e.target.checked;
+    if (name === "sort_order") {
+      if (value === "") {
+        setTierForm((prev) => ({ ...prev, sort_order: "" }));
+        return;
+      }
+      const parsed = Number.parseInt(value, 10);
+      if (Number.isFinite(parsed)) {
+        setTierForm((prev) => ({ ...prev, sort_order: parsed }));
+      }
+      return;
+    }
+    setTierForm((prev) => ({
+      ...prev,
+      [name]: type === "checkbox" ? checked : value,
+    }));
+  };
+
+  const handleSaveTier = async () => {
+    if (!initialData?.id) return;
+    const code = tierForm.code.trim();
+    const label = tierForm.label.trim();
+    if (!code || !label) {
+      toast.error("Tier code and label are required.");
+      return;
+    }
+    if (!tierForm.onsite_offered && !tierForm.online_offered) {
+      toast.error("Offer at least one mode (onsite or online).");
+      return;
+    }
+    setTierSaving(true);
+    try {
+      const payload = {
+        code,
+        label,
+        onsite_offered: tierForm.onsite_offered,
+        online_offered: tierForm.online_offered,
+        onsite_price: tierForm.onsite_offered
+          ? tierForm.onsite_price || "0.00"
+          : "0.00",
+        online_price: tierForm.online_offered
+          ? tierForm.online_price || "0.00"
+          : "0.00",
+        sort_order:
+          tierForm.sort_order === "" ? 0 : Number(tierForm.sort_order),
+        is_active: true,
+      };
+      if (editingTierId != null) {
+        await eventRegistrationApi.updateTier(
+          initialData.id,
+          editingTierId,
+          payload,
+        );
+        toast.success("Tier updated.");
+      } else {
+        await eventRegistrationApi.createTier(initialData.id, payload);
+        toast.success("Tier created.");
+      }
+      resetTierForm();
+      await loadTiers();
+    } catch (error) {
+      toast.error(formatApiErrorMessage(error, "Failed to save tier."));
+    } finally {
+      setTierSaving(false);
+    }
+  };
+
+  const handleDeleteTier = async (tierId: number) => {
+    if (!initialData?.id) return;
+    if (!window.confirm("Delete this pricing tier?")) return;
+    setTierSaving(true);
+    try {
+      await eventRegistrationApi.deleteTier(initialData.id, tierId);
+      toast.success("Tier deleted.");
+      if (editingTierId === tierId) resetTierForm();
+      await loadTiers();
+    } catch (error) {
+      toast.error(formatApiErrorMessage(error, "Failed to delete tier."));
+    } finally {
+      setTierSaving(false);
+    }
+  };
+
+  const activeStartDate = formData.start_date || defaultFormData.start_date;
+  const parsedStartDate = parseLocalDateTime(activeStartDate);
+  const activeStartDateObj =
+    parsedStartDate && !Number.isNaN(parsedStartDate.getTime())
+      ? parsedStartDate
+      : (() => {
+          const fallback = activeStartDate
+            ? new Date(activeStartDate)
+            : new Date();
+          return Number.isNaN(fallback.getTime()) ? new Date() : fallback;
+        })();
+
+  const recurrenceMaxThroughDate = getMaxThroughDate(activeStartDateObj);
+  const currentThroughDate = recurrencePattern?.through
+    ? parseLocalDateTime(`${recurrencePattern.through}T00:00:00`)
+    : null;
+  const clampedThroughDate = clampThroughDate(
+    activeStartDateObj,
+    currentThroughDate,
+  );
+  const recurrenceThroughValue = formatDateOnly(clampedThroughDate);
+  const recurrenceMinThroughValue = formatDateOnly(activeStartDateObj);
+  const recurrenceMaxThroughValue = formatDateOnly(recurrenceMaxThroughDate);
+  const liveRecurrencePattern = formData.is_recurring
+    ? buildPattern(activeStartDate, {
+        ...(recurrencePattern ?? {}),
+        through: recurrenceThroughValue,
+      } as RecurrencePattern)
+    : recurrencePattern;
+  const repeatOption = getRepeatOption(liveRecurrencePattern);
+
+  const handleRecurrenceThroughChange = (value: string) => {
+    if (!value) return;
+    const selectedDate =
+      parseLocalDateTime(`${value}T00:00:00`) ?? new Date(`${value}T00:00:00`);
+    const clamped = clampThroughDate(activeStartDateObj, selectedDate);
+
+    setRecurrencePattern((current) => {
+      const base = current ?? buildPattern(activeStartDate, null);
+      return buildPattern(activeStartDate, {
+        ...base,
+        through: formatDateOnly(clamped),
+      });
+    });
+  };
+
+  const handleRepeatOptionChange = (value: RepeatOption) => {
+    setRecurrencePattern((current) =>
+      buildPattern(activeStartDate, current, {
+        frequency: value === "monthly" ? "monthly" : "weekly",
+        interval: value === "every_2_weeks" ? 2 : 1,
+        monthly_mode:
+          value === "monthly"
+            ? (current?.monthly_mode ?? "by_date")
+            : undefined,
+      }),
+    );
+  };
+
+  const handleMonthlyModeChange = (mode: "by_date" | "by_weekday") => {
+    setRecurrencePattern((current) =>
+      buildPattern(activeStartDate, current, {
+        frequency: "monthly",
+        monthly_mode: mode,
+      }),
+    );
+  };
+
+  const formatDateTimeLocal = (dateString: string) => {
+    return toDateTimeLocalValue(dateString);
+  };
+
+  const pendingAttendeeCount = recordedAttendeeCount(initialData);
+  const attendeeLabel = pendingAttendeeCount === 1 ? "attendee" : "attendees";
+
+  return (
+    <>
+      <form onSubmit={handleSubmit} className="space-y-6 text-sm max-w-3xl">
+        {scopeHint && (
+          <p className="text-sm text-gray-600 bg-gray-50 border border-gray-200 rounded-lg px-3 py-2">
+            {scopeHint}
+          </p>
+        )}
+        {isBookingRequest && !initialData && (
+          <p className="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+            This booking will be submitted for Events Coordinator approval. The
+            room is held until they approve or reject it.
+          </p>
+        )}
+        {conflictError && (
+          <p className="text-sm text-red-800 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
+            {conflictError}
+          </p>
+        )}
+        <div className="space-y-6 pr-1">
+          <div>
+            <div className="p-0">
+              <h3 className="text-sm font-semibold text-gray-900 mb-2">
+                Event Details
+              </h3>
+              <p className="text-xs text-gray-500 mb-4">
+                Basic information about the event.
+              </p>
+              <div className="space-y-4">
+                {/* Event Title */}
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">
+                    Event Title *
+                  </label>
+                  <input
+                    type="text"
+                    name="title"
+                    required
+                    value={formData.title}
+                    onChange={handleChange}
+                    className="w-full px-3 py-2 min-h-[44px] border border-gray-300 rounded-lg focus:ring-2 focus:ring-ring focus:border-transparent"
+                    placeholder="e.g., Sunday Worship Service"
+                  />
+                </div>
+
+                {/* Event Type, Branch, Room */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      Event Type *
+                    </label>
+                    <select
+                      name="type"
+                      value={formData.type}
+                      onChange={handleChange}
+                      disabled={isEditingNationalLocked}
+                      className="w-full px-3 py-2 min-h-[44px] border border-gray-300 rounded-lg focus:ring-2 focus:ring-ring focus:border-transparent disabled:bg-gray-100"
+                    >
+                      {visibleTypeOptions.map((option) => (
+                        <option key={option.value} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      Branch{allowsChurchWide ? "" : " *"}
+                    </label>
+                    <select
+                      name="branch"
+                      required={!allowsChurchWide}
+                      value={formData.branch}
+                      onChange={handleChange}
+                      disabled={
+                        (!canPickBranch && !allowsChurchWide) ||
+                        isEditingNationalLocked
+                      }
+                      className="w-full px-3 py-2 min-h-[44px] border border-gray-300 rounded-lg focus:ring-2 focus:ring-ring focus:border-transparent disabled:bg-gray-100"
+                    >
+                      {allowsChurchWide && (
+                        <option value="">Church-wide</option>
+                      )}
+                      {!allowsChurchWide && formData.branch === "" && (
+                        <option value="">Select branch</option>
+                      )}
+                      {(canPickBranch
+                        ? branches
+                        : branches.filter(
+                            (branch) => branch.id === userBranchId,
+                          )
+                      ).map((branch) => (
+                        <option key={branch.id} value={branch.id}>
+                          {branch.name}
+                          {branch.is_headquarters ? " (HQ)" : ""}
+                        </option>
+                      ))}
+                      {!canPickBranch &&
+                        userBranchId !== "" &&
+                        !branches.some(
+                          (branch) => branch.id === userBranchId,
+                        ) && (
+                          <option value={userBranchId}>
+                            {user?.branch_name || `Branch #${userBranchId}`}
+                          </option>
+                        )}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      Room *
+                    </label>
+                    <select
+                      name="room"
+                      required={
+                        !(
+                          (formData.branch === "" && !allowsChurchWide) ||
+                          isEditingNationalLocked
+                        )
+                      }
+                      value={isChurchWide ? OFFSITE_ROOM : formData.room}
+                      onChange={handleChange}
+                      disabled={
+                        (formData.branch === "" && !allowsChurchWide) ||
+                        isEditingNationalLocked
+                      }
+                      className="w-full px-3 py-2 min-h-[44px] border border-gray-300 rounded-lg focus:ring-2 focus:ring-ring focus:border-transparent disabled:bg-gray-100"
+                    >
+                      {formData.room === "" && !isChurchWide && (
+                        <option value="" disabled>
+                          {formData.branch === "" && !allowsChurchWide
+                            ? "Select a branch first"
+                            : "Select room"}
+                        </option>
+                      )}
+                      {!isChurchWide &&
+                        roomChoices.map((room) => (
+                          <option key={room.id} value={room.id}>
+                            {room.name}
+                            {room.capacity != null ? ` (${room.capacity})` : ""}
+                          </option>
+                        ))}
+                      {!isRoomHold && (
+                        <option value={OFFSITE_ROOM}>
+                          {isChurchWide
+                            ? "Other / off-site (required for church-wide)"
+                            : "Other / off-site"}
+                        </option>
+                      )}
+                    </select>
+                  </div>
+                  {formData.room === OFFSITE_ROOM && !isRoomHold && (
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-2">
+                        Location *
+                      </label>
+                      <input
+                        type="text"
+                        name="location"
+                        required
+                        value={formData.location}
+                        onChange={handleChange}
+                        disabled={isEditingNationalLocked}
+                        className="w-full px-3 py-2 min-h-[44px] border border-gray-300 rounded-lg focus:ring-2 focus:ring-ring focus:border-transparent disabled:bg-gray-100"
+                        placeholder={
+                          isChurchWide
+                            ? "e.g., Calamba Tent"
+                            : "e.g., Retreat center, park"
+                        }
+                      />
+                    </div>
+                  )}
+                </div>
+                {isChurchWide && (
+                  <p className="text-xs text-gray-600 bg-gray-50 border border-gray-200 rounded-lg px-3 py-2">
+                    Church-wide AWTA is visible to all branches. Use Other /
+                    off-site for the dedicated venue. Online check-in still uses
+                    Home altar or Cluster house.
+                  </p>
+                )}
+                {isEditingNationalLocked && (
+                  <p className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                    Only HQ Events coordinators and above can change AWTA or
+                    church-wide event details.
+                  </p>
+                )}
+                {isRoomHold && (
+                  <p className="text-xs text-gray-600 bg-gray-50 border border-gray-200 rounded-lg px-3 py-2">
+                    This books a room in the church building. It is not recorded
+                    as a person&apos;s first activity attended.
+                  </p>
+                )}
+
+                {/* Description */}
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">
+                    Description
+                  </label>
+                  <textarea
+                    name="description"
+                    value={formData.description}
+                    onChange={handleChange}
+                    rows={3}
+                    className="w-full px-3 py-2 min-h-[44px] border border-gray-300 rounded-lg focus:ring-2 focus:ring-ring focus:border-transparent"
+                    placeholder="Add any additional details about the event..."
+                  />
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {!isRoomHold && (
+            <div>
+              <div className="p-0">
+                <h3 className="text-sm font-semibold text-gray-900 mb-2">
+                  Attendance
+                </h3>
+                <p className="text-xs text-gray-500 mb-4">
+                  How people check in, and related registration options.
+                </p>
+                <div className="space-y-4">
+                  <div className="rounded-lg border border-gray-200 bg-gray-50 p-4 space-y-3">
+                    <div>
+                      <h4 className="text-sm font-semibold text-gray-800">
+                        Attendance format
+                      </h4>
+                      <p className="mt-1 text-xs text-gray-500">
+                        Hybrid allows door check-in and online (online needs a
+                        venue like Home altar). Online only is remote with no
+                        venue. Onsite only is door/station only.
+                      </p>
+                    </div>
+                    <div className="space-y-2">
+                      {(
+                        [
+                          ["hybrid", "Hybrid (onsite + online)"],
+                          ["online_only", "Online only"],
+                          ["onsite_only", "Onsite only"],
+                        ] as const
+                      ).map(([value, label]) => (
+                        <label
+                          key={value}
+                          className="flex items-center gap-2 text-sm text-gray-700"
+                        >
+                          <input
+                            type="radio"
+                            name="attendance_format"
+                            value={value}
+                            checked={formData.attendance_format === value}
+                            onChange={handleChange}
+                            className="h-4 w-4 text-primary focus:ring-ring border-gray-300"
+                          />
+                          {label}
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+
+                  {formData.attendance_format !== "onsite_only" && (
+                    <div className="rounded-lg border border-gray-200 bg-gray-50 p-4 space-y-2">
+                      <div>
+                        <h4 className="text-sm font-semibold text-gray-800">
+                          Online self-check-in
+                        </h4>
+                        <p className="mt-1 text-xs text-gray-500">
+                          {formData.attendance_format === "online_only"
+                            ? "When enabled, members check in online (no venue) on days this event occurs, if church-wide member self-check-in is also open."
+                            : "When enabled, members can check in online (public LAMP ID link and logged-in household) on days this event occurs, if church-wide member self-check-in is also open. Hybrid online check-in asks for Home altar or Cluster house."}
+                        </p>
+                      </div>
+                      <label className="flex items-center gap-2 text-sm text-gray-700">
+                        <input
+                          type="checkbox"
+                          name="self_checkin_enabled"
+                          checked={formData.self_checkin_enabled}
+                          onChange={handleChange}
+                          className="h-4 w-4 text-primary focus:ring-ring border-gray-300 rounded"
+                        />
+                        Open for online self-check-in
+                      </label>
+                    </div>
+                  )}
+
+                  {showRegistrationSettings && (
+                  <div className="rounded-lg border border-gray-200 bg-gray-50 p-4 space-y-3">
+                    <div>
+                      <h4 className="text-sm font-semibold text-gray-800">
+                        Paid registration (Admin)
+                      </h4>
+                      <p className="mt-1 text-xs text-gray-500">
+                        Enable paid registration, require confirmation before
+                        check-in, and set capacity limits per mode.
+                      </p>
+                    </div>
+                    <label className="flex items-center gap-2 text-sm text-gray-700">
+                      <input
+                        type="checkbox"
+                        name="registration_enabled"
+                        checked={formData.registration_enabled}
+                        onChange={handleChange}
+                        className="h-4 w-4 text-primary focus:ring-ring border-gray-300 rounded"
+                      />
+                      Enable paid registration
+                    </label>
+                    {formData.attendance_format !== "online_only" && (
+                      <label className="flex items-center gap-2 text-sm text-gray-700">
+                        <input
+                          type="checkbox"
+                          name="onsite_registration_required"
+                          checked={formData.onsite_registration_required}
+                          onChange={handleChange}
+                          className="h-4 w-4 text-primary focus:ring-ring border-gray-300 rounded"
+                        />
+                        Require registration for onsite check-in
+                      </label>
+                    )}
+                    {formData.attendance_format !== "onsite_only" && (
+                      <label className="flex items-center gap-2 text-sm text-gray-700">
+                        <input
+                          type="checkbox"
+                          name="online_registration_required"
+                          checked={formData.online_registration_required}
+                          onChange={handleChange}
+                          className="h-4 w-4 text-primary focus:ring-ring border-gray-300 rounded"
+                        />
+                        Require registration for online check-in
+                      </label>
+                    )}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      {formData.attendance_format !== "online_only" && (
+                        <label className="block text-sm text-gray-700">
+                          <span className="mb-1 block text-xs font-medium text-gray-600">
+                            Onsite capacity
+                          </span>
+                          <input
+                            type="number"
+                            name="onsite_capacity"
+                            min={0}
+                            step={1}
+                            value={formData.onsite_capacity}
+                            onChange={handleChange}
+                            placeholder="Unlimited"
+                            className="input-field text-sm"
+                          />
+                        </label>
+                      )}
+                      {formData.attendance_format !== "onsite_only" && (
+                        <label className="block text-sm text-gray-700">
+                          <span className="mb-1 block text-xs font-medium text-gray-600">
+                            Online capacity
+                          </span>
+                          <input
+                            type="number"
+                            name="online_capacity"
+                            min={0}
+                            step={1}
+                            value={formData.online_capacity}
+                            onChange={handleChange}
+                            placeholder="Unlimited"
+                            className="input-field text-sm"
+                          />
+                        </label>
+                      )}
+                    </div>
+
+                    {formData.registration_enabled && !initialData?.id && (
+                      <p className="text-xs text-amber-800 bg-amber-50 border border-amber-100 rounded-md px-3 py-2">
+                        Save the event first to add pricing tiers.
+                      </p>
+                    )}
+
+                    {formData.registration_enabled && initialData?.id ? (
+                      <div className="space-y-3 border-t border-gray-200 pt-3">
+                        <div className="flex items-center justify-between gap-2">
+                          <h5 className="text-sm font-semibold text-gray-800">
+                            Pricing tiers
+                          </h5>
+                          {tiersLoading ? (
+                            <span className="text-xs text-gray-500">
+                              Loading…
+                            </span>
+                          ) : null}
+                        </div>
+                        {tiers.length > 0 ? (
+                          <ul className="space-y-2">
+                            {tiers.map((tier) => (
+                              <li
+                                key={tier.id}
+                                className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 rounded-md border border-gray-200 bg-white px-3 py-2 text-sm"
+                              >
+                                <div>
+                                  <div className="font-medium text-gray-900">
+                                    {tier.label}{" "}
+                                    <span className="text-xs font-normal text-gray-500">
+                                      ({tier.code})
+                                    </span>
+                                  </div>
+                                  <div className="text-xs text-gray-500">
+                                    {tier.onsite_offered
+                                      ? `Onsite ₱${tier.onsite_price}`
+                                      : "Onsite off"}
+                                    {" · "}
+                                    {tier.online_offered
+                                      ? `Online ₱${tier.online_price}`
+                                      : "Online off"}
+                                    {" · sort "}
+                                    {tier.sort_order}
+                                  </div>
+                                </div>
+                                <div className="flex gap-2">
+                                  <Button
+                                    type="button"
+                                    variant="tertiary"
+                                    className="!px-2 !py-1 text-xs min-h-0"
+                                    onClick={() => startEditTier(tier)}
+                                    disabled={tierSaving}
+                                  >
+                                    Edit
+                                  </Button>
+                                  <Button
+                                    type="button"
+                                    variant="tertiary"
+                                    className="!px-2 !py-1 text-xs min-h-0 !text-red-600"
+                                    onClick={() =>
+                                      void handleDeleteTier(tier.id)
+                                    }
+                                    disabled={tierSaving}
+                                  >
+                                    Delete
+                                  </Button>
+                                </div>
+                              </li>
+                            ))}
+                          </ul>
+                        ) : !tiersLoading ? (
+                          <p className="text-xs text-gray-500">
+                            No tiers yet. Add one below.
+                          </p>
+                        ) : null}
+
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                          <label className="block text-xs text-gray-600">
+                            Code
+                            <input
+                              name="code"
+                              value={tierForm.code}
+                              onChange={handleTierFormChange}
+                              className="input-field mt-1 text-sm"
+                              placeholder="EARLY"
+                            />
+                          </label>
+                          <label className="block text-xs text-gray-600">
+                            Label
+                            <input
+                              name="label"
+                              value={tierForm.label}
+                              onChange={handleTierFormChange}
+                              className="input-field mt-1 text-sm"
+                              placeholder="Early bird"
+                            />
+                          </label>
+                          <label className="flex items-center gap-2 text-sm text-gray-700 sm:col-span-2">
+                            <input
+                              type="checkbox"
+                              name="onsite_offered"
+                              checked={tierForm.onsite_offered}
+                              onChange={handleTierFormChange}
+                              className="h-4 w-4 text-primary focus:ring-ring border-gray-300 rounded"
+                            />
+                            Onsite offered
+                          </label>
+                          {tierForm.onsite_offered && (
+                            <label className="block text-xs text-gray-600">
+                              Onsite price
+                              <input
+                                name="onsite_price"
+                                value={tierForm.onsite_price}
+                                onChange={handleTierFormChange}
+                                className="input-field mt-1 text-sm"
+                                inputMode="decimal"
+                              />
+                            </label>
+                          )}
+                          <label className="flex items-center gap-2 text-sm text-gray-700 sm:col-span-2">
+                            <input
+                              type="checkbox"
+                              name="online_offered"
+                              checked={tierForm.online_offered}
+                              onChange={handleTierFormChange}
+                              className="h-4 w-4 text-primary focus:ring-ring border-gray-300 rounded"
+                            />
+                            Online offered
+                          </label>
+                          {tierForm.online_offered && (
+                            <label className="block text-xs text-gray-600">
+                              Online price
+                              <input
+                                name="online_price"
+                                value={tierForm.online_price}
+                                onChange={handleTierFormChange}
+                                className="input-field mt-1 text-sm"
+                                inputMode="decimal"
+                              />
+                            </label>
+                          )}
+                          <label className="block text-xs text-gray-600">
+                            Sort order
+                            <input
+                              type="number"
+                              name="sort_order"
+                              value={tierForm.sort_order}
+                              onChange={handleTierFormChange}
+                              className="input-field mt-1 text-sm"
+                            />
+                          </label>
+                        </div>
+                        <div className="flex flex-wrap gap-2">
+                          <Button
+                            type="button"
+                            className="min-h-[40px] text-sm"
+                            onClick={() => void handleSaveTier()}
+                            disabled={tierSaving}
+                          >
+                            {tierSaving
+                              ? "Saving…"
+                              : editingTierId != null
+                                ? "Update tier"
+                                : "Add tier"}
+                          </Button>
+                          {editingTierId != null && (
+                            <Button
+                              type="button"
+                              variant="tertiary"
+                              className="min-h-[40px] text-sm"
+                              onClick={resetTierForm}
+                              disabled={tierSaving}
+                            >
+                              Cancel edit
+                            </Button>
+                          )}
+                        </div>
+                      </div>
+                    ) : null}
+                  </div>
+                )}
+
+                  {!isBookingRequest && formData.branch !== "" && (
+                  <div className="rounded-lg border border-gray-200 bg-gray-50 p-4 space-y-3">
+                    <div>
+                      <h4 className="text-sm font-semibold text-gray-800">
+                        Cross-branch attendance
+                      </h4>
+                      <p className="mt-1 text-xs text-gray-500">
+                        When enabled, people from other branches can check in
+                        and self-check-in. They are not counted in Expected when
+                        tracking is on (useful for anniversary Sundays at a
+                        dedicated venue).
+                      </p>
+                    </div>
+                    <label className="flex items-center gap-2 text-sm text-gray-700">
+                      <input
+                        type="checkbox"
+                        name="allow_cross_branch_attendance"
+                        checked={formData.allow_cross_branch_attendance}
+                        onChange={handleChange}
+                        className="h-4 w-4 text-primary focus:ring-ring border-gray-300 rounded"
+                      />
+                      Allow other branches to check in
+                    </label>
+                  </div>
+                )}
+
+                  {!isBookingRequest && (
+                  <div className="rounded-lg border border-gray-200 bg-gray-50 p-4 space-y-3">
+                    <div>
+                      <h4 className="text-sm font-semibold text-gray-800">
+                        Expected Attendees
+                      </h4>
+                      <p className="mt-1 text-xs text-gray-500">
+                        When tracking is on, Active / Semi-active / Inactive /
+                        Ongoing visitors define Total and Remaining for
+                        check-in. When off, the event is open headcount-only.
+                        Anyone can still be checked in at the door.
+                      </p>
+                    </div>
+                    <label className="flex items-center gap-2 text-sm text-gray-700">
+                      <input
+                        type="checkbox"
+                        name="track_expected_attendees"
+                        checked={formData.track_expected_attendees}
+                        onChange={handleChange}
+                        className="h-4 w-4 text-primary focus:ring-ring border-gray-300 rounded"
+                      />
+                      Track expected attendees
+                    </label>
+                    {formData.track_expected_attendees ? (
+                      <div className="space-y-2">
+                        <label className="flex items-center gap-2 text-sm text-gray-700">
+                          <input
+                            type="checkbox"
+                            name="expected_include_active"
+                            checked={formData.expected_include_active}
+                            onChange={handleChange}
+                            className="h-4 w-4 text-primary focus:ring-ring border-gray-300 rounded"
+                          />
+                          Active
+                        </label>
+                        <label className="flex items-center gap-2 text-sm text-gray-700">
+                          <input
+                            type="checkbox"
+                            name="expected_include_semiactive"
+                            checked={formData.expected_include_semiactive}
+                            onChange={handleChange}
+                            className="h-4 w-4 text-primary focus:ring-ring border-gray-300 rounded"
+                          />
+                          Semi-active
+                        </label>
+                        <label className="flex items-center gap-2 text-sm text-gray-700">
+                          <input
+                            type="checkbox"
+                            name="expected_include_inactive"
+                            checked={formData.expected_include_inactive}
+                            onChange={handleChange}
+                            className="h-4 w-4 text-primary focus:ring-ring border-gray-300 rounded"
+                          />
+                          Inactive
+                        </label>
+                        <label className="flex items-center gap-2 text-sm text-gray-700">
+                          <input
+                            type="checkbox"
+                            name="expected_include_ongoing_visitors"
+                            checked={formData.expected_include_ongoing_visitors}
+                            onChange={handleChange}
+                            className="h-4 w-4 text-primary focus:ring-ring border-gray-300 rounded"
+                          />
+                          Ongoing visitors
+                        </label>
+                      </div>
+                    ) : null}
+                  </div>
+                )}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Schedule Section */}
+          <div>
+            <div className="p-0">
+              <h3 className="text-sm font-semibold text-gray-900 mb-2">
+                Schedule
+              </h3>
+              <p className="text-xs text-gray-500 mb-4">
+                When the event will take place.
+              </p>
+              <div className="space-y-4">
+                {/* Date and Time */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      Start Date & Time *
+                    </label>
+                    <input
+                      type="datetime-local"
+                      name="start_date"
+                      required
+                      value={formatDateTimeLocal(formData.start_date)}
+                      onChange={(e) => {
+                        const value = e.target.value;
+                        const nextEnd = endDateFromStart(value);
+                        setFormData((prev) => {
+                          const next = {
+                            ...prev,
+                            start_date: value,
+                            end_date: nextEnd || prev.end_date,
+                          };
+                          if (prev.is_recurring) {
+                            setRecurrencePattern((current) =>
+                              buildPattern(value, current),
+                            );
+                          }
+                          return next;
+                        });
+                      }}
+                      className="w-full px-3 py-2 min-h-[44px] border border-gray-300 rounded-lg focus:ring-2 focus:ring-ring focus:border-transparent"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      End Date & Time *
+                    </label>
+                    <input
+                      type="datetime-local"
+                      name="end_date"
+                      required
+                      value={formatDateTimeLocal(formData.end_date)}
+                      onChange={(e) => {
+                        const value = e.target.value;
+                        setFormData((prev) => ({ ...prev, end_date: value }));
+                      }}
+                      className="w-full px-3 py-2 min-h-[44px] border border-gray-300 rounded-lg focus:ring-2 focus:ring-ring focus:border-transparent"
+                    />
+                  </div>
+                </div>
+
+                {/* Recurring Event */}
+                <div className="flex items-center">
+                  <input
+                    id="is_recurring"
+                    type="checkbox"
+                    name="is_recurring"
+                    checked={formData.is_recurring}
+                    onChange={handleChange}
+                    disabled={lockRecurrence}
+                    className="h-4 w-4 text-primary focus:ring-ring border-gray-300 rounded disabled:opacity-50"
+                  />
+                  <label
+                    htmlFor="is_recurring"
+                    className="ml-2 block text-sm text-gray-700"
+                  >
+                    This is a recurring event
+                  </label>
+                </div>
+
+                {formData.is_recurring && (
+                  <div className="ml-6 mt-3 space-y-3 border-l border-gray-200 pl-4">
+                    <p className="text-xs text-gray-500">
+                      {formatRecurrenceSummary(
+                        liveRecurrencePattern,
+                        activeStartDateObj.toLocaleDateString("en-US", {
+                          weekday: "long",
+                        }),
+                      )}
+                    </p>
+
+                    <div>
+                      <label
+                        htmlFor="recurrence_repeat"
+                        className="block text-xs font-medium text-gray-600 mb-1"
+                      >
+                        Repeat
+                      </label>
+                      <select
+                        id="recurrence_repeat"
+                        value={repeatOption}
+                        disabled={lockRecurrence}
+                        onChange={(e) =>
+                          handleRepeatOptionChange(
+                            e.target.value as RepeatOption,
+                          )
+                        }
+                        className="w-full md:w-64 px-3 py-2 min-h-[44px] border border-gray-300 rounded-lg focus:ring-2 focus:ring-ring focus:border-transparent text-sm disabled:opacity-50"
+                      >
+                        <option value="weekly">Weekly</option>
+                        <option value="every_2_weeks">Every 2 weeks</option>
+                        <option value="monthly">Monthly</option>
+                      </select>
+                    </div>
+
+                    {repeatOption === "monthly" && (
+                      <fieldset className="space-y-2" disabled={lockRecurrence}>
+                        <legend className="text-xs font-medium text-gray-600">
+                          Monthly on
+                        </legend>
+                        <label className="flex items-center gap-2 text-sm text-gray-700">
+                          <input
+                            type="radio"
+                            name="monthly_mode"
+                            checked={
+                              liveRecurrencePattern?.monthly_mode !==
+                              "by_weekday"
+                            }
+                            onChange={() => handleMonthlyModeChange("by_date")}
+                            className="h-4 w-4 text-primary focus:ring-ring border-gray-300"
+                          />
+                          {monthlyDateOptionLabel(activeStartDateObj)}
+                        </label>
+                        <label className="flex items-center gap-2 text-sm text-gray-700">
+                          <input
+                            type="radio"
+                            name="monthly_mode"
+                            checked={
+                              liveRecurrencePattern?.monthly_mode ===
+                              "by_weekday"
+                            }
+                            onChange={() =>
+                              handleMonthlyModeChange("by_weekday")
+                            }
+                            className="h-4 w-4 text-primary focus:ring-ring border-gray-300"
+                          />
+                          {monthlyWeekdayOptionLabel(activeStartDateObj)}
+                        </label>
+                      </fieldset>
+                    )}
+
+                    <div>
+                      <label className="block text-xs font-medium text-gray-600 mb-1">
+                        Repeat until
+                      </label>
+                      <input
+                        type="date"
+                        value={recurrenceThroughValue}
+                        min={recurrenceMinThroughValue}
+                        max={recurrenceMaxThroughValue}
+                        onChange={(e) =>
+                          handleRecurrenceThroughChange(e.target.value)
+                        }
+                        className="w-full md:w-64 px-3 py-2 min-h-[44px] border border-gray-300 rounded-lg focus:ring-2 focus:ring-ring focus:border-transparent text-sm"
+                      />
+                      <p className="text-[11px] text-gray-400 mt-1">
+                        Schedule can be adjusted anytime. You can skip an
+                        individual date later without removing the series.
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                <div className="rounded-lg border border-gray-200 bg-gray-50 p-4 space-y-2">
+                  <div>
+                    <h4 className="text-sm font-semibold text-gray-800">
+                      Tardy grace period
+                    </h4>
+                    <p className="mt-1 text-xs text-gray-500">
+                      Minutes after the event start before a check-in counts as
+                      tardy. Use 0 for no grace (default for Sunday Service).
+                    </p>
+                  </div>
+                  <label className="block text-sm text-gray-700">
+                    <span className="sr-only">Tardy grace minutes</span>
+                    <input
+                      type="number"
+                      name="tardy_grace_minutes"
+                      min={0}
+                      step={1}
+                      value={formData.tardy_grace_minutes}
+                      onChange={handleChange}
+                      className="w-full md:w-40 px-3 py-2 min-h-[44px] border border-gray-300 rounded-lg focus:ring-2 focus:ring-ring focus:border-transparent text-sm"
+                    />
+                    <span className="mt-1 block text-xs text-gray-500">
+                      minutes
+                    </span>
+                  </label>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Footer */}
+        <div className="flex flex-col-reverse sm:flex-row gap-3 pt-4">
+          <Button
+            variant="tertiary"
+            className="w-full sm:flex-1 min-h-[44px]"
+            onClick={onClose}
+            disabled={loading}
+          >
+            Cancel
+          </Button>
+          <Button
+            className="w-full sm:flex-1 min-h-[44px]"
+            disabled={loading}
+            type="submit"
+          >
+            {loading
+              ? "Saving..."
+              : initialData
+                ? "Update Event"
+                : isBookingRequest
+                  ? "Submit booking"
+                  : "Create Event"}
+          </Button>
+        </div>
+      </form>
+      <ConfirmationModal
+        isOpen={dateMoveConfirm.isOpen}
+        onClose={() => setDateMoveConfirm({ isOpen: false, payload: null })}
+        onConfirm={() => {
+          const payload = dateMoveConfirm.payload;
+          setDateMoveConfirm({ isOpen: false, payload: null });
+          if (payload) {
+            void submitPayload(payload);
+          }
+        }}
+        title="Move event date?"
+        message={`${pendingAttendeeCount} ${attendeeLabel} already recorded for this event will move to the new date. Continue?`}
+        confirmText="Move date"
+        cancelText="Cancel"
+        variant="warning"
+        zIndex={80}
+        loading={loading}
+      />
+    </>
+  );
+}

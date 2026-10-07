@@ -1,0 +1,981 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import Button from "@/src/components/ui/Button";
+import ErrorMessage from "@/src/components/ui/ErrorMessage";
+import ScalableSelect from "@/src/components/ui/ScalableSelect";
+import {
+  Lesson,
+  LessonStudentEnrollment,
+  LessonSessionReport,
+  LessonSessionReportInput,
+} from "@/src/types/lesson";
+import { Person } from "@/src/types/person";
+import { formatPersonName } from "@/src/lib/name";
+import { LessonPersonLike } from "@/src/lib/lessonsUtils";
+import { isSelectablePerson } from "@/src/lib/peopleSelectors";
+import {
+  DEFAULT_SESSION_TOPIC,
+  LESSON_TOPIC_PREFIX,
+  parseSessionTopicValue,
+  PRE_LESSON_KIND_OPTIONS,
+  sessionTopicFromReport,
+} from "@/src/lib/sessionTopic";
+import {
+  formatPersonClusterLabel,
+  formatPersonStatusLabel,
+  getPersonClusterChipClass,
+  getPersonStatusColor,
+} from "@/src/lib/personStatus";
+import { getLocalTodayDateString, parseLocalYmd } from "@/src/lib/date";
+
+export interface LessonSessionReportFormProps {
+  report?: LessonSessionReport | null;
+  submitting?: boolean;
+  onSubmit: (
+    values: LessonSessionReportInput,
+    options?: { markCommitmentSigned?: boolean }
+  ) => void;
+  onCancel: () => void;
+  people: Person[];
+  teacherChoices?: LessonPersonLike[];
+  lessons: Lesson[];
+  defaultLessonId?: number | string | null;
+  defaultTeacherId?: number | string | null;
+  loggedInTeacherId?: number | string | null;
+  defaultStudentId?: number | string | null;
+  defaultProgressId?: number | string | null;
+  enrollmentTeacherByStudentId?: Map<number, number>;
+  enrollmentByStudentId?: Map<number, LessonStudentEnrollment>;
+  nextLessonIdByStudentId?: Map<number, number>;
+  lastLessonId?: number | null;
+  error?: string | null;
+}
+
+interface FormState {
+  teacherId: string;
+  studentId: string;
+  sessionTopic: string;
+  sessionDate: string;
+  sessionStart: string;
+  score: string;
+  nextSessionDate: string;
+  remarks: string;
+}
+
+function toLocalDateValue(value?: string | null): string {
+  if (!value) return "";
+  const trimmed = value.trim();
+  if (parseLocalYmd(trimmed)) {
+    return trimmed;
+  }
+  const date = new Date(trimmed);
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+  return getLocalTodayDateString(date);
+}
+
+const NO_TEACHER_ASSIGNED_LABEL = "No teacher assigned";
+
+function StudentOptionBadges({ person }: { person: Person }) {
+  const clusterCodes = person.cluster_codes?.filter(Boolean) ?? [];
+  const hasCluster = clusterCodes.length > 0;
+
+  return (
+    <span className="mt-1.5 flex flex-wrap items-center gap-1.5">
+      <span
+        className={`inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-semibold ${getPersonStatusColor(
+          person.status,
+        )}`}
+      >
+        {formatPersonStatusLabel(person.status)}
+      </span>
+      <span className={getPersonClusterChipClass(hasCluster)}>
+        {formatPersonClusterLabel(clusterCodes)}
+      </span>
+    </span>
+  );
+}
+
+function toLocalDateTimeValue(value?: string | null): string {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+  const pad = (input: number) => input.toString().padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(
+    date.getDate(),
+  )}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+export default function LessonSessionReportForm({
+  report,
+  submitting = false,
+  onSubmit,
+  onCancel,
+  people,
+  teacherChoices,
+  lessons,
+  defaultLessonId,
+  defaultTeacherId,
+  loggedInTeacherId: loggedInTeacherIdProp,
+  defaultStudentId,
+  defaultProgressId,
+  enrollmentTeacherByStudentId,
+  enrollmentByStudentId,
+  nextLessonIdByStudentId,
+  lastLessonId,
+  error,
+}: LessonSessionReportFormProps) {
+  const teacherOptions = useMemo(
+    () =>
+      teacherChoices && teacherChoices.length > 0
+        ? teacherChoices
+        : people,
+    [teacherChoices, people],
+  );
+
+  const studentOptions = useMemo(() => {
+    const explicitlyAllowedStudentIds = new Set<number>();
+    if (enrollmentTeacherByStudentId) {
+      enrollmentTeacherByStudentId.forEach((_, studentId) => {
+        explicitlyAllowedStudentIds.add(studentId);
+      });
+    }
+    const reportStudentId =
+      report?.student?.id != null ? Number(report.student.id) : null;
+    if (reportStudentId != null && !Number.isNaN(reportStudentId)) {
+      explicitlyAllowedStudentIds.add(reportStudentId);
+    }
+    const defaultStudentNumericId =
+      defaultStudentId != null ? Number(defaultStudentId) : null;
+    if (
+      defaultStudentNumericId != null &&
+      !Number.isNaN(defaultStudentNumericId)
+    ) {
+      explicitlyAllowedStudentIds.add(defaultStudentNumericId);
+    }
+
+    return [...people]
+      .filter((person) => {
+        if (!isSelectablePerson(person)) {
+          return false;
+        }
+        if (
+          loggedInTeacherIdProp != null &&
+          String(person.id) === String(loggedInTeacherIdProp)
+        ) {
+          const isExistingReportStudent =
+            reportStudentId != null &&
+            String(reportStudentId) === String(person.id);
+          if (!isExistingReportStudent) {
+            const enrolledTeacherId = enrollmentTeacherByStudentId?.get(
+              Number(person.id),
+            );
+            if (
+              enrolledTeacherId == null ||
+              String(enrolledTeacherId) === String(person.id)
+            ) {
+              return false;
+            }
+          }
+        }
+        if (!enrollmentTeacherByStudentId) {
+          return true;
+        }
+        return explicitlyAllowedStudentIds.has(Number(person.id));
+      })
+      .sort((first, second) => {
+        const nameA = formatPersonName(first);
+        const nameB = formatPersonName(second);
+        return nameA.localeCompare(nameB);
+      });
+  }, [
+    people,
+    enrollmentTeacherByStudentId,
+    loggedInTeacherIdProp,
+    report?.student?.id,
+    defaultStudentId,
+  ]);
+
+  const loggedInTeacherId = loggedInTeacherIdProp?.toString() ?? "";
+
+  const defaultState = useMemo(
+    (): FormState => ({
+      teacherId:
+        report?.teacher?.id?.toString() ??
+        (defaultStudentId
+          ? (defaultTeacherId?.toString() ?? "")
+          : loggedInTeacherId),
+      studentId:
+        report?.student?.id?.toString() ?? defaultStudentId?.toString() ?? "",
+      sessionTopic: report
+        ? sessionTopicFromReport(report)
+        : defaultStudentId && defaultLessonId
+          ? `${LESSON_TOPIC_PREFIX}${defaultLessonId}`
+          : DEFAULT_SESSION_TOPIC,
+      sessionDate:
+        report?.session_date ?? new Date().toISOString().slice(0, 10),
+      sessionStart:
+        toLocalDateTimeValue(report?.session_start) ||
+        new Date().toISOString().slice(0, 16),
+      score: report?.score ?? "",
+      nextSessionDate: report?.next_session_date ?? "",
+      remarks: report?.remarks ?? "",
+    }),
+    [
+      report,
+      loggedInTeacherId,
+      defaultTeacherId,
+      defaultStudentId,
+      defaultLessonId,
+    ],
+  );
+
+  const [formState, setFormState] = useState<FormState>(defaultState);
+  const [formError, setFormError] = useState<string | null>(null);
+  const [fieldErrors, setFieldErrors] = useState<
+    Partial<Record<keyof FormState, string>>
+  >({});
+  const [studentQuery, setStudentQuery] = useState("");
+  const [isStudentDropdownOpen, setStudentDropdownOpen] = useState(false);
+  const [markCommitmentSigned, setMarkCommitmentSigned] = useState(false);
+
+  const isTeacherLocked = Boolean(formState.studentId.trim()) && !report;
+
+  useEffect(() => {
+    setFormState(defaultState);
+    const studentMatch = studentOptions.find(
+      (person) => person.id?.toString() === defaultState.studentId,
+    );
+    setStudentQuery(studentMatch ? formatPersonName(studentMatch) : "");
+  }, [defaultState, studentOptions]);
+
+  useEffect(() => {
+    if (report) {
+      return;
+    }
+
+    const studentId = formState.studentId.trim();
+    if (!studentId) {
+      const nextTeacherId = loggedInTeacherId;
+      setFormState((previous) =>
+        previous.teacherId === nextTeacherId
+          ? previous
+          : { ...previous, teacherId: nextTeacherId },
+      );
+      return;
+    }
+
+    const numericStudentId = Number(studentId);
+    if (Number.isNaN(numericStudentId)) {
+      return;
+    }
+
+    const enrollmentTeacherId =
+      enrollmentTeacherByStudentId?.get(numericStudentId) ?? null;
+    const nextTeacherId = enrollmentTeacherId?.toString() ?? "";
+    const nextLessonId = nextLessonIdByStudentId?.get(numericStudentId) ?? null;
+    const nextSessionTopic =
+      nextLessonId != null ? `${LESSON_TOPIC_PREFIX}${nextLessonId}` : null;
+
+    setFormState((previous) =>
+      previous.teacherId === nextTeacherId &&
+      (!nextSessionTopic || previous.sessionTopic === nextSessionTopic)
+        ? previous
+        : {
+            ...previous,
+            teacherId: nextTeacherId,
+            sessionTopic: nextSessionTopic ?? previous.sessionTopic,
+          },
+    );
+  }, [
+    formState.studentId,
+    report,
+    loggedInTeacherId,
+    enrollmentTeacherByStudentId,
+    nextLessonIdByStudentId,
+  ]);
+
+  const teacherHelperText = useMemo(() => {
+    if (report) {
+      return null;
+    }
+    if (isTeacherLocked) {
+      if (!formState.teacherId) {
+        return "This student has no lessons teacher. Assign one in Student Progress first.";
+      }
+      return "Assigned lessons teacher for this student (cannot be changed here).";
+    }
+    return loggedInTeacherId
+      ? "Defaults to you. Select a student to use their assigned lessons teacher."
+      : "Choosing a student selects their assigned lessons teacher.";
+  }, [formState.teacherId, isTeacherLocked, loggedInTeacherId, report]);
+
+  const clearStudentSelection = () => {
+    handleChange("studentId", "");
+    setStudentQuery("");
+    setStudentDropdownOpen(false);
+  };
+
+  const lessonOptions = useMemo(() => {
+    if (!lessons.length) {
+      return [];
+    }
+    return [...lessons].sort((first, second) => {
+      if (first.order !== second.order) {
+        return first.order - second.order;
+      }
+      return first.title.localeCompare(second.title);
+    });
+  }, [lessons]);
+
+  const teacherSelectOptions = useMemo(
+    () =>
+      teacherOptions
+        .map((person) => ({
+          value: person.id?.toString() ?? "",
+          label: formatPersonName(person),
+          nickname: person.nickname?.trim() || null,
+          firstName: person.first_name?.trim() || null,
+        }))
+        .filter(
+          (option) => option.value && option.value !== formState.studentId,
+        ),
+    [formState.studentId, teacherOptions],
+  );
+
+  const lockedTeacherLabel = useMemo(() => {
+    if (!formState.teacherId) {
+      return NO_TEACHER_ASSIGNED_LABEL;
+    }
+    const teacherMatch = teacherOptions.find(
+      (person) => person.id?.toString() === formState.teacherId,
+    );
+    return teacherMatch
+      ? formatPersonName(teacherMatch)
+      : NO_TEACHER_ASSIGNED_LABEL;
+  }, [formState.teacherId, teacherOptions]);
+
+  const filteredStudentOptions = useMemo(() => {
+    let filtered = studentOptions;
+    if (!report && formState.teacherId) {
+      filtered = filtered.filter((person) => {
+        if (
+          formState.studentId &&
+          person.id?.toString() === formState.studentId
+        ) {
+          return true;
+        }
+        const numericStudentId = Number(person.id);
+        if (Number.isNaN(numericStudentId)) {
+          return false;
+        }
+        const assignedTeacherId =
+          enrollmentTeacherByStudentId?.get(numericStudentId);
+        return assignedTeacherId?.toString() === formState.teacherId;
+      });
+    }
+
+    const query = studentQuery.trim().toLowerCase();
+    if (!query) {
+      return filtered;
+    }
+    return filtered.filter((person) => {
+      const name = formatPersonName(person).toLowerCase();
+      const username = person.username?.toLowerCase() ?? "";
+      const memberId = person.member_id?.toLowerCase() ?? "";
+      return (
+        name.includes(query) ||
+        username.includes(query) ||
+        memberId.includes(query)
+      );
+    });
+  }, [
+    studentOptions,
+    studentQuery,
+    report,
+    formState.teacherId,
+    formState.studentId,
+    enrollmentTeacherByStudentId,
+  ]);
+
+  const selectedStudentEnrollment = useMemo(() => {
+    const numericStudentId = Number(formState.studentId);
+    if (Number.isNaN(numericStudentId)) {
+      return null;
+    }
+    return enrollmentByStudentId?.get(numericStudentId) ?? null;
+  }, [formState.studentId, enrollmentByStudentId]);
+
+  const selectedTopic = useMemo(
+    () => parseSessionTopicValue(formState.sessionTopic),
+    [formState.sessionTopic]
+  );
+
+  const canMarkCommitmentInForm = useMemo(() => {
+    if (report) {
+      return false;
+    }
+    if (!selectedStudentEnrollment || selectedStudentEnrollment.commitment_signed) {
+      return false;
+    }
+    if (!lastLessonId || selectedTopic.sessionType !== "LESSON") {
+      return false;
+    }
+    return selectedTopic.lessonId === lastLessonId;
+  }, [report, selectedStudentEnrollment, lastLessonId, selectedTopic]);
+
+  useEffect(() => {
+    if (!canMarkCommitmentInForm && markCommitmentSigned) {
+      setMarkCommitmentSigned(false);
+    }
+  }, [canMarkCommitmentInForm, markCommitmentSigned]);
+
+  const handleChange = (field: keyof FormState, value: string) => {
+    setFormState((previous) => ({ ...previous, [field]: value }));
+    // Clear field error when user starts typing
+    if (fieldErrors[field]) {
+      setFieldErrors((previous) => {
+        const updated = { ...previous };
+        delete updated[field];
+        return updated;
+      });
+    }
+    // Clear general form error
+    if (formError) {
+      setFormError(null);
+    }
+  };
+
+  const studentDropdownRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (
+        studentDropdownRef.current &&
+        !studentDropdownRef.current.contains(event.target as Node)
+      ) {
+        setStudentDropdownOpen(false);
+      }
+    };
+
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+    };
+  }, []);
+
+  const handleSubmit = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+
+    const { teacherId, studentId, sessionDate, sessionStart, nextSessionDate } =
+      formState;
+
+    const errors: Partial<Record<keyof FormState, string>> = {};
+
+    if (!studentId) {
+      errors.studentId = "Select a student for this session.";
+    }
+
+    if (studentId && teacherId && studentId === teacherId) {
+      errors.teacherId =
+        "A person cannot be assigned as their own lessons teacher.";
+    } else if (!report && studentId && !teacherId) {
+      errors.teacherId =
+        "This student has no lessons teacher assigned. Assign one in Student Progress first.";
+    } else if (!report && !teacherId) {
+      errors.teacherId = "Select who led this session.";
+    }
+
+    if (!formState.sessionTopic) {
+      errors.sessionTopic = "Select what this session covered.";
+    }
+
+    const topic = parseSessionTopicValue(formState.sessionTopic);
+    if (
+      topic.sessionType === "PRE_LESSON" &&
+      topic.preLessonKind === "OTHER" &&
+      !formState.remarks.trim()
+    ) {
+      errors.remarks = "Add remarks describing this pre-lesson session.";
+    }
+
+    if (!sessionDate) {
+      errors.sessionDate = "Provide the scheduled session date.";
+    }
+
+    if (!sessionStart) {
+      errors.sessionStart = "Provide the actual session date.";
+    } else {
+      const sessionStartDate = new Date(sessionStart);
+      if (Number.isNaN(sessionStartDate.getTime())) {
+        errors.sessionStart = "The actual session date is invalid.";
+      }
+    }
+
+    // Validate next_session_date is after session_date
+    if (nextSessionDate && sessionDate) {
+      const nextDate = new Date(nextSessionDate);
+      const sessionDateObj = new Date(sessionDate);
+      if (
+        !Number.isNaN(nextDate.getTime()) &&
+        !Number.isNaN(sessionDateObj.getTime())
+      ) {
+        if (nextDate <= sessionDateObj) {
+          errors.nextSessionDate =
+            "Next session date must be after the scheduled session date.";
+        }
+      }
+    }
+
+    if (Object.keys(errors).length > 0) {
+      setFieldErrors(errors);
+      setFormError("Please fix the errors below.");
+      return;
+    }
+
+    setFieldErrors({});
+
+    const sessionStartDate = new Date(sessionStart);
+    const payload: LessonSessionReportInput = {
+      teacher_id: teacherId ? Number(teacherId) : undefined,
+      student_id: Number(studentId),
+      session_type: topic.sessionType,
+      session_date: sessionDate,
+      session_start: sessionStartDate.toISOString(),
+      score: formState.score.trim() || undefined,
+      next_session_date: formState.nextSessionDate || null,
+      remarks: formState.remarks.trim() || undefined,
+    };
+
+    if (topic.sessionType === "PRE_LESSON") {
+      payload.pre_lesson_kind = topic.preLessonKind;
+    } else if (topic.lessonId != null && !Number.isNaN(topic.lessonId)) {
+      payload.lesson_id = topic.lessonId;
+      const progressId = report?.progress ?? defaultProgressId;
+      if (progressId != null && progressId !== "") {
+        payload.progress_id = Number(progressId);
+      }
+    }
+
+    setFormError(null);
+    onSubmit(payload, {
+      markCommitmentSigned: canMarkCommitmentInForm && markCommitmentSigned,
+    });
+  };
+
+  return (
+    <form className="space-y-4" onSubmit={handleSubmit}>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 md:items-start">
+        <div className="flex flex-col">
+          <label
+            htmlFor="student-search"
+            className="mb-1 block min-h-5 text-sm font-medium text-gray-700"
+          >
+            Student{" "}
+            <span className="text-red-500" aria-label="required">
+              *
+            </span>
+          </label>
+          <div className="relative h-11 shrink-0" ref={studentDropdownRef}>
+          <input
+            id="student-search"
+            type="text"
+            value={studentQuery}
+            onChange={(event) => {
+              setStudentQuery(event.target.value);
+              setStudentDropdownOpen(true);
+            }}
+            onFocus={() => setStudentDropdownOpen(true)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") {
+                setStudentDropdownOpen(false);
+              }
+            }}
+            placeholder="Search student by name, username, or member ID..."
+            className={`h-11 w-full rounded-md border py-2 text-sm focus:outline-none focus:ring-1 ${
+              formState.studentId ? "pl-3 pr-16" : "px-3"
+            } ${
+              fieldErrors.studentId
+                ? "border-red-300 focus:border-red-500 focus:ring-red-500"
+                : "border-gray-300 focus:border-primary focus:ring-ring"
+            }`}
+            required
+            aria-invalid={!!fieldErrors.studentId}
+            aria-describedby={
+              fieldErrors.studentId ? "student-error" : undefined
+            }
+            aria-label="Search for student"
+            aria-expanded={isStudentDropdownOpen}
+            aria-haspopup="listbox"
+            aria-controls="student-options"
+          />
+          {formState.studentId && (
+            <button
+              type="button"
+              onClick={clearStudentSelection}
+              className="absolute right-2 top-1/2 -translate-y-1/2 rounded px-2 py-1 text-xs font-medium text-gray-600 hover:bg-gray-100 hover:text-gray-900"
+              aria-label="Clear student"
+            >
+              Clear
+            </button>
+          )}
+          {isStudentDropdownOpen && (
+            <div
+              id="student-options"
+              role="listbox"
+              className="absolute z-10 w-full mt-1 bg-white border border-gray-200 rounded-md shadow-lg max-h-56 overflow-y-auto"
+              aria-label="Student options"
+            >
+              {filteredStudentOptions.length === 0 ? (
+                <div
+                  className="px-3 py-2 text-sm text-gray-500"
+                  role="option"
+                >
+                  No students match your search.
+                </div>
+              ) : (
+                filteredStudentOptions.map((person) => (
+                  <button
+                    key={person.id}
+                    type="button"
+                    role="option"
+                    aria-selected={
+                      formState.studentId === person.id?.toString()
+                    }
+                    onClick={() => {
+                      handleChange("studentId", person.id.toString());
+                      setStudentQuery(formatPersonName(person));
+                      setStudentDropdownOpen(false);
+                    }}
+                    className="w-full px-3 py-2 text-left text-sm hover:bg-primary/10 focus:bg-primary/10 focus:outline-none"
+                  >
+                    <div className="flex flex-col">
+                      <span className="font-medium text-gray-800">
+                        {formatPersonName(person)}
+                      </span>
+                      <StudentOptionBadges person={person} />
+                    </div>
+                  </button>
+                ))
+              )}
+            </div>
+          )}
+        </div>
+          <div className="mt-1 min-h-10">
+            {fieldErrors.studentId && (
+              <p
+                id="student-error"
+                className="text-xs text-red-600"
+                role="alert"
+              >
+                {fieldErrors.studentId}
+              </p>
+            )}
+          </div>
+        </div>
+
+        <div className="flex flex-col">
+          <label
+            htmlFor={isTeacherLocked ? "teacher-display" : "teacher-select"}
+            className="mb-1 block min-h-5 text-sm font-medium text-gray-700"
+          >
+            Teacher
+          </label>
+          <div className="h-11 shrink-0">
+            {isTeacherLocked ? (
+              <input
+                id="teacher-display"
+                type="text"
+                readOnly
+                disabled
+                value={lockedTeacherLabel}
+                className="h-11 w-full cursor-not-allowed rounded-md border border-gray-300 bg-gray-50 px-3 py-2 text-sm text-gray-700"
+                aria-invalid={!!fieldErrors.teacherId}
+                aria-describedby={
+                  fieldErrors.teacherId ? "teacher-error" : undefined
+                }
+              />
+            ) : (
+              <ScalableSelect
+                options={teacherSelectOptions}
+                value={formState.teacherId}
+                onChange={(value) => handleChange("teacherId", value)}
+                placeholder="Select teacher..."
+                searchPlaceholder="Search by name..."
+                emptyMessage="No teachers found"
+              />
+            )}
+          </div>
+          <div className="mt-1 min-h-10">
+            {fieldErrors.teacherId && (
+              <p
+                id="teacher-error"
+                className="text-xs text-red-600"
+                role="alert"
+              >
+                {fieldErrors.teacherId}
+              </p>
+            )}
+            {!fieldErrors.teacherId && teacherHelperText && (
+              <p className="text-xs text-gray-500">{teacherHelperText}</p>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <div className="space-y-1">
+        <label
+          htmlFor="session-topic-select"
+          className="block text-sm font-medium text-gray-700"
+        >
+          Session topic{" "}
+          <span className="text-red-500" aria-label="required">
+            *
+          </span>
+        </label>
+        <select
+          id="session-topic-select"
+          className={`w-full min-h-[44px] rounded-md border px-3 py-2 text-sm focus:outline-none focus:ring-1 ${
+            fieldErrors.sessionTopic
+              ? "border-red-300 focus:border-red-500 focus:ring-red-500"
+              : "border-gray-300 focus:border-primary focus:ring-ring"
+          }`}
+          value={formState.sessionTopic}
+          onChange={(event) => handleChange("sessionTopic", event.target.value)}
+          required
+          aria-invalid={!!fieldErrors.sessionTopic}
+          aria-describedby={
+            fieldErrors.sessionTopic
+              ? "session-topic-error"
+              : "session-topic-help"
+          }
+        >
+          <optgroup label="Before lessons (not counted)">
+            {PRE_LESSON_KIND_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </optgroup>
+          <optgroup label="Lesson content">
+            {lessonOptions.map((lesson) => (
+              <option
+                key={lesson.id}
+                value={`${LESSON_TOPIC_PREFIX}${lesson.id}`}
+              >
+                {lesson.title}
+              </option>
+            ))}
+          </optgroup>
+        </select>
+        <p id="session-topic-help" className="text-xs text-gray-500">
+          Pre-lesson visits are logged for history only and do not complete
+          assigned lessons.
+        </p>
+        {fieldErrors.sessionTopic && (
+          <p
+            id="session-topic-error"
+            className="text-xs text-red-600 mt-1"
+            role="alert"
+          >
+            {fieldErrors.sessionTopic}
+          </p>
+        )}
+      </div>
+
+      {canMarkCommitmentInForm && (
+        <div className="rounded-md border border-gray-200 bg-gray-50 px-3 py-2.5">
+          <label className="inline-flex items-center gap-2 text-sm text-gray-700">
+            <input
+              type="checkbox"
+              checked={markCommitmentSigned}
+              onChange={(event) => setMarkCommitmentSigned(event.target.checked)}
+              className="rounded border-gray-300 text-primary focus:ring-ring"
+            />
+            Mark commitment form as signed
+          </label>
+          <p className="mt-1 text-xs text-gray-500">
+            Available because this session topic is the student's last lesson.
+          </p>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div className="space-y-1">
+          <label
+            htmlFor="session-date"
+            className="block text-sm font-medium text-gray-700"
+          >
+            Scheduled Session Date{" "}
+            <span className="text-red-500" aria-label="required">
+              *
+            </span>
+          </label>
+          <input
+            id="session-date"
+            type="date"
+            className={`w-full min-h-[44px] rounded-md border px-3 py-2 text-sm focus:outline-none focus:ring-1 ${
+              fieldErrors.sessionDate
+                ? "border-red-300 focus:border-red-500 focus:ring-red-500"
+                : "border-gray-300 focus:border-primary focus:ring-ring"
+            }`}
+            value={formState.sessionDate}
+            onChange={(event) =>
+              handleChange("sessionDate", event.target.value)
+            }
+            required
+            aria-invalid={!!fieldErrors.sessionDate}
+            aria-describedby={
+              fieldErrors.sessionDate ? "session-date-error" : undefined
+            }
+          />
+          {fieldErrors.sessionDate && (
+            <p
+              id="session-date-error"
+              className="text-xs text-red-600 mt-1"
+              role="alert"
+            >
+              {fieldErrors.sessionDate}
+            </p>
+          )}
+        </div>
+
+        <div className="space-y-1">
+          <label
+            htmlFor="session-start"
+            className="block text-sm font-medium text-gray-700"
+          >
+            Actual Session Date{" "}
+            <span className="text-red-500" aria-label="required">
+              *
+            </span>
+          </label>
+          <input
+            id="session-start"
+            type="datetime-local"
+            className={`w-full min-h-[44px] rounded-md border px-3 py-2 text-sm focus:outline-none focus:ring-1 ${
+              fieldErrors.sessionStart
+                ? "border-red-300 focus:border-red-500 focus:ring-red-500"
+                : "border-gray-300 focus:border-primary focus:ring-ring"
+            }`}
+            value={formState.sessionStart}
+            onChange={(event) =>
+              handleChange("sessionStart", event.target.value)
+            }
+            required
+            aria-invalid={!!fieldErrors.sessionStart}
+            aria-describedby={
+              fieldErrors.sessionStart ? "session-start-error" : undefined
+            }
+          />
+          {fieldErrors.sessionStart && (
+            <p
+              id="session-start-error"
+              className="text-xs text-red-600 mt-1"
+              role="alert"
+            >
+              {fieldErrors.sessionStart}
+            </p>
+          )}
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div className="space-y-1">
+          <label className="block text-sm font-medium text-gray-700">
+            Score / Rating (optional)
+          </label>
+          <input
+            type="text"
+            className="w-full min-h-[44px] rounded-md border border-gray-300 px-3 py-2 text-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-ring"
+            value={formState.score}
+            onChange={(event) => handleChange("score", event.target.value)}
+            placeholder="e.g. 10/10 or Passed"
+          />
+        </div>
+
+        <div className="space-y-1">
+          <label
+            htmlFor="next-session-date"
+            className="block text-sm font-medium text-gray-700"
+          >
+            Next Scheduled Session Date (optional)
+          </label>
+          <input
+            id="next-session-date"
+            type="date"
+            className={`w-full min-h-[44px] rounded-md border px-3 py-2 text-sm focus:outline-none focus:ring-1 ${
+              fieldErrors.nextSessionDate
+                ? "border-red-300 focus:border-red-500 focus:ring-red-500"
+                : "border-gray-300 focus:border-primary focus:ring-ring"
+            }`}
+            value={formState.nextSessionDate}
+            onChange={(event) =>
+              handleChange("nextSessionDate", event.target.value)
+            }
+            min={formState.sessionDate || undefined}
+            aria-invalid={!!fieldErrors.nextSessionDate}
+            aria-describedby={
+              fieldErrors.nextSessionDate ? "next-session-error" : undefined
+            }
+          />
+          {fieldErrors.nextSessionDate && (
+            <p
+              id="next-session-error"
+              className="text-xs text-red-600 mt-1"
+              role="alert"
+            >
+              {fieldErrors.nextSessionDate}
+            </p>
+          )}
+        </div>
+      </div>
+
+      <div className="space-y-1">
+        <label className="block text-sm font-medium text-gray-700">
+          Remarks
+        </label>
+        <textarea
+          className={`w-full min-h-[44px] rounded-md border px-3 py-2 text-sm focus:outline-none focus:ring-1 ${
+            fieldErrors.remarks
+              ? "border-red-300 focus:border-red-500 focus:ring-red-500"
+              : "border-gray-300 focus:border-primary focus:ring-ring"
+          }`}
+          rows={4}
+          value={formState.remarks}
+          onChange={(event) => handleChange("remarks", event.target.value)}
+          placeholder="Notes, observations, or reminders"
+          aria-invalid={!!fieldErrors.remarks}
+        />
+        {fieldErrors.remarks && (
+          <p className="text-xs text-red-600 mt-1" role="alert">
+            {fieldErrors.remarks}
+          </p>
+        )}
+      </div>
+
+      {formError && <ErrorMessage message={formError} />}
+      {error && <ErrorMessage message={error} />}
+
+      <div className="flex flex-col-reverse sm:flex-row gap-4 pt-4">
+        <Button
+          type="button"
+          variant="tertiary"
+          onClick={onCancel}
+          className="w-full sm:flex-1 min-h-[44px]"
+        >
+          Cancel
+        </Button>
+        <Button
+          type="submit"
+          disabled={submitting}
+          className="w-full sm:flex-1 min-h-[44px]"
+        >
+          {submitting ? "Saving..." : report ? "Update Report" : "Save Report"}
+        </Button>
+      </div>
+    </form>
+  );
+}

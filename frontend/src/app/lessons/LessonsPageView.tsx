@@ -1,0 +1,1024 @@
+import { useMemo } from "react";
+import { LockedControlTooltip } from "@/src/components/ui/LockedControlTooltip";
+import { LESSONS_BRANCH_LOCKED_HINT } from "@/src/lib/lessonsBranchFilter";
+import {
+  TOOLBAR_BRANCH_SELECT_CLASS,
+  TOOLBAR_BRANCH_SELECT_LOCKED_CLASS,
+} from "@/src/lib/toolbarStyles";
+import DashboardLayout from "@/src/components/layout/DashboardLayout";
+import LessonList from "@/src/components/lessons/LessonList";
+import LessonDetailPanel from "@/src/components/lessons/LessonDetailPanel";
+import LessonForm, {
+  LessonFormValues,
+} from "@/src/components/lessons/LessonForm";
+import LessonStatsCards from "@/src/components/lessons/LessonStatsCards";
+import LessonSessionReportForm from "@/src/components/lessons/LessonSessionReportForm";
+import LessonContentTabs, {
+  LessonContentTab,
+} from "@/src/components/lessons/LessonContentTabs";
+import MemberProgressSection from "@/src/components/lessons/MemberProgressSection";
+import TeacherOverviewSection from "@/src/components/lessons/TeacherOverviewSection";
+import SessionReportsSection, {
+  LessonPersonLike,
+} from "@/src/components/lessons/SessionReportsSection";
+import { SessionFilterValues } from "@/src/lib/lessonsUtils";
+import CommitmentFormSection from "@/src/components/lessons/CommitmentFormSection";
+import NccLessonsPdfSection from "@/src/components/lessons/NccLessonsPdfSection";
+import Modal from "@/src/components/ui/Modal";
+import Button from "@/src/components/ui/Button";
+import LoadingSpinner from "@/src/components/ui/LoadingSpinner";
+import ErrorMessage from "@/src/components/ui/ErrorMessage";
+import Card from "@/src/components/ui/Card";
+import ConfirmationModal from "@/src/components/ui/ConfirmationModal";
+import NoteInputModal from "@/src/components/ui/NoteInputModal";
+import { useAuth } from "@/src/contexts/AuthContext";
+import { useModuleSettings } from "@/src/hooks/useModuleSettings";
+import { canWriteLessons, canManageLessonCatalog, canBrowseAllLessonStudents, isLessonsTeacherScoped } from "@/src/lib/lessons/lessonsPermissions";
+import { TeacherProgressGroup } from "@/src/lib/lessonsUtils";
+import {
+  Lesson,
+  LessonCommitmentSettings,
+  LessonProgressStatus,
+  LessonProgressSummary,
+  LessonSessionReport,
+  LessonSessionReportInput,
+  PersonLessonProgress,
+  PersonProgressSummary,
+  LessonPersonSummary,
+  LessonStudentEnrollment,
+  ProgressSortField,
+} from "@/src/types/lesson";
+import PersonLessonProgressModal from "@/src/components/lessons/PersonLessonProgressModal";
+import { Person } from "@/src/types/person";
+import { formatPersonName } from "@/src/lib/name";
+
+type ProgressStatusFilter = "ALL" | LessonProgressStatus;
+
+interface LessonsPageViewProps {
+  // Lessons state
+  lessons: Lesson[];
+  lessonsLoading: boolean;
+  lessonsError: string | null;
+  selectedLessonId: number | null;
+  selectedLesson: Lesson | null;
+  onSelectLesson: (lesson: Lesson) => void;
+  // Progress state
+  progress: PersonLessonProgress[];
+  progressLoading: boolean;
+  progressError: string | null;
+  progressActionError: string | null;
+  isProgressUpdating: boolean;
+  progressSummary: Record<LessonProgressStatus, number>;
+  // Summary state
+  summary: LessonProgressSummary | null;
+  summaryLoading: boolean;
+  summaryError: string | null;
+  ongoingStudentsCount: number;
+  // Commitment state
+  commitmentSettings: LessonCommitmentSettings | null;
+  commitmentLoading: boolean;
+  commitmentError: string | null;
+  isCommitmentModalOpen: boolean;
+  commitmentFile: File | null;
+  commitmentUploading: boolean;
+  commitmentUploadError: string | null;
+  isNccLessonsPdfModalOpen: boolean;
+  nccLessonsPdfFile: File | null;
+  nccLessonsPdfUploading: boolean;
+  nccLessonsPdfUploadError: string | null;
+  commitmentConfirm: {
+    enrollment: LessonStudentEnrollment;
+    person: LessonPersonSummary | null;
+    nextValue: boolean;
+  } | null;
+  // Note input modal
+  noteInputModal: {
+    isOpen: boolean;
+    record: PersonLessonProgress | null;
+  };
+  // Alert modal
+  alertModal: {
+    isOpen: boolean;
+    message: string;
+    title?: string;
+  };
+  // Lesson form state
+  isLessonFormOpen: boolean;
+  lessonFormSubmitting: boolean;
+  lessonFormError: string | null;
+  editingLesson: Lesson | null;
+  // Assign state
+  assigning: boolean;
+  assignError: string | null;
+  peopleLoading: boolean;
+  peopleError: string | null;
+  // Grouped progress state
+  allProgress: PersonLessonProgress[];
+  allProgressLoading: boolean;
+  allProgressError: string | null;
+  groupedProgress: PersonProgressSummary[];
+  teacherOverviewRows: TeacherProgressGroup[];
+  assignedStudentIds: Set<number>;
+  studentTeacherById: Map<number, LessonPersonSummary>;
+  progressFilterLessonId: number | null;
+  progressSearchQuery: string;
+  progressStatusFilter: ProgressStatusFilter;
+  progressSortField: ProgressSortField;
+  progressSortDirection: "asc" | "desc";
+  focusTeacherKey?: string | null;
+  activeLatestLessons: Lesson[];
+  // Person progress modal
+  personProgressModal: {
+    isOpen: boolean;
+    person: LessonPersonSummary | null;
+  };
+  // Content tab state
+  activeContentTab: LessonContentTab;
+  // Branch filter
+  lessonsBranchSelectedId: string;
+  onLessonsBranchChange: (branchId: string) => void;
+  lessonsBranchCanChangeFilter: boolean;
+  lessonsBranchEditableOptions: { value: string; label: string }[];
+  lessonsBranchReadonlyOptions: { value: string; label: string }[];
+  lessonsBranchesLoading: boolean;
+  // Session reports state
+  sessionReports: LessonSessionReport[];
+  sessionReportsLoading: boolean;
+  sessionReportsError: string | null;
+  isSessionModalOpen: boolean;
+  sessionFormSubmitting: boolean;
+  sessionFormError: string | null;
+  editingSessionReport: LessonSessionReport | null;
+  sessionDeleteTarget: LessonSessionReport | null;
+  sessionDeleteLoading: boolean;
+  sessionDeleteError: string | null;
+  sessionFormDefaults: {
+    studentId?: string | number | null;
+    teacherId?: string | number | null;
+    lessonId?: string | number | null;
+    progressId?: string | number | null;
+  };
+  sessionFilters: SessionFilterValues;
+  sessionFilterDraft: SessionFilterValues;
+  sessionYearOptions: string[];
+  // Delete lesson state
+  lessonDeleteTarget: Lesson | null;
+  lessonDeleteLoading: boolean;
+  lessonDeleteError: string | null;
+  lessonHardDeleteTarget?: Lesson | null;
+  lessonHardDeleteLoading?: boolean;
+  lessonHardDeleteError?: string | null;
+  // People data
+  people: Person[];
+  sessionFormPeople?: Person[];
+  teacherChoices: LessonPersonLike[];
+  sessionTeacherChoices?: LessonPersonLike[];
+  studentChoices: LessonPersonLike[];
+  lockedSessionTeacherId?: string | null;
+  currentTeacherId: string | null;
+  currentUserId: string | number | null;
+  nextLessonIdByStudent: Map<number, number>;
+  // Format functions
+  formatDateOnly: (value?: string | null) => string;
+  formatDateTime: (value?: string | null) => string;
+  // Handlers
+  onOpenCreateLesson: () => void;
+  onOpenEditLesson: (lesson: Lesson) => void;
+  onRequestDeleteLesson: (lesson: Lesson) => void;
+  onRequestHardDeleteLesson?: (lesson: Lesson) => void;
+  onConfirmDeleteLesson: () => void;
+  onConfirmHardDeleteLesson?: () => void;
+  userCanHardDelete?: boolean;
+  onCloseLessonForm: () => void;
+  onLessonFormSubmit: (values: LessonFormValues) => void;
+  onMarkCompleted: (record: PersonLessonProgress) => void;
+  onNoteInputConfirm: (note: string) => void;
+  onUpdateStatus: (
+    record: PersonLessonProgress,
+    status: LessonProgressStatus
+  ) => void;
+  onRequestCommitmentToggle: (
+    enrollment: LessonStudentEnrollment,
+    person: LessonPersonSummary | null
+  ) => void;
+  onConfirmCommitmentToggle: () => void;
+  onOpenCommitmentModal: () => void;
+  onCloseCommitmentModal: () => void;
+  onCommitmentUpload: () => void;
+  onSetCommitmentFile: (file: File | null) => void;
+  onOpenNccLessonsPdfModal: () => void;
+  onCloseNccLessonsPdfModal: () => void;
+  onNccLessonsPdfUpload: () => void;
+  onSetNccLessonsPdfFile: (file: File | null) => void;
+  onCloseNoteInputModal: () => void;
+  onCloseAlertModal: () => void;
+  onSetCommitmentConfirm: (
+    confirm: {
+      enrollment: LessonStudentEnrollment;
+      person: LessonPersonSummary | null;
+      nextValue: boolean;
+    } | null
+  ) => void;
+  onAssignLessons: (
+    personIds: string[],
+    lessonIds: number[],
+    teacherId: string
+  ) => void;
+  enrollmentByStudent: Map<number, LessonStudentEnrollment>;
+  enrollmentByStudentForAssign: Map<number, LessonStudentEnrollment>;
+  defaultAssignTeacherId: string | null;
+  onAssignTeacher: (
+    studentId: number,
+    teacherId: number,
+    note?: string
+  ) => Promise<void>;
+  onTransferTeacher: (
+    enrollmentId: number,
+    teacherId: number,
+    note?: string
+  ) => Promise<void>;
+  onProgressFilterChange: (lessonId: number | null) => void;
+  onProgressSearchQueryChange: (value: string) => void;
+  onProgressStatusFilterChange: (value: ProgressStatusFilter) => void;
+  onProgressSortChange: (field: ProgressSortField) => void;
+  onTeacherOverviewClick: (group: TeacherProgressGroup) => void;
+  onOpenPersonProgressModal: (person: LessonPersonSummary) => void;
+  onClosePersonProgressModal: () => void;
+  onSetActiveContentTab: (tab: LessonContentTab) => void;
+  onUpdateSessionFilterDraft: (
+    field: keyof SessionFilterValues,
+    value: string
+  ) => void;
+  onResetSessionFilters: () => void;
+  onExportSessionReports: () => void;
+  onOpenSessionReportModal: () => void;
+  onOpenSessionReportForEdit: (report: LessonSessionReport) => void;
+  onCloseSessionModal: () => void;
+  onSessionFormSubmit: (
+    values: LessonSessionReportInput,
+    options?: { markCommitmentSigned?: boolean }
+  ) => void;
+  onLogSessionFromProgress: (record: PersonLessonProgress) => void;
+  onRequestDeleteSessionReport: (report: LessonSessionReport) => void;
+  onConfirmDeleteSessionReport: () => void;
+  onSetSessionDeleteTarget: (target: LessonSessionReport | null) => void;
+  onSetLessonDeleteTarget: (target: Lesson | null) => void;
+  onSetLessonHardDeleteTarget?: (target: Lesson | null) => void;
+  onSetLessonDeleteError: (error: string | null) => void;
+  onSetLessonHardDeleteError?: (error: string | null) => void;
+}
+
+export default function LessonsPageView({
+  lessons,
+  lessonsLoading,
+  lessonsError,
+  selectedLessonId,
+  selectedLesson,
+  onSelectLesson,
+  progress,
+  progressLoading,
+  progressError,
+  progressActionError,
+  isProgressUpdating,
+  progressSummary,
+  summary,
+  summaryLoading,
+  summaryError,
+  ongoingStudentsCount,
+  commitmentSettings,
+  commitmentLoading,
+  commitmentError,
+  isCommitmentModalOpen,
+  commitmentFile,
+  commitmentUploading,
+  commitmentUploadError,
+  isNccLessonsPdfModalOpen,
+  nccLessonsPdfFile,
+  nccLessonsPdfUploading,
+  nccLessonsPdfUploadError,
+  commitmentConfirm,
+  noteInputModal,
+  alertModal,
+  isLessonFormOpen,
+  lessonFormSubmitting,
+  lessonFormError,
+  editingLesson,
+  assigning,
+  assignError,
+  peopleLoading,
+  peopleError,
+  activeContentTab,
+  lessonsBranchSelectedId,
+  onLessonsBranchChange,
+  lessonsBranchCanChangeFilter,
+  lessonsBranchEditableOptions,
+  lessonsBranchReadonlyOptions,
+  lessonsBranchesLoading,
+  sessionReports,
+  sessionReportsLoading,
+  sessionReportsError,
+  isSessionModalOpen,
+  sessionFormSubmitting,
+  sessionFormError,
+  editingSessionReport,
+  sessionDeleteTarget,
+  sessionDeleteLoading,
+  sessionDeleteError,
+  sessionFormDefaults,
+  sessionFilters,
+  sessionFilterDraft,
+  sessionYearOptions,
+  lessonDeleteTarget,
+  lessonDeleteLoading,
+  lessonDeleteError,
+  lessonHardDeleteTarget,
+  lessonHardDeleteLoading,
+  lessonHardDeleteError,
+  userCanHardDelete = false,
+  people,
+  sessionFormPeople,
+  teacherChoices,
+  sessionTeacherChoices,
+  studentChoices,
+  lockedSessionTeacherId = null,
+  currentTeacherId,
+  currentUserId,
+  nextLessonIdByStudent,
+  formatDateOnly,
+  formatDateTime,
+  onOpenCreateLesson,
+  onOpenEditLesson,
+  onRequestDeleteLesson,
+  onRequestHardDeleteLesson,
+  onConfirmDeleteLesson,
+  onConfirmHardDeleteLesson,
+  onCloseLessonForm,
+  onLessonFormSubmit,
+  onMarkCompleted,
+  onNoteInputConfirm,
+  onUpdateStatus,
+  onRequestCommitmentToggle,
+  onConfirmCommitmentToggle,
+  onOpenCommitmentModal,
+  onCloseCommitmentModal,
+  onCommitmentUpload,
+  onOpenNccLessonsPdfModal,
+  onCloseNccLessonsPdfModal,
+  onNccLessonsPdfUpload,
+  onSetNccLessonsPdfFile,
+  onSetCommitmentFile,
+  onCloseNoteInputModal,
+  onCloseAlertModal,
+  onSetCommitmentConfirm,
+  onAssignLessons,
+  enrollmentByStudent,
+  enrollmentByStudentForAssign,
+  defaultAssignTeacherId,
+  onAssignTeacher,
+  onTransferTeacher,
+  onProgressFilterChange,
+  onProgressSearchQueryChange,
+  onProgressStatusFilterChange,
+  onProgressSortChange,
+  onTeacherOverviewClick,
+  onOpenPersonProgressModal,
+  onClosePersonProgressModal,
+  allProgress,
+  allProgressLoading,
+  allProgressError,
+  groupedProgress,
+  teacherOverviewRows,
+  assignedStudentIds,
+  studentTeacherById,
+  progressFilterLessonId,
+  progressSearchQuery,
+  progressStatusFilter,
+  progressSortField,
+  progressSortDirection,
+  focusTeacherKey = null,
+  activeLatestLessons,
+  personProgressModal,
+  onSetActiveContentTab,
+  onUpdateSessionFilterDraft,
+  onResetSessionFilters,
+  onExportSessionReports,
+  onOpenSessionReportModal,
+  onOpenSessionReportForEdit,
+  onCloseSessionModal,
+  onSessionFormSubmit,
+  onLogSessionFromProgress,
+  onRequestDeleteSessionReport,
+  onConfirmDeleteSessionReport,
+  onSetSessionDeleteTarget,
+  onSetLessonDeleteTarget,
+  onSetLessonHardDeleteTarget,
+  onSetLessonDeleteError,
+  onSetLessonHardDeleteError,
+}: LessonsPageViewProps) {
+  const { user, isModuleCoordinator, isSeniorCoordinator } = useAuth();
+  const { moduleEnabled } = useModuleSettings();
+  const canWriteLessonsAccess = canWriteLessons({ user, moduleEnabled });
+  const canManageLessonCatalogAccess = canManageLessonCatalog({
+    user,
+    moduleEnabled,
+  });
+  const canTransferLessonTeacher = canWriteLessonsAccess;
+  const showStudentWorkflowTabs = !user || canWriteLessonsAccess;
+  const showTeachersTab =
+    showStudentWorkflowTabs && canBrowseAllLessonStudents(user);
+  const enrollmentTeacherByStudentId = useMemo(() => {
+    const map = new Map<number, number>();
+    enrollmentByStudent.forEach((enrollment, studentId) => {
+      if (enrollment.teacher?.id) {
+        map.set(studentId, enrollment.teacher.id);
+      }
+    });
+    return map;
+  }, [enrollmentByStudent]);
+
+  // Show stats cards for Lessons write access (admins, pastors, coordinators,
+  // NCC coordinators, teachers) plus cluster coordinators / any-module seniors.
+  const shouldShowStats =
+    canWriteLessonsAccess ||
+    isSeniorCoordinator() ||
+    isModuleCoordinator("CLUSTER", "COORDINATOR");
+
+  const lessonsBranchSelectInteractive =
+    lessonsBranchCanChangeFilter && !lessonsBranchesLoading;
+
+  const lessonsBranchHoverHint = useMemo(() => {
+    if (lessonsBranchSelectInteractive) return "";
+    if (lessonsBranchesLoading && lessonsBranchCanChangeFilter) {
+      return "Loading branches…";
+    }
+    return LESSONS_BRANCH_LOCKED_HINT;
+  }, [
+    lessonsBranchSelectInteractive,
+    lessonsBranchesLoading,
+    lessonsBranchCanChangeFilter,
+  ]);
+
+  const renderLessonsBranchSelect = () => {
+    const options =
+      lessonsBranchesLoading && lessonsBranchCanChangeFilter ? (
+        <option value="">Loading…</option>
+      ) : (
+        (
+          lessonsBranchCanChangeFilter
+            ? lessonsBranchEditableOptions
+            : lessonsBranchReadonlyOptions
+        ).map((option) => (
+          <option
+            key={option.value === "" ? "__all_branches__" : option.value}
+            value={option.value}
+          >
+            {option.label}
+          </option>
+        ))
+      );
+
+    const selectEl = (
+      <select
+        aria-label="Branch"
+        aria-disabled={!lessonsBranchSelectInteractive}
+        tabIndex={lessonsBranchSelectInteractive ? 0 : -1}
+        value={lessonsBranchSelectedId}
+        onChange={(event) => {
+          if (!lessonsBranchSelectInteractive) return;
+          onLessonsBranchChange(event.target.value);
+        }}
+        className={
+          lessonsBranchSelectInteractive
+            ? TOOLBAR_BRANCH_SELECT_CLASS
+            : TOOLBAR_BRANCH_SELECT_LOCKED_CLASS
+        }
+      >
+        {options}
+      </select>
+    );
+
+    return lessonsBranchSelectInteractive ? (
+      selectEl
+    ) : (
+      <LockedControlTooltip label={lessonsBranchHoverHint}>
+        {selectEl}
+      </LockedControlTooltip>
+    );
+  };
+  
+  return (
+    <DashboardLayout>
+      <div className="space-y-6">
+        <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+          <div className="space-y-1">
+            <h1 className="text-2xl font-bold text-foreground">
+              New Converts Course
+            </h1>
+            <p className="text-sm text-gray-600">
+              Track lesson content, version labels, and participant journeys
+              across the conversion journey.
+            </p>
+          </div>
+          {canWriteLessonsAccess && (
+            <Button
+              variant="primary"
+              onClick={onOpenSessionReportModal}
+              disabled={lessons.length === 0}
+              className="w-full sm:w-auto min-h-[44px] self-start md:self-auto"
+            >
+              Log Session
+            </Button>
+          )}
+        </div>
+
+        {lessonsError && <ErrorMessage message={lessonsError} />}
+
+        {shouldShowStats && (
+          <LessonStatsCards
+            summary={summary}
+            visitorsAwaitingCount={summary?.unassigned_visitors ?? 0}
+            loading={summaryLoading}
+            error={summaryError}
+            ongoingStudentsCount={ongoingStudentsCount}
+            scopedToAssignedStudents={isLessonsTeacherScoped(user)}
+          />
+        )}
+
+        <div className="mt-10 border-t border-gray-200 pt-7 space-y-6">
+          <LessonContentTabs
+            activeTab={activeContentTab}
+            onTabChange={onSetActiveContentTab}
+            hideProgress={!showStudentWorkflowTabs}
+            hideTeachers={!showTeachersTab}
+            hideSessions={!showStudentWorkflowTabs}
+            branchFilter={
+              showStudentWorkflowTabs ? renderLessonsBranchSelect() : undefined
+            }
+          />
+
+          <div
+            className={activeContentTab === "lesson" ? "space-y-6" : "hidden"}
+          >
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+              <div className="lg:col-span-1">
+                {lessonsLoading ? (
+                  <Card>
+                    <LoadingSpinner />
+                  </Card>
+                ) : (
+                  <div className="max-h-[calc(100vh-20rem)] overflow-y-auto">
+                    <LessonList
+                      lessons={lessons}
+                      selectedLessonId={selectedLessonId}
+                      onSelect={onSelectLesson}
+                      onEdit={
+                        canManageLessonCatalogAccess
+                          ? onOpenEditLesson
+                          : undefined
+                      }
+                      onCreateNew={
+                        canManageLessonCatalogAccess
+                          ? onOpenCreateLesson
+                          : undefined
+                      }
+                    />
+                  </div>
+                )}
+              </div>
+              <div className="lg:col-span-2">
+                <LessonDetailPanel
+                  lesson={selectedLesson}
+                  onEdit={
+                    canManageLessonCatalogAccess
+                      ? onOpenEditLesson
+                      : undefined
+                  }
+                />
+              </div>
+            </div>
+          </div>
+
+          {showStudentWorkflowTabs && (
+            <>
+          <div
+            className={activeContentTab === "progress" ? "space-y-6" : "hidden"}
+          >
+            <MemberProgressSection
+              allLessons={lessons}
+              groupedProgress={groupedProgress}
+              studentTeacherById={studentTeacherById}
+              progressLoading={allProgressLoading}
+              progressError={allProgressError}
+              progressActionError={progressActionError}
+              progressFilterLessonId={progressFilterLessonId}
+              onProgressFilterChange={onProgressFilterChange}
+              progressSearchQuery={progressSearchQuery}
+              onProgressSearchQueryChange={onProgressSearchQueryChange}
+              progressStatusFilter={progressStatusFilter}
+              onProgressStatusFilterChange={onProgressStatusFilterChange}
+              progressSortField={progressSortField}
+              progressSortDirection={progressSortDirection}
+              onProgressSortChange={onProgressSortChange}
+              people={people}
+              peopleLoading={peopleLoading}
+              peopleError={peopleError}
+              assigning={assigning}
+              assignError={assignError}
+              canAssignLessons={canWriteLessonsAccess}
+              onAssignLessons={onAssignLessons}
+              enrollmentByStudent={enrollmentByStudentForAssign}
+              assignedStudentIds={assignedStudentIds}
+              defaultTeacherId={defaultAssignTeacherId}
+              teacherChoices={teacherChoices}
+              currentUserId={currentUserId}
+              onPersonClick={onOpenPersonProgressModal}
+              focusTeacherKey={focusTeacherKey}
+            />
+          </div>
+
+          {showTeachersTab ? (
+            <div
+              className={
+                activeContentTab === "teachers" ? "space-y-6" : "hidden"
+              }
+            >
+              <TeacherOverviewSection
+                rows={teacherOverviewRows}
+                loading={allProgressLoading}
+                error={allProgressError}
+                onTeacherClick={onTeacherOverviewClick}
+              />
+            </div>
+          ) : null}
+
+          <div
+            className={activeContentTab === "sessions" ? "space-y-6" : "hidden"}
+          >
+            <SessionReportsSection
+              lessonChoices={activeLatestLessons.map((lesson) => ({
+                id: lesson.id,
+                first_name: lesson.title,
+                username: lesson.title,
+              }))}
+              sessionReports={sessionReports}
+              sessionReportsLoading={sessionReportsLoading}
+              sessionReportsError={sessionReportsError}
+              sessionFilterDraft={sessionFilterDraft}
+              sessionYearOptions={sessionYearOptions}
+              teacherChoices={sessionTeacherChoices ?? teacherChoices}
+              studentChoices={studentChoices}
+              lockedTeacherId={lockedSessionTeacherId}
+              onFilterChange={onUpdateSessionFilterDraft}
+              onResetFilters={onResetSessionFilters}
+              onExport={onExportSessionReports}
+              onOpenSessionModal={onOpenSessionReportModal}
+              onEditSession={onOpenSessionReportForEdit}
+              onRequestDelete={
+                userCanHardDelete ? onRequestDeleteSessionReport : undefined
+              }
+              formatDateOnly={formatDateOnly}
+              formatDateTime={formatDateTime}
+              canLogSession={canWriteLessonsAccess}
+              logSessionEnabled={lessons.length > 0}
+              canExport={sessionReports.length > 0}
+            />
+          </div>
+            </>
+          )}
+
+          <div
+            className={
+              activeContentTab === "commitment" ? "space-y-6" : "hidden"
+            }
+          >
+            <NccLessonsPdfSection
+              commitmentSettings={commitmentSettings}
+              commitmentLoading={commitmentLoading}
+              commitmentError={commitmentError}
+              onOpenModal={onOpenNccLessonsPdfModal}
+              canManageNccLessonsPdf={canManageLessonCatalogAccess}
+            />
+            <CommitmentFormSection
+              commitmentSettings={commitmentSettings}
+              commitmentLoading={commitmentLoading}
+              commitmentError={null}
+              onOpenModal={onOpenCommitmentModal}
+              canManageCommitmentForm={canManageLessonCatalogAccess}
+            />
+          </div>
+        </div>
+      </div>
+
+      <Modal
+        isOpen={isLessonFormOpen}
+        onClose={onCloseLessonForm}
+        title={editingLesson ? "Edit Lesson" : "New Lesson"}
+        closeOnOutsideClick={false}
+      >
+        {lessonFormError && (
+          <div className="mb-4">
+            <ErrorMessage message={lessonFormError} />
+          </div>
+        )}
+        <LessonForm
+          lesson={editingLesson}
+          submitting={lessonFormSubmitting}
+          deleteDisabled={lessonDeleteLoading}
+          onSubmit={onLessonFormSubmit}
+          onCancel={onCloseLessonForm}
+          onDelete={
+            editingLesson
+              ? () => onRequestDeleteLesson(editingLesson)
+              : undefined
+          }
+          onHardDelete={
+            editingLesson && onRequestHardDeleteLesson
+              ? () => onRequestHardDeleteLesson(editingLesson)
+              : undefined
+          }
+        />
+      </Modal>
+
+      <Modal
+        isOpen={Boolean(commitmentConfirm)}
+        onClose={() => onSetCommitmentConfirm(null)}
+        title={
+          commitmentConfirm?.nextValue
+            ? "Confirm Commitment Signature"
+            : "Remove Commitment Signature"
+        }
+      >
+        <div className="space-y-4">
+          <p className="text-sm text-gray-600">
+            {commitmentConfirm?.nextValue
+              ? (
+                  <>
+                    Mark{" "}
+                    <span className="font-semibold text-foreground">
+                      {formatPersonName(commitmentConfirm.person)}
+                    </span>{" "}
+                    as having signed the commitment form? This will add a journey
+                    to the conversion timeline.
+                  </>
+                )
+              : commitmentConfirm
+              ? (
+                  <>
+                    Remove the commitment signature for{" "}
+                    <span className="font-semibold text-foreground">
+                      {formatPersonName(commitmentConfirm.person)}
+                    </span>
+                    ? This will clear the journey entry.
+                  </>
+                )
+              : ""}
+          </p>
+        </div>
+        <div className="flex flex-col-reverse sm:flex-row gap-4 mt-6">
+          <Button
+            variant="tertiary"
+            onClick={() => onSetCommitmentConfirm(null)}
+            disabled={isProgressUpdating}
+            className="w-full sm:flex-1 min-h-[44px]"
+          >
+            Cancel
+          </Button>
+          <Button
+            onClick={onConfirmCommitmentToggle}
+            disabled={isProgressUpdating}
+            className="w-full sm:flex-1 min-h-[44px]"
+          >
+            {isProgressUpdating ? "Updating..." : "Confirm"}
+          </Button>
+        </div>
+      </Modal>
+
+      <NoteInputModal
+        isOpen={noteInputModal.isOpen}
+        onClose={onCloseNoteInputModal}
+        onConfirm={onNoteInputConfirm}
+        title="Add Note for Journey"
+        message="Add a note for this journey (optional):"
+        initialValue={noteInputModal.record?.notes ?? ""}
+        loading={isProgressUpdating}
+      />
+
+      <ConfirmationModal
+        isOpen={alertModal.isOpen}
+        onClose={onCloseAlertModal}
+        onConfirm={onCloseAlertModal}
+        title={alertModal.title || "Information"}
+        message={alertModal.message}
+        confirmText="OK"
+        variant="info"
+      />
+
+      <Modal
+        isOpen={isCommitmentModalOpen}
+        onClose={onCloseCommitmentModal}
+        title="Upload Commitment Form"
+      >
+        <div className="space-y-4">
+          <p className="text-sm text-gray-600">
+            Upload a PDF version of the commitment form that students will sign
+            after completing the course.
+          </p>
+          <input
+            type="file"
+            accept="application/pdf"
+            onChange={(event) =>
+              onSetCommitmentFile(event.target.files?.[0] ?? null)
+            }
+            className="block w-full text-sm text-gray-700"
+          />
+          {commitmentUploadError && (
+            <ErrorMessage message={commitmentUploadError} />
+          )}
+          <div className="flex flex-col-reverse sm:flex-row gap-4 pt-2">
+            <Button
+              variant="tertiary"
+              onClick={onCloseCommitmentModal}
+              className="w-full sm:flex-1 min-h-[44px]"
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={onCommitmentUpload}
+              disabled={commitmentUploading || !commitmentFile}
+              className="w-full sm:flex-1 min-h-[44px]"
+            >
+              {commitmentUploading ? "Uploading..." : "Upload PDF"}
+            </Button>
+          </div>
+        </div>
+      </Modal>
+
+      <Modal
+        isOpen={isNccLessonsPdfModalOpen}
+        onClose={onCloseNccLessonsPdfModal}
+        title="Upload NCC Lessons PDF"
+      >
+        <div className="space-y-4">
+          <p className="text-sm text-gray-600">
+            Upload a PDF copy of the New Converts Course booklet for teachers
+            to view and download.
+          </p>
+          <input
+            type="file"
+            accept="application/pdf"
+            onChange={(event) =>
+              onSetNccLessonsPdfFile(event.target.files?.[0] ?? null)
+            }
+            className="block w-full text-sm text-gray-700"
+          />
+          {nccLessonsPdfUploadError && (
+            <ErrorMessage message={nccLessonsPdfUploadError} />
+          )}
+          <div className="flex flex-col-reverse sm:flex-row gap-4 pt-2">
+            <Button
+              variant="tertiary"
+              onClick={onCloseNccLessonsPdfModal}
+              className="w-full sm:flex-1 min-h-[44px]"
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={onNccLessonsPdfUpload}
+              disabled={nccLessonsPdfUploading || !nccLessonsPdfFile}
+              className="w-full sm:flex-1 min-h-[44px]"
+            >
+              {nccLessonsPdfUploading ? "Uploading..." : "Upload PDF"}
+            </Button>
+          </div>
+        </div>
+      </Modal>
+
+      <ConfirmationModal
+        isOpen={Boolean(lessonDeleteTarget)}
+        onClose={() => {
+          if (lessonDeleteLoading) return;
+          onSetLessonDeleteTarget(null);
+          onSetLessonDeleteError(null);
+        }}
+        onConfirm={onConfirmDeleteLesson}
+        title="Deactivate Lesson"
+        message={
+          lessonDeleteError
+            ? `${lessonDeleteError} Please try again.`
+            : `Deactivate the "${lessonDeleteTarget?.title}" lesson? It will be hidden from the active catalog but historical progress is preserved.`
+        }
+        confirmText="Deactivate Lesson"
+        cancelText="Cancel"
+        variant="warning"
+        loading={lessonDeleteLoading}
+      />
+
+      {onConfirmHardDeleteLesson && (
+      <ConfirmationModal
+        isOpen={Boolean(lessonHardDeleteTarget)}
+        onClose={() => {
+          if (lessonHardDeleteLoading) return;
+          onSetLessonHardDeleteTarget?.(null);
+          onSetLessonHardDeleteError?.(null);
+        }}
+        onConfirm={onConfirmHardDeleteLesson}
+        title="Delete Lesson Permanently"
+        message={
+          lessonHardDeleteError
+            ? `${lessonHardDeleteError} Please try again.`
+            : `Are you sure you want to permanently delete the "${lessonHardDeleteTarget?.title}" lesson? This action cannot be undone.`
+        }
+        confirmText="Delete Lesson"
+        cancelText="Cancel"
+        variant="danger"
+        loading={lessonHardDeleteLoading}
+      />
+      )}
+
+      <Modal
+        isOpen={isSessionModalOpen}
+        onClose={onCloseSessionModal}
+        title={
+          editingSessionReport ? "Edit Lesson Session" : "Log Lesson Session"
+        }
+        closeOnOutsideClick={false}
+      >
+        <LessonSessionReportForm
+          report={editingSessionReport}
+          submitting={sessionFormSubmitting}
+          onSubmit={onSessionFormSubmit}
+          onCancel={onCloseSessionModal}
+          people={sessionFormPeople ?? people}
+          teacherChoices={teacherChoices}
+          lessons={lessons}
+          defaultLessonId={
+            sessionFormDefaults.lessonId ?? selectedLessonId ?? undefined
+          }
+          loggedInTeacherId={currentTeacherId ?? undefined}
+          defaultTeacherId={
+            sessionFormDefaults.studentId
+              ? sessionFormDefaults.teacherId ?? undefined
+              : (sessionFormDefaults.teacherId ?? currentTeacherId ?? undefined)
+          }
+          defaultStudentId={sessionFormDefaults.studentId ?? undefined}
+          defaultProgressId={sessionFormDefaults.progressId ?? undefined}
+          enrollmentTeacherByStudentId={enrollmentTeacherByStudentId}
+          enrollmentByStudentId={enrollmentByStudent}
+          nextLessonIdByStudentId={nextLessonIdByStudent}
+          lastLessonId={
+            activeLatestLessons.length > 0
+              ? activeLatestLessons[activeLatestLessons.length - 1].id
+              : null
+          }
+          error={sessionFormError}
+        />
+      </Modal>
+
+      <ConfirmationModal
+        isOpen={Boolean(sessionDeleteTarget)}
+        onClose={() => {
+          if (sessionDeleteLoading) return;
+          onSetSessionDeleteTarget(null);
+        }}
+        onConfirm={onConfirmDeleteSessionReport}
+        title="Delete Session Report"
+        message={
+          sessionDeleteError ? (
+            <>{sessionDeleteError} Please try again.</>
+          ) : (
+            <>
+              Delete the session report for{" "}
+              <span className="font-semibold text-gray-900">
+                {formatPersonName(sessionDeleteTarget?.student)}
+              </span>{" "}
+              recorded on {formatDateTime(sessionDeleteTarget?.session_start)}?
+              This action cannot be undone.
+            </>
+          )
+        }
+        confirmText="Delete"
+        cancelText="Cancel"
+        variant="danger"
+        loading={sessionDeleteLoading}
+      />
+
+      <PersonLessonProgressModal
+        isOpen={personProgressModal.isOpen}
+        person={personProgressModal.person}
+        allProgress={allProgress}
+        allLessons={lessons}
+        enrollment={
+          personProgressModal.person
+            ? enrollmentByStudent.get(personProgressModal.person.id) ?? null
+            : null
+        }
+        canTransferTeacher={canTransferLessonTeacher}
+        onAssignTeacher={onAssignTeacher}
+        onTransferTeacher={onTransferTeacher}
+        onRequestCommitmentToggle={onRequestCommitmentToggle}
+        isProgressUpdating={isProgressUpdating}
+        onClose={onClosePersonProgressModal}
+      />
+    </DashboardLayout>
+  );
+}

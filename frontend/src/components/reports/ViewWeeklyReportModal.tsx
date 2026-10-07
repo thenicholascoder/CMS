@@ -1,0 +1,678 @@
+import React, { useState, useEffect } from "react";
+import { PersonUI, Family } from "@/src/types/person";
+import { ClusterWeeklyReport } from "@/src/types/cluster";
+import { formatPersonName } from "@/src/lib/name";
+import Button from "@/src/components/ui/Button";
+import ModalOverlay from "@/src/components/ui/ModalOverlay";
+import PersonAvatar from "@/src/components/people/PersonAvatar";
+import PersonProfile from "@/src/components/people/PersonProfile";
+import { familiesApi, peopleApi } from "@/src/lib/api";
+import { getEvangelismGatheringTypeChipClass } from "@/src/lib/evangelismGatheringTypeStyles";
+import { getPersonRoleColor } from "@/src/lib/personRole";
+import {
+  formatPersonStatusLabel,
+  getPersonStatusColor,
+} from "@/src/lib/personStatus";
+import { formatDisplayDate } from "@/src/lib/date";
+
+type AttendeePerson = NonNullable<
+  ClusterWeeklyReport["members_attended_details"]
+>[number];
+
+function attendeeToPersonUI(person: AttendeePerson): PersonUI {
+  return {
+    id: String(person.id),
+    name: formatPersonName(person),
+    first_name: person.first_name,
+    last_name: person.last_name,
+    middle_name: person.middle_name,
+    suffix: person.suffix,
+    nickname: person.nickname,
+    username: person.username,
+    email: "",
+    role: (person.role ?? "MEMBER") as PersonUI["role"],
+    status: (person.status ?? "ACTIVE") as PersonUI["status"],
+  };
+}
+
+interface ViewWeeklyReportModalProps {
+  report: ClusterWeeklyReport;
+  isOpen: boolean;
+  /** When false, hides Edit/Delete footer actions. Defaults true for backward compatibility. */
+  canMutateReports?: boolean;
+  onClose: () => void;
+  onEdit: () => void;
+  onDelete?: () => void;
+}
+
+export default function ViewWeeklyReportModal({
+  report,
+  isOpen,
+  canMutateReports = true,
+  onClose,
+  onEdit,
+  onDelete,
+}: ViewWeeklyReportModalProps) {
+  const [membersExpanded, setMembersExpanded] = useState(false);
+  const [visitorsExpanded, setVisitorsExpanded] = useState(false);
+  const [selectedPerson, setSelectedPerson] = useState<PersonUI | null>(null);
+  const [showPersonModal, setShowPersonModal] = useState(false);
+  const [families, setFamilies] = useState<Family[]>([]);
+
+  // Show 6 items initially (3 rows with 2 columns)
+  const INITIAL_DISPLAY_COUNT = 6;
+
+  // Reset expanded states when report changes (e.g., after editing)
+  // Use a more comprehensive check to detect when report data actually changes
+  useEffect(() => {
+    if (isOpen && report) {
+      setMembersExpanded(false);
+      setVisitorsExpanded(false);
+    }
+  }, [
+    isOpen,
+    report?.id,
+    report?.updated_at,
+    report?.meeting_date,
+    report?.members_present,
+    report?.visitors_present,
+  ]);
+
+  // Fetch families when modal opens
+  useEffect(() => {
+    if (isOpen) {
+      familiesApi
+        .getAll()
+        .then((response) => {
+          setFamilies(response.data || []);
+        })
+        .catch((error) => {
+          console.error("Error fetching families:", error);
+          setFamilies([]);
+        });
+    }
+  }, [isOpen]);
+
+  const handlePersonClick = (person: PersonUI) => {
+    setSelectedPerson(person);
+    setShowPersonModal(true);
+  };
+
+  const peopleGridClass = "grid gap-2 grid-cols-1 sm:grid-cols-2";
+
+  const renderAttendeeCard = (person: AttendeePerson) => {
+    const personName = formatPersonName(person);
+    const isLongWrappedName = personName.length > 20;
+    return (
+      <div
+        key={person.id}
+        onClick={() => handlePersonClick(attendeeToPersonUI(person))}
+        className="flex items-start gap-3 p-3 bg-gray-50 border border-gray-200 rounded-md cursor-pointer hover:bg-gray-100 transition-colors"
+      >
+        <PersonAvatar person={person} size="sm" />
+        <div className="flex-1 min-w-0">
+          <p
+            className={`font-medium text-gray-900 break-words ${
+              isLongWrappedName ? "text-xs leading-5" : "text-sm leading-5"
+            }`}
+          >
+            <span className="min-w-0 break-words">{personName}</span>
+          </p>
+          <div className="flex items-center gap-1 flex-wrap mt-0.5">
+            {person.status && (
+              <span
+                className={`inline-flex items-center px-1 py-0.5 rounded-full text-[9px] font-medium ${getPersonStatusColor(
+                  person.status,
+                )}`}
+              >
+                {formatPersonStatusLabel(person.status)}
+              </span>
+            )}
+            {person.role && (
+              <span
+                className={`inline-flex items-center px-1 py-0.5 rounded-full text-[9px] font-medium ${getPersonRoleColor(
+                  person.role,
+                )}`}
+              >
+                {person.role}
+              </span>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const handlePersonModalCancel = () => {
+    setShowPersonModal(false);
+    setSelectedPerson(null);
+  };
+
+  if (!isOpen) return null;
+
+  // Ensure offerings is a number
+  const offerings =
+    typeof report.offerings === "string"
+      ? parseFloat(report.offerings)
+      : report.offerings;
+
+  const formatDate = (dateString: string) => {
+    return formatDisplayDate(dateString) || dateString;
+  };
+
+  const formatDateTime = (dateString: string) => {
+    return new Date(dateString).toLocaleString("en-US", {
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  };
+
+  return (
+    <>
+    <ModalOverlay
+      isOpen={isOpen}
+      onClose={onClose}
+      className="p-0 sm:p-4"
+      panelClassName="relative flex h-full w-full max-w-4xl flex-col sm:h-auto"
+    >
+      <div className="flex h-full max-h-[95vh] flex-col overflow-hidden rounded-none bg-white shadow-xl sm:rounded-lg sm:h-auto">
+        {/* Header */}
+        <div className="flex items-center justify-between border-b border-gray-200 py-3 pl-3 sm:pl-6 pr-2">
+          <div>
+            <h2 className="text-sm font-medium text-gray-900">
+              Weekly Report Details
+            </h2>
+            <p className="text-[11px] text-gray-600 mt-0.5">
+              {report.cluster_code} {report.cluster_name} - {report.year} Week{" "}
+              {report.week_number}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="text-red-500 hover:text-red-700 p-2 rounded-md hover:bg-red-50 transition-colors min-w-[44px] min-h-[44px] flex items-center justify-center shrink-0"
+            aria-label="Close modal"
+          >
+            <svg
+              className="w-5 h-5"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth={2}
+                d="M6 18L18 6M6 6l12 12"
+              />
+            </svg>
+          </button>
+        </div>
+
+        {/* Content */}
+        <div className="p-5 overflow-y-auto flex-1">
+          <div className="space-y-5">
+            {/* Basic Information */}
+            <div className="bg-gradient-to-r from-lighthouse-ivory to-muted rounded-lg p-4 border border-primary/20">
+              <div className="flex items-center justify-between">
+                <h2 className="text-xl font-bold text-gray-900">
+                  {report.cluster_code}{" "}
+                  {report.cluster_name || "Untitled Cluster"}
+                </h2>
+                <div className="flex flex-col items-end text-sm text-gray-700">
+                  <span className="font-medium">Year {report.year}</span>
+                  <span className="font-medium">Week {report.week_number}</span>
+                </div>
+              </div>
+              <div className="flex items-center gap-4 text-sm text-gray-700">
+                <div className="flex items-center gap-1">
+                  <svg
+                    className="w-4 h-4"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                    strokeWidth={2}
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"
+                    />
+                  </svg>
+                  <span>{formatDate(report.meeting_date)}</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Attendance and Gathering Type */}
+            <div className="bg-white rounded-lg border border-gray-200 p-4 shadow-sm">
+              <h3 className="text-lg font-semibold text-gray-900 mb-3">
+                Attendance & Gathering
+              </h3>
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                <div>
+                  <p className="text-sm text-gray-600">Members Present</p>
+                  <p className="text-xl font-bold text-gray-900">
+                    {report.members_present}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-sm text-gray-600">Visitors Present</p>
+                  <p
+                    className={`text-xl font-bold ${
+                      report.visitors_present === 0
+                        ? "text-red-600"
+                        : "text-gray-900"
+                    }`}
+                  >
+                    {report.visitors_present}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-sm text-gray-600">Prospects Invited</p>
+                  <p className="text-xl font-bold text-gray-900">
+                    {report.prospects_invited_count ??
+                      report.prospects_invited_details?.length ??
+                      report.prospects_invited?.length ??
+                      0}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-sm text-gray-600">Total Attendance</p>
+                  <p className="text-xl font-bold text-primary">
+                    {report.members_present + report.visitors_present}
+                  </p>
+                </div>
+              </div>
+              <div className="mt-4 flex flex-col sm:flex-row items-start gap-4">
+                <div>
+                  <p className="text-sm text-gray-600 mb-2">Gathering Type</p>
+                  <span
+                    className={`inline-flex items-center px-3 py-1 rounded-full text-sm font-medium ${getEvangelismGatheringTypeChipClass(
+                      report.gathering_type
+                    )}`}
+                  >
+                    {report.gathering_type}
+                  </span>
+                </div>
+                <div>
+                  <p className="text-sm text-gray-600 mb-2">Offerings</p>
+                  <span className="inline-flex items-center text-sm font-medium text-green-600">
+                    ₱{offerings.toFixed(2)}
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            {/* Members & Visitors Who Attended */}
+            {((report.members_attended_details &&
+              report.members_attended_details.length > 0) ||
+              (report.visitors_attended_details &&
+                report.visitors_attended_details.length > 0)) && (
+              <div className="bg-white rounded-lg border border-gray-200 p-4 shadow-sm">
+                {report.members_attended_details &&
+                  report.members_attended_details.length > 0 && (
+                    <div className="mb-4">
+                      <div className="flex items-center justify-between mb-3">
+                        <h3 className="text-lg font-semibold text-gray-900">
+                          Members Who Attended (
+                          {report.members_attended_details.length})
+                        </h3>
+                        {report.members_attended_details.length >
+                          INITIAL_DISPLAY_COUNT && (
+                          <button
+                            onClick={() => setMembersExpanded(!membersExpanded)}
+                            className="text-sm text-primary hover:text-primary font-medium flex items-center gap-1"
+                          >
+                            {membersExpanded ? (
+                              <>
+                                <svg
+                                  className="w-4 h-4"
+                                  fill="none"
+                                  stroke="currentColor"
+                                  viewBox="0 0 24 24"
+                                >
+                                  <path
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                    strokeWidth={2}
+                                    d="M5 15l7-7 7 7"
+                                  />
+                                </svg>
+                                Show Less
+                              </>
+                            ) : (
+                              <>
+                                <svg
+                                  className="w-4 h-4"
+                                  fill="none"
+                                  stroke="currentColor"
+                                  viewBox="0 0 24 24"
+                                >
+                                  <path
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                    strokeWidth={2}
+                                    d="M19 9l-7 7-7-7"
+                                  />
+                                </svg>
+                                Show More
+                              </>
+                            )}
+                          </button>
+                        )}
+                      </div>
+                      <div className={peopleGridClass}>
+                        {(membersExpanded
+                          ? report.members_attended_details
+                          : report.members_attended_details.slice(
+                              0,
+                              INITIAL_DISPLAY_COUNT
+                            )
+                        ).map((member) => renderAttendeeCard(member))}
+                      </div>
+                    </div>
+                  )}
+                {report.visitors_attended_details &&
+                  report.visitors_attended_details.length > 0 && (
+                    <div>
+                      <div className="flex items-center justify-between mb-3">
+                        <h3 className="text-lg font-semibold text-gray-900">
+                          Visitors Who Attended (
+                          {report.visitors_attended_details.length})
+                        </h3>
+                        {report.visitors_attended_details.length >
+                          INITIAL_DISPLAY_COUNT && (
+                          <button
+                            onClick={() =>
+                              setVisitorsExpanded(!visitorsExpanded)
+                            }
+                            className="text-sm text-primary hover:text-primary font-medium flex items-center gap-1"
+                          >
+                            {visitorsExpanded ? (
+                              <>
+                                <svg
+                                  className="w-4 h-4"
+                                  fill="none"
+                                  stroke="currentColor"
+                                  viewBox="0 0 24 24"
+                                >
+                                  <path
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                    strokeWidth={2}
+                                    d="M5 15l7-7 7 7"
+                                  />
+                                </svg>
+                                Show Less
+                              </>
+                            ) : (
+                              <>
+                                <svg
+                                  className="w-4 h-4"
+                                  fill="none"
+                                  stroke="currentColor"
+                                  viewBox="0 0 24 24"
+                                >
+                                  <path
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                    strokeWidth={2}
+                                    d="M19 9l-7 7-7-7"
+                                  />
+                                </svg>
+                                Show More
+                              </>
+                            )}
+                          </button>
+                        )}
+                      </div>
+                      <div className={peopleGridClass}>
+                        {(visitorsExpanded
+                          ? report.visitors_attended_details
+                          : report.visitors_attended_details.slice(
+                              0,
+                              INITIAL_DISPLAY_COUNT
+                            )
+                        ).map((visitor) => renderAttendeeCard(visitor))}
+                      </div>
+                    </div>
+                  )}
+              </div>
+            )}
+
+            {/* Prospects Invited (not yet attended) */}
+            {report.prospects_invited_details &&
+              report.prospects_invited_details.length > 0 && (
+                <div className="bg-white rounded-lg border border-gray-200 p-4 shadow-sm">
+                  <h3 className="text-lg font-semibold text-gray-900 mb-2">
+                    Prospects Invited ({report.prospects_invited_details.length})
+                  </h3>
+                  <p className="text-xs text-gray-500 mb-3">
+                    Invited visitors only — not yet attended.
+                  </p>
+                  <div className={peopleGridClass}>
+                    {report.prospects_invited_details.map((prospect) => {
+                      const inviter = prospect.invited_by;
+                      const inviterName = inviter
+                        ? formatPersonName(inviter) || inviter.username
+                        : null;
+                      const prospectName =
+                        prospect.display_name ||
+                        `${prospect.first_name} ${prospect.last_name}`.trim();
+                      const isLongWrappedName = prospectName.length > 20;
+                      return (
+                        <div
+                          key={prospect.id}
+                          className="flex items-start gap-3 p-3 bg-amber-50/50 border border-amber-100 rounded-md"
+                        >
+                          <div className="flex-1 min-w-0">
+                            <p
+                              className={`font-medium text-gray-900 break-words ${
+                                isLongWrappedName
+                                  ? "text-xs leading-5"
+                                  : "text-sm leading-5"
+                              }`}
+                            >
+                              <span className="min-w-0 break-words">
+                                {prospectName}
+                              </span>
+                            </p>
+                            {inviterName && (
+                              <p className="text-xs text-gray-600 break-words mt-0.5">
+                                Invited by {inviterName}
+                              </p>
+                            )}
+                            <div className="flex items-center gap-1 flex-wrap mt-0.5">
+                              <span className="inline-flex items-center px-1 py-0.5 rounded-full text-[9px] font-medium bg-amber-100 text-amber-800">
+                                {prospect.pipeline_stage_display ||
+                                  prospect.pipeline_stage ||
+                                  "Invited"}
+                              </span>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+            {/* Activities */}
+            {report.activities_held && (
+              <div className="bg-gray-50 rounded-lg p-4">
+                <h3 className="text-sm font-medium text-gray-700 mb-2">
+                  Activities Held
+                </h3>
+                <p className="text-gray-600 whitespace-pre-wrap">
+                  {report.activities_held}
+                </p>
+              </div>
+            )}
+
+            {/* Prayer Requests */}
+            {report.prayer_requests && (
+              <div className="bg-gray-50 rounded-lg p-4">
+                <h3 className="text-sm font-medium text-gray-700 mb-2">
+                  Prayer Requests
+                </h3>
+                <p className="text-gray-600 whitespace-pre-wrap">
+                  {report.prayer_requests}
+                </p>
+              </div>
+            )}
+
+            {/* Testimonies */}
+            {report.testimonies && (
+              <div className="bg-gray-50 rounded-lg p-4">
+                <h3 className="text-sm font-medium text-gray-700 mb-2">
+                  Testimonies
+                </h3>
+                <p className="text-gray-600 whitespace-pre-wrap">
+                  {report.testimonies}
+                </p>
+              </div>
+            )}
+
+            {/* Highlights and Lowlights */}
+            {(report.highlights || report.lowlights) && (
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                {report.highlights && (
+                  <div className="bg-green-50 rounded-lg border border-green-200 p-4">
+                    <h3 className="text-sm font-medium text-green-900 mb-2">
+                      Highlights
+                    </h3>
+                    <p className="text-gray-600 whitespace-pre-wrap">
+                      {report.highlights}
+                    </p>
+                  </div>
+                )}
+                {report.lowlights && (
+                  <div className="bg-orange-50 rounded-lg border border-orange-200 p-4">
+                    <h3 className="text-sm font-medium text-orange-900 mb-2">
+                      Lowlights
+                    </h3>
+                    <p className="text-gray-600 whitespace-pre-wrap">
+                      {report.lowlights}
+                    </p>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Submission Information */}
+            <div className="bg-gray-50 rounded-lg p-4">
+              <h3 className="text-sm font-medium text-gray-700 mb-2">
+                Submission Information
+              </h3>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <p className="text-xs text-gray-600">Submitted By</p>
+                  <p className="text-sm font-medium text-gray-900">
+                    {report.submitted_by_details
+                      ? formatPersonName(report.submitted_by_details as any)
+                      : "Unknown"}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-xs text-gray-600">Submitted At</p>
+                  <p className="text-sm font-medium text-gray-900">
+                    {formatDateTime(report.submitted_at)}
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Footer */}
+        {canMutateReports && (
+        <div className="p-3 sm:p-4 border-t border-gray-200 bg-gray-50">
+          <div className="flex flex-nowrap items-center gap-2 w-full overflow-x-auto">
+            <div className="flex flex-nowrap items-center gap-2 shrink-0">
+              {onDelete && (
+                <Button
+                  onClick={onDelete}
+                  variant="secondary"
+                  aria-label="Delete report"
+                  title="Delete report"
+                  className="!text-red-600 bg-white border border-red-200 hover:bg-red-50 hover:border-red-300 flex items-center justify-center h-10 min-h-[44px] px-4 text-sm font-medium shrink-0"
+                >
+                  <svg
+                    className="w-4 h-4"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"
+                    />
+                  </svg>
+                </Button>
+              )}
+            </div>
+            <div className="flex flex-nowrap items-center gap-2 shrink-0 ml-auto">
+              <Button
+                onClick={onEdit}
+                variant="secondary"
+                className="!text-primary bg-white border border-primary/20 hover:bg-primary/10 hover:border-primary/30 flex items-center justify-center space-x-2 h-10 min-h-[44px] px-4 text-sm font-medium shrink-0"
+              >
+                <svg
+                  className="w-4 h-4"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={2}
+                    d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"
+                  />
+                </svg>
+                <span>Edit</span>
+              </Button>
+            </div>
+          </div>
+        </div>
+        )}
+      </div>
+    </ModalOverlay>
+
+      {/* Person Profile Modal */}
+      {showPersonModal && selectedPerson && (
+        <ModalOverlay
+          isOpen={showPersonModal}
+          onClose={handlePersonModalCancel}
+          zIndex={80}
+          className="p-0 sm:p-4"
+          panelClassName="relative flex h-full w-full max-w-3xl flex-col sm:h-auto"
+        >
+          <div className="flex h-full max-h-[95vh] flex-col overflow-hidden rounded-none bg-white shadow-xl sm:rounded-lg sm:h-auto">
+            <PersonProfile
+              person={selectedPerson}
+              families={families}
+              onEdit={() => {}}
+              onDelete={() => {}}
+              onAddTimeline={() => {}}
+              onClose={handlePersonModalCancel}
+              hideEditButton={true}
+              hideDeleteButton={true}
+              onViewPerson={(id) => {
+                void peopleApi.getById(id).then((response) => {
+                  setSelectedPerson(response.data as PersonUI);
+                });
+              }}
+            />
+          </div>
+        </ModalOverlay>
+      )}
+    </>
+  );
+}

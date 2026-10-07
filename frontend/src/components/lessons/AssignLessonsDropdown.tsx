@@ -1,0 +1,526 @@
+"use client";
+
+import { useState, useRef, useEffect, useMemo } from "react";
+import Button from "@/src/components/ui/Button";
+import ErrorMessage from "@/src/components/ui/ErrorMessage";
+import LoadingSpinner from "@/src/components/ui/LoadingSpinner";
+import Modal from "@/src/components/ui/Modal";
+import ScalableSelect from "@/src/components/ui/ScalableSelect";
+import { Lesson, LessonStudentEnrollment } from "@/src/types/lesson";
+import { Person } from "@/src/types/person";
+import { formatPersonName, personNameSearchText } from "@/src/lib/name";
+import {
+  enrollmentTeacherLabel,
+  LessonPersonLike,
+  NCC_TEACHER_ROSTER_EMPTY_MESSAGE,
+  personBranchId,
+} from "@/src/lib/lessonsUtils";
+import { isSelectablePerson } from "@/src/lib/peopleSelectors";
+import {
+  formatPersonClusterLabel,
+  formatPersonStatusLabel,
+  getPersonClusterChipClass,
+  getPersonStatusColor,
+} from "@/src/lib/personStatus";
+import { useIsMdUp } from "@/src/lib/listViewMode";
+
+interface AssignLessonsDropdownProps {
+  allLessons: Lesson[];
+  people: Person[];
+  peopleLoading: boolean;
+  peopleError: string | null;
+  assigning: boolean;
+  assignError: string | null;
+  onAssignLessons: (
+    personIds: string[],
+    lessonIds: number[],
+    teacherId: string
+  ) => void;
+  enrollmentByStudent: Map<number, LessonStudentEnrollment>;
+  assignedStudentIds: Set<number>;
+  defaultTeacherId: string | null;
+  teacherChoices: LessonPersonLike[];
+  currentUserId?: string | number | null;
+}
+
+export default function AssignLessonsDropdown({
+  allLessons,
+  people,
+  peopleLoading,
+  peopleError,
+  assigning,
+  assignError,
+  onAssignLessons,
+  enrollmentByStudent,
+  assignedStudentIds,
+  defaultTeacherId,
+  teacherChoices,
+  currentUserId,
+}: AssignLessonsDropdownProps) {
+  const [isOpen, setIsOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [selectedPersonId, setSelectedPersonId] = useState<string | null>(null);
+  const [selectedLessonIds, setSelectedLessonIds] = useState<Set<number>>(
+    new Set()
+  );
+  const [selectedTeacherId, setSelectedTeacherId] = useState("");
+  const containerRef = useRef<HTMLDivElement>(null);
+  const isMdUp = useIsMdUp();
+
+  const eligiblePeople = useMemo(() => {
+    return people.filter((person) => {
+      if (!isSelectablePerson(person) || person.has_finished_lessons) {
+        return false;
+      }
+      if (
+        currentUserId != null &&
+        String(person.id) === String(currentUserId)
+      ) {
+        return false;
+      }
+      const personId = Number(person.id);
+      if (Number.isNaN(personId)) {
+        return true;
+      }
+      return !assignedStudentIds.has(personId);
+    });
+  }, [assignedStudentIds, currentUserId, people]);
+
+  const emptyEligibleMessage = useMemo(() => {
+    const selectable = people.filter(isSelectablePerson);
+    const notFinished = selectable.filter((person) => !person.has_finished_lessons);
+    if (notFinished.length === 0) {
+      return "No people available (all have finished lessons).";
+    }
+    const allAlreadyAssigned = notFinished.every((person) => {
+      const personId = Number(person.id);
+      return !Number.isNaN(personId) && assignedStudentIds.has(personId);
+    });
+    if (allAlreadyAssigned) {
+      return "No people available (all eligible students already have lessons assigned).";
+    }
+    return "No people available.";
+  }, [assignedStudentIds, people]);
+
+  const filteredPeople = useMemo(() => {
+    if (!searchQuery.trim()) {
+      return eligiblePeople;
+    }
+    const query = searchQuery.toLowerCase();
+    return eligiblePeople.filter((person) => {
+      const haystack = personNameSearchText(person);
+      const memberId = (person.member_id || "").toLowerCase();
+      return haystack.includes(query) || memberId.includes(query);
+    });
+  }, [eligiblePeople, searchQuery]);
+
+  const selectedPerson = selectedPersonId
+    ? people.find((person) => String(person.id) === String(selectedPersonId)) ??
+      null
+    : null;
+  const studentBranchId = personBranchId(selectedPerson);
+
+  const teacherSelectOptions = useMemo(
+    () =>
+      teacherChoices
+        .filter((person) => {
+          if (person.id?.toString() === selectedPersonId) {
+            return false;
+          }
+          if (studentBranchId == null) {
+            return false;
+          }
+          const choiceBranch = personBranchId(person);
+          if (choiceBranch == null) {
+            return true;
+          }
+          return choiceBranch === studentBranchId;
+        })
+        .map((person) => ({
+          value: person.id?.toString() ?? "",
+          label: formatPersonName(person),
+          nickname: person.nickname?.trim() || null,
+          firstName: person.first_name?.trim() || null,
+        })),
+    [selectedPersonId, studentBranchId, teacherChoices]
+  );
+
+  const selectedPersonNumericId = selectedPersonId
+    ? Number(selectedPersonId)
+    : null;
+  const existingEnrollment =
+    selectedPersonNumericId != null && !Number.isNaN(selectedPersonNumericId)
+      ? enrollmentByStudent.get(selectedPersonNumericId)
+      : undefined;
+  const requiresTeacherPicker = Boolean(
+    selectedPersonId && !existingEnrollment
+  );
+
+  useEffect(() => {
+    if (selectedPersonId) {
+      const defaultLessonIds = new Set(
+        allLessons
+          .filter((lesson) => lesson.is_latest && lesson.is_active)
+          .map((lesson) => lesson.id)
+      );
+      setSelectedLessonIds(defaultLessonIds);
+
+      if (existingEnrollment?.teacher?.id) {
+        setSelectedTeacherId(existingEnrollment.teacher.id.toString());
+      } else {
+        const nextTeacherId = defaultTeacherId ?? "";
+        setSelectedTeacherId(
+          nextTeacherId === selectedPersonId ? "" : nextTeacherId
+        );
+      }
+    }
+  }, [
+    selectedPersonId,
+    allLessons,
+    existingEnrollment?.teacher?.id,
+    defaultTeacherId,
+  ]);
+
+  useEffect(() => {
+    if (!selectedTeacherId) {
+      return;
+    }
+    const stillValid = teacherSelectOptions.some(
+      (option) => option.value === selectedTeacherId,
+    );
+    if (!stillValid) {
+      setSelectedTeacherId("");
+    }
+  }, [selectedTeacherId, teacherSelectOptions]);
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest('[data-scalable-select-portal="true"]')) {
+        return;
+      }
+      if (
+        containerRef.current &&
+        !containerRef.current.contains(event.target as Node)
+      ) {
+        setIsOpen(false);
+        setSearchQuery("");
+        setSelectedPersonId(null);
+        setSelectedLessonIds(new Set());
+        setSelectedTeacherId("");
+      }
+    };
+
+    if (isOpen && isMdUp) {
+      document.addEventListener("mousedown", handleClickOutside);
+    }
+
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+    };
+  }, [isOpen, isMdUp]);
+
+  const handlePersonSelect = (personId: string) => {
+    setSelectedPersonId(personId);
+  };
+
+  const handleLessonToggle = (lessonId: number) => {
+    setSelectedLessonIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(lessonId)) {
+        next.delete(lessonId);
+      } else {
+        next.add(lessonId);
+      }
+      return next;
+    });
+  };
+
+  const handleSubmit = () => {
+    if (!selectedPersonId || selectedLessonIds.size === 0) {
+      return;
+    }
+    if (requiresTeacherPicker && !selectedTeacherId) {
+      return;
+    }
+    onAssignLessons(
+      [selectedPersonId],
+      Array.from(selectedLessonIds),
+      selectedTeacherId
+    );
+    setIsOpen(false);
+    setSearchQuery("");
+    setSelectedPersonId(null);
+    setSelectedLessonIds(new Set());
+    setSelectedTeacherId("");
+  };
+
+  const handleCancel = () => {
+    setIsOpen(false);
+    setSearchQuery("");
+    setSelectedPersonId(null);
+    setSelectedLessonIds(new Set());
+    setSelectedTeacherId("");
+  };
+
+  const sortedLessons = useMemo(() => {
+    return [...allLessons]
+      .filter((lesson) => lesson.is_latest && lesson.is_active)
+      .sort((a, b) => a.order - b.order);
+  }, [allLessons]);
+
+  const canSubmit =
+    selectedPersonId &&
+    selectedLessonIds.size > 0 &&
+    (!requiresTeacherPicker || Boolean(selectedTeacherId));
+
+  const renderPanelBody = (layout: "modal" | "popover") => {
+    const isModal = layout === "modal";
+    const personListClass = isModal
+      ? "min-h-0 flex-1 overflow-y-auto border rounded-lg divide-y divide-gray-200"
+      : "max-h-80 overflow-y-auto border rounded-lg divide-y divide-gray-200";
+    const lessonListClass = isModal
+      ? "min-h-0 flex-1 overflow-y-auto border rounded-lg divide-y divide-gray-200"
+      : "max-h-80 overflow-y-auto border rounded-lg divide-y divide-gray-200";
+
+    return (
+      <>
+        <div
+          className={
+            isModal
+              ? "flex min-h-0 flex-1 flex-col gap-4 overflow-hidden p-4"
+              : "flex-1 overflow-y-auto p-4 space-y-4 sm:max-h-[75vh]"
+          }
+        >
+          {!selectedPersonId ? (
+            <>
+              <div className="shrink-0 space-y-2">
+                <label className="block text-sm font-medium text-gray-700">
+                  Search Person
+                </label>
+                <input
+                  type="text"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="Search by name, nickname, or member ID..."
+                  className="w-full min-h-[44px] border border-gray-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                  autoFocus={isMdUp}
+                />
+              </div>
+
+              {peopleError && <ErrorMessage message={peopleError} />}
+              {assignError && <ErrorMessage message={assignError} />}
+
+              <div
+                className={
+                  isModal
+                    ? "flex min-h-0 flex-1 flex-col space-y-2"
+                    : "space-y-2"
+                }
+              >
+                <label className="block shrink-0 text-sm font-medium text-gray-700">
+                  Select Person
+                </label>
+                <div className={personListClass}>
+                  {peopleLoading ? (
+                    <div className="p-4">
+                      <LoadingSpinner />
+                    </div>
+                  ) : filteredPeople.length === 0 ? (
+                    <div className="p-4 text-sm text-gray-500">
+                      {eligiblePeople.length === 0
+                        ? emptyEligibleMessage
+                        : "No people match your search."}
+                    </div>
+                  ) : (
+                    filteredPeople.map((person) => (
+                      <button
+                        key={person.id}
+                        type="button"
+                        onClick={() => handlePersonSelect(person.id)}
+                        className="w-full px-4 py-2 text-left text-sm text-gray-700 hover:bg-gray-50 min-h-[44px]"
+                      >
+                        <div className="font-medium text-foreground">
+                          {formatPersonName(person)}
+                        </div>
+                        <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                          <span
+                            className={`inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-semibold ${getPersonStatusColor(person.status)}`}
+                          >
+                            {formatPersonStatusLabel(person.status)}
+                          </span>
+                          <span
+                            className={getPersonClusterChipClass(
+                              (person.cluster_codes?.length ?? 0) > 0,
+                            )}
+                          >
+                            {formatPersonClusterLabel(person.cluster_codes)}
+                          </span>
+                        </div>
+                      </button>
+                    ))
+                  )}
+                </div>
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="shrink-0 space-y-2">
+                <div className="flex items-center justify-between">
+                  <label className="block text-sm font-medium text-gray-700">
+                    Selected: {formatPersonName(selectedPerson!)}
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSelectedPersonId(null);
+                      setSelectedLessonIds(new Set());
+                      setSelectedTeacherId("");
+                    }}
+                    className="text-sm text-primary hover:text-primary min-h-[44px] px-2"
+                  >
+                    Change
+                  </button>
+                </div>
+              </div>
+
+              <div className="shrink-0 space-y-2">
+                <label className="block text-sm font-medium text-gray-700">
+                  Teacher
+                  {requiresTeacherPicker && (
+                    <span className="text-red-500 ml-1">*</span>
+                  )}
+                </label>
+                {existingEnrollment ? (
+                  <p className="text-sm text-gray-600 rounded-md border border-gray-200 bg-gray-50 px-3 py-2">
+                    {enrollmentTeacherLabel(
+                      existingEnrollment,
+                      formatPersonName,
+                    )}{" "}
+                    (assigned)
+                  </p>
+                ) : (
+                  <ScalableSelect
+                    options={teacherSelectOptions}
+                    value={selectedTeacherId}
+                    onChange={setSelectedTeacherId}
+                    placeholder="Select teacher..."
+                    searchPlaceholder="Search teacher..."
+                    emptyMessage={
+                      studentBranchId == null
+                        ? "Student must have a branch before assigning a lessons teacher."
+                        : NCC_TEACHER_ROSTER_EMPTY_MESSAGE
+                    }
+                  />
+                )}
+              </div>
+
+              <div
+                className={
+                  isModal
+                    ? "flex min-h-0 flex-1 flex-col space-y-2"
+                    : "space-y-2"
+                }
+              >
+                <label className="block shrink-0 text-sm font-medium text-gray-700">
+                  Select Lessons (all checked by default)
+                </label>
+                <div className={lessonListClass}>
+                  {sortedLessons.map((lesson) => (
+                    <label
+                      key={lesson.id}
+                      className="flex items-center gap-3 px-4 py-2 text-sm text-gray-700 hover:bg-gray-50 cursor-pointer min-h-[44px]"
+                    >
+                      <input
+                        type="checkbox"
+                        className="rounded border-gray-300 text-primary focus:ring-ring"
+                        checked={selectedLessonIds.has(lesson.id)}
+                        onChange={() => handleLessonToggle(lesson.id)}
+                      />
+                      <div className="flex-1">
+                        <div className="font-medium">
+                          Lesson {lesson.order}: {lesson.title}
+                        </div>
+                        {lesson.version_label && (
+                          <span className="chip-primary-sm mt-1">
+                            {lesson.version_label}
+                          </span>
+                        )}
+                      </div>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+
+        {canSubmit && (
+          <div className="shrink-0 p-4 border-t border-gray-200 flex justify-end">
+            <Button
+              onClick={handleSubmit}
+              disabled={assigning}
+              className="w-full sm:w-auto min-h-[44px]"
+            >
+              {assigning ? "Assigning..." : "Assign Selected Lessons"}
+            </Button>
+          </div>
+        )}
+      </>
+    );
+  };
+
+  return (
+    <div className="relative w-full md:w-auto" ref={containerRef}>
+      <Button
+        variant="primary"
+        onClick={() => setIsOpen(!isOpen)}
+        className="min-h-[44px] w-full md:w-auto"
+      >
+        Assign Lessons
+      </Button>
+
+      {isOpen && !isMdUp && (
+        <Modal
+          isOpen={isOpen}
+          onClose={handleCancel}
+          title="Assign Lessons"
+          contentClassName="overflow-hidden flex flex-col p-0"
+        >
+          {renderPanelBody("modal")}
+        </Modal>
+      )}
+
+      {isOpen && isMdUp && (
+        <div className="absolute right-0 mt-2 w-96 bg-white border border-gray-300 rounded-lg shadow-lg z-50 max-h-[80vh] flex flex-col">
+          <div className="flex items-center justify-between gap-2 pl-4 pr-1 py-1 border-b border-gray-200">
+            <h3 className="text-base font-semibold text-gray-900">
+              Assign Lessons
+            </h3>
+            <button
+              type="button"
+              onClick={handleCancel}
+              className="text-red-500 hover:text-red-700 p-1.5 rounded-md hover:bg-red-50 transition-colors min-w-[36px] min-h-[36px] flex items-center justify-center"
+              aria-label="Close"
+            >
+              <svg
+                className="w-5 h-5"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M6 18L18 6M6 6l12 12"
+                />
+              </svg>
+            </button>
+          </div>
+          {renderPanelBody("popover")}
+        </div>
+      )}
+    </div>
+  );
+}
